@@ -1,0 +1,10 @@
+# Build artifacts
+/subswapper
+*.test
+*.out
+
+# Editor / tool state
+.idea/
+.vscode/
+.claude/
+.mcp.json
