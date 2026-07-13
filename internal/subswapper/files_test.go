@@ -321,7 +321,11 @@ func TestSwitchRemainsCommittedWhenRollbackCleanupFails(t *testing.T) {
 }
 
 func TestCaptureRollsBackBackupWhenStateCommitFails(t *testing.T) {
-	dir := t.TempDir()
+	realDir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(realDir, dir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
 	live := filepath.Join(dir, "active.json")
 	cfg := testConfig(dir, live)
 	if err := os.WriteFile(live, []byte("old-credential"), 0o600); err != nil {
@@ -336,7 +340,7 @@ func TestCaptureRollsBackBackupWhenStateCommitFails(t *testing.T) {
 	}
 	oldCommit := commitStagedFile
 	commitStagedFile = func(file stagedFile) error {
-		if file.target == ExpandPath(cfg.StatePath) {
+		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
 			return errors.New("injected state commit failure")
 		}
 		return file.commit()
@@ -666,7 +670,7 @@ func TestRemoveAccountRollsBackBackupWhenStateCommitFails(t *testing.T) {
 	captureWithUsage(t, cfg, "codex", active, "account-b", "b", 20, 20)
 	oldCommit := commitStagedFile
 	commitStagedFile = func(file stagedFile) error {
-		if file.target == ExpandPath(cfg.StatePath) {
+		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
 			return errors.New("injected state commit failure")
 		}
 		return file.commit()

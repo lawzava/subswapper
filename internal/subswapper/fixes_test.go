@@ -1662,7 +1662,7 @@ func TestImportClaudeSwapRollsBackFilesWhenStateCommitFails(t *testing.T) {
 	cfg := testClaudeImportConfig(dir)
 	oldCommit := commitStagedFile
 	commitStagedFile = func(file stagedFile) error {
-		if file.target == ExpandPath(cfg.StatePath) {
+		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
 			return errors.New("injected state commit failure")
 		}
 		return file.commit()
