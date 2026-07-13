@@ -8,7 +8,7 @@ import (
 
 const sampleConfig = `{
   "monitor": {
-    "interval": "30s",
+    "interval": "5m",
     "auto_switch": true
   },
   "services": [

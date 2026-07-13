@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -34,6 +35,12 @@ type AccountState struct {
 	// CredentialsError records why the stored credentials were rejected; the
 	// account stays unselectable until a fetch succeeds or it is re-captured.
 	CredentialsError string `json:"credentials_error,omitempty"`
+	// LastProbeError is a bounded, terminal-safe summary of the latest
+	// transient provider failure. Raw provider output is never persisted.
+	LastProbeError string `json:"last_probe_error,omitempty"`
+	// LastProbeStartedAt orders overlapping provider probes so an older result
+	// cannot replace a newer snapshot.
+	LastProbeStartedAt time.Time `json:"last_probe_started_at,omitzero"`
 }
 
 func LoadState(path string) (*State, error) {
@@ -61,8 +68,40 @@ func LoadState(path string) (*State, error) {
 		if state.Services[name].Accounts == nil {
 			state.Services[name].Accounts = map[string]AccountState{}
 		}
+		for accountName, account := range state.Services[name].Accounts {
+			if account.CredentialsError != "" {
+				account.CredentialsError = sanitizeStoredProbeError(account.CredentialsError, true)
+			}
+			if account.LastProbeError != "" {
+				account.LastProbeError = sanitizeStoredProbeError(account.LastProbeError, false)
+			}
+			state.Services[name].Accounts[accountName] = account
+		}
 	}
 	return &state, nil
+}
+
+func sanitizeStoredProbeError(message string, credentials bool) string {
+	safe := sanitizeProbeError(errors.New(message))
+	lower := strings.ToLower(safe)
+	switch {
+	case strings.Contains(lower, "claude usage api returned"):
+		return "claude usage API request failed"
+	case strings.Contains(lower, "claude token refresh returned"):
+		if credentials {
+			return "stored credentials unusable: claude token refresh failed"
+		}
+		return "claude token refresh failed"
+	case strings.Contains(lower, "codex app-server"):
+		if credentials {
+			return "stored credentials unusable: codex app-server authentication failed"
+		}
+		return "codex app-server probe failed"
+	case strings.Contains(lower, "usage command failed"):
+		return "usage command failed"
+	default:
+		return safe
+	}
 }
 
 func NewState() *State {

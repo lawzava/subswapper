@@ -1,7 +1,10 @@
 package subswapper
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +14,578 @@ import (
 	"testing"
 	"time"
 )
+
+func TestUsageSnapshotScoresAvailableWindows(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage UsageSnapshot
+		want  float64
+	}{
+		{name: "weekly", usage: UsageSnapshot{Weekly: LimitWindow{Pct: PtrFloat64(30)}}, want: 0.30},
+		{name: "five hour", usage: UsageSnapshot{FiveHour: LimitWindow{Pct: PtrFloat64(20)}}, want: 0.20},
+		{name: "fable", usage: UsageSnapshot{FableWeekly: LimitWindow{Pct: PtrFloat64(40)}}, want: 0.40},
+		{name: "empty", usage: UsageSnapshot{}, want: math.Inf(1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.usage.Score(); got != tt.want {
+				t.Fatalf("Score() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCustomUsageCommandStillRequiresCoreWindows(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json")}
+	service := ServiceConfig{
+		Name:         "svc",
+		Kind:         "custom",
+		UsageCommand: []string{"sh", "-c", `echo '{"weekly":{"pct":20}}'`},
+	}
+	_, err := runUsageCommand(testContext(t), cfg, service, AccountState{Name: "a"})
+	if err == nil || !strings.Contains(err.Error(), "missing limits") {
+		t.Fatalf("expected missing core limits error, got %v", err)
+	}
+}
+
+func TestProbeErrorsAreSanitizedAndBackedOff(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "active.json")
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "backups"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Monitor:    MonitorConfig{Interval: Duration{Duration: 5 * time.Minute}},
+		Services: []ServiceConfig{
+			{
+				Name:  "svc",
+				Kind:  "custom",
+				Files: []ManagedFile{requiredFile(live, "auth.json")},
+				UsageCommand: []string{"sh", "-c",
+					`{ printf '\033[31mboom\n  repeated   whitespace '; i=0; while [ "$i" -lt 600 ]; do printf x; i=$((i+1)); done; printf '\033[0m'; } >&2; exit 1`},
+			},
+		},
+	}
+	captureWithUsage(t, cfg, "svc", live, "credential", "a", 10, 20)
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	if status.Account.LastProbeError == "" {
+		t.Fatal("expected persisted probe summary")
+	}
+	if strings.ContainsAny(status.Account.LastProbeError, "\n\r\x1b") {
+		t.Fatalf("probe summary contains control characters: %q", status.Account.LastProbeError)
+	}
+	if strings.Contains(status.Account.LastProbeError, "  ") {
+		t.Fatalf("probe summary contains repeated whitespace: %q", status.Account.LastProbeError)
+	}
+	if len(status.Account.LastProbeError) > 512 {
+		t.Fatalf("probe summary has %d bytes, want at most 512", len(status.Account.LastProbeError))
+	}
+	if !status.Account.FetchBackoffUntil.After(time.Now().Add(4 * time.Minute)) {
+		t.Fatalf("expected transient backoff, got %s", status.Account.FetchBackoffUntil)
+	}
+}
+
+func TestStatusProbeDoesNotHoldStateLock(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "active.json")
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "backups"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services: []ServiceConfig{
+			{
+				Name:         "svc",
+				Kind:         "custom",
+				Files:        []ManagedFile{requiredFile(live, "auth.json")},
+				UsageCommand: []string{"sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep 0.01; done; echo '{"five_hour":{"pct":10},"weekly":{"pct":20}}'`, "probe", started, release},
+			},
+		},
+	}
+	captureWithUsage(t, cfg, "svc", live, "credential", "a", 10, 20)
+	statusDone := make(chan error, 1)
+	go func() {
+		_, err := StatusOnce(context.Background(), cfg)
+		statusDone <- err
+	}()
+	waitForFile(t, started)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	lock, err := AcquireStateLock(ctx, cfg)
+	if err != nil {
+		_ = os.WriteFile(release, nil, 0o600)
+		<-statusDone
+		t.Fatalf("state lock remained held during provider probe: %v", err)
+	}
+	lock.Release()
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-statusDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMergeProbeStateSkipsRecapturedAccount(t *testing.T) {
+	oldAdded := time.Now().Add(-time.Hour).UTC()
+	newAdded := time.Now().UTC()
+	probed := NewState()
+	probed.Service("svc").Accounts["a"] = AccountState{
+		Name:           "a",
+		AddedAt:        oldAdded,
+		Usage:          usageForTest(99, 99),
+		LastProbeError: "stale result",
+	}
+	current := NewState()
+	current.Service("svc").Accounts["a"] = AccountState{
+		Name:    "a",
+		AddedAt: newAdded,
+		Usage:   usageForTest(10, 20),
+	}
+
+	mergeProbeState(current, probed)
+	account := current.Service("svc").Accounts["a"]
+	if account.LastProbeError != "" {
+		t.Fatalf("stale probe error was merged: %q", account.LastProbeError)
+	}
+	if score := account.Usage.Score(); score != 0.20 {
+		t.Fatalf("stale usage was merged: %v", score)
+	}
+}
+
+func TestConcurrentActiveChangeSuppressesAutoSwitch(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "active.json")
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	command := `if [ "$SUBSWAPPER_ACCOUNT" = a ]; then touch "$1"; while [ ! -f "$2" ]; do sleep 0.01; done; pct=95; else pct=10; fi; printf '{"five_hour":{"pct":%s},"weekly":{"pct":%s}}\n' "$pct" "$pct"`
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "backups"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services: []ServiceConfig{
+			{
+				Name:         "svc",
+				Kind:         "custom",
+				Files:        []ManagedFile{requiredFile(live, "auth.json")},
+				UsageCommand: []string{"sh", "-c", command, "probe", started, release},
+			},
+		},
+	}
+	captureWithUsage(t, cfg, "svc", live, "account-a", "a", 95, 95)
+	captureWithUsage(t, cfg, "svc", live, "account-b", "b", 10, 10)
+	if err := SwitchAccount(cfg, "svc", "a"); err != nil {
+		t.Fatal(err)
+	}
+	setServiceLastSwitchedAt(t, cfg, "svc", time.Now().Add(-defaultAutoSwitchCooldown-time.Minute))
+
+	done := make(chan CycleResult, 1)
+	go func() { done <- MonitorOnce(context.Background(), cfg, true) }()
+	waitForFile(t, started)
+	if err := SwitchAccount(cfg, "svc", "b"); err != nil {
+		_ = os.WriteFile(release, nil, 0o600)
+		<-done
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if len(result.Switches) != 0 {
+		t.Fatalf("stale probe performed switches: %v", result.Switches)
+	}
+	if len(result.Errors) == 0 || !strings.Contains(result.Errors[0].Error(), "changed during usage probe") {
+		t.Fatalf("expected concurrent change diagnostic, got %v", result.Errors)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Service("svc").ActiveAccount; got != "b" {
+		t.Fatalf("active account = %q, want b", got)
+	}
+}
+
+func TestStaleCredentialRefreshDoesNotOverwriteNewLogin(t *testing.T) {
+	dir := t.TempDir()
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/usage":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/token":
+			close(refreshStarted)
+			<-releaseRefresh
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"refreshed","refresh_token":"refreshed-r","expires_in":3600}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
+	claudeUsageURL, claudeTokenURL = server.URL+"/usage", server.URL+"/token"
+	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
+
+	liveCredentials := filepath.Join(dir, "credentials.json")
+	liveConfig := filepath.Join(dir, "claude.json")
+	service := ServiceConfig{
+		Name: "claude",
+		Kind: "claude",
+		Files: []ManagedFile{
+			requiredFile(liveCredentials, "credentials.json"),
+			optionalFile(liveConfig, "claude.json"),
+		},
+	}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	accountDir := AccountDir(cfg, "claude", "a")
+	if err := os.MkdirAll(accountDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldCredentials := `{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-r"}}`
+	identity := `{"oauthAccount":{"accountUuid":"account-a"}}`
+	for path, content := range map[string]string{
+		liveCredentials: oldCredentials,
+		liveConfig:      identity,
+		filepath.Join(accountDir, "credentials.json"): oldCredentials,
+		filepath.Join(accountDir, "claude.json"):      identity,
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setActiveTestAccount(t, cfg, "claude", "a")
+	done := make(chan error, 1)
+	go func() {
+		_, err := fetchClaudeUsage(context.Background(), cfg, service, AccountState{Name: "a"}, true)
+		done <- err
+	}()
+	<-refreshStarted
+	newCredentials := `{"claudeAiOauth":{"accessToken":"new-login","refreshToken":"new-r"}}`
+	if err := os.WriteFile(liveCredentials, []byte(newCredentials), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseRefresh)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "changed during probe") {
+		t.Fatalf("expected stale refresh rejection, got %v", err)
+	}
+	assertFileContent(t, liveCredentials, newCredentials)
+	assertFileContent(t, filepath.Join(accountDir, "credentials.json"), oldCredentials)
+}
+
+func TestRefreshFinishingAfterSwitchUpdatesOnlyOriginalBackup(t *testing.T) {
+	dir := t.TempDir()
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/usage":
+			if r.Header.Get("Authorization") == "Bearer refreshed" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"five_hour":{"utilization":10},"seven_day":{"utilization":20}}`))
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/token":
+			close(refreshStarted)
+			<-releaseRefresh
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"refreshed","refresh_token":"refreshed-r","expires_in":3600}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
+	claudeUsageURL, claudeTokenURL = server.URL+"/usage", server.URL+"/token"
+	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
+
+	liveCredentials := filepath.Join(dir, "credentials.json")
+	liveConfig := filepath.Join(dir, "claude.json")
+	service := ServiceConfig{
+		Name: "claude",
+		Kind: "claude",
+		Files: []ManagedFile{
+			requiredFile(liveCredentials, "credentials.json"),
+			optionalFile(liveConfig, "claude.json"),
+		},
+	}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	writeClaudeAccount := func(name, token, uuid string) {
+		t.Helper()
+		if err := os.WriteFile(liveCredentials, []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q}}`, token, token+"-r")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(liveConfig, []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q}}`, uuid)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := CaptureAccount(cfg, "claude", name, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeClaudeAccount("a", "old", "account-a")
+	writeClaudeAccount("b", "account-b-token", "account-b")
+	if err := SwitchAccount(cfg, "claude", "a"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountA := state.Service("claude").Accounts["a"]
+	done := make(chan error, 1)
+	go func() {
+		_, err := fetchClaudeUsage(context.Background(), cfg, service, accountA, true)
+		done <- err
+	}()
+	<-refreshStarted
+	if err := SwitchAccount(cfg, "claude", "b"); err != nil {
+		close(releaseRefresh)
+		<-done
+		t.Fatal(err)
+	}
+	close(releaseRefresh)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	assertClaudeAccessToken(t, filepath.Join(AccountDir(cfg, "claude", "a"), "credentials.json"), "refreshed")
+	assertClaudeAccessToken(t, liveCredentials, "account-b-token")
+}
+
+func assertClaudeAccessToken(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oauth, err := parseClaudeOAuth(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oauth.AccessToken != want {
+		t.Fatalf("access token = %q, want %q", oauth.AccessToken, want)
+	}
+}
+
+func TestOlderProbeCannotOverwriteNewerProbe(t *testing.T) {
+	base := time.Now().UTC()
+	current := NewState()
+	current.Service("svc").Accounts["a"] = AccountState{Name: "a", AddedAt: base, Usage: usageForTest(50, 50)}
+	newer := NewState()
+	newer.Service("svc").Accounts["a"] = AccountState{Name: "a", AddedAt: base, Usage: usageForTest(10, 10), LastProbeStartedAt: base.Add(2 * time.Second)}
+	older := NewState()
+	older.Service("svc").Accounts["a"] = AccountState{Name: "a", AddedAt: base, Usage: usageForTest(95, 95), LastProbeStartedAt: base.Add(time.Second)}
+
+	mergeProbeState(current, newer)
+	mergeProbeState(current, older)
+	account := current.Service("svc").Accounts["a"]
+	if score := account.Usage.Score(); score != 0.10 {
+		t.Fatalf("older probe overwrote newer usage: %v", score)
+	}
+	if serviceStateMatchesSnapshot(current.Service("svc"), older.Service("svc")) {
+		t.Fatal("older probe remained eligible for automatic switching")
+	}
+}
+
+func TestActiveAccountABAChangeSuppressesAutoSwitch(t *testing.T) {
+	base := time.Now().UTC()
+	snapshot := &ServiceState{
+		ActiveAccount:  "a",
+		LastSwitchedAt: base,
+		Accounts: map[string]AccountState{
+			"a": {Name: "a", AddedAt: base, LastProbeStartedAt: base},
+			"b": {Name: "b", AddedAt: base, LastProbeStartedAt: base},
+		},
+	}
+	current := &ServiceState{
+		ActiveAccount:  "a",
+		LastSwitchedAt: base.Add(time.Second),
+		Accounts: map[string]AccountState{
+			"a": {Name: "a", AddedAt: base, LastProbeStartedAt: base},
+			"b": {Name: "b", AddedAt: base, LastProbeStartedAt: base},
+		},
+	}
+	if serviceStateMatchesSnapshot(current, snapshot) {
+		t.Fatal("A to B to A switch during probe remained eligible for automatic switching")
+	}
+}
+
+func TestSanitizeProbeErrorRedactsCredentials(t *testing.T) {
+	err := errors.New(`request failed: Authorization: Bearer bearer-secret refresh_token=refresh-secret "access_token":"access-secret" OPENAI_API_KEY=key-secret`)
+	summary := sanitizeProbeError(err)
+	for _, secret := range []string{"bearer-secret", "refresh-secret", "access-secret", "key-secret"} {
+		if strings.Contains(summary, secret) {
+			t.Fatalf("summary leaked %q: %q", secret, summary)
+		}
+	}
+}
+
+func TestClaudeProviderBodyIsNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("diagnostic opaque-claude-secret"))
+	}))
+	t.Cleanup(server.Close)
+	oldURL := claudeUsageURL
+	claudeUsageURL = server.URL
+	t.Cleanup(func() { claudeUsageURL = oldURL })
+
+	live := filepath.Join(dir, "credentials.json")
+	service := ServiceConfig{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	if err := os.WriteFile(live, []byte(`{"claudeAiOauth":{"accessToken":"test-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CaptureAccount(cfg, "claude", "a", ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	CollectService(context.Background(), cfg, state, service)
+	if got := state.Service("claude").Accounts["a"].LastProbeError; strings.Contains(got, "opaque-claude-secret") {
+		t.Fatalf("provider body persisted: %q", got)
+	}
+}
+
+func TestCodexStderrIsNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	fakeCodex := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' 'diagnostic opaque-codex-secret' >&2\nexit 1\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldCommand := codexCommand
+	codexCommand = fakeCodex
+	t.Cleanup(func() { codexCommand = oldCommand })
+
+	live := filepath.Join(dir, "auth.json")
+	service := ServiceConfig{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-token","account_id":"account-a"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CaptureAccount(cfg, "codex", "a", ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	CollectService(context.Background(), cfg, state, service)
+	if got := state.Service("codex").Accounts["a"].LastProbeError; strings.Contains(got, "opaque-codex-secret") {
+		t.Fatalf("app-server stderr persisted: %q", got)
+	}
+}
+
+func TestCustomCommandDiagnosticsAreNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "credential")
+	service := ServiceConfig{
+		Name:         "custom",
+		Kind:         "custom",
+		Files:        []ManagedFile{requiredFile(live, "credential")},
+		UsageCommand: []string{"sh", "-c", "printf '%s\\n' 'diagnostic opaque-command-secret' >&2; exit 1"},
+	}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	if err := os.WriteFile(live, []byte("credential"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CaptureAccount(cfg, "custom", "a", ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	CollectService(context.Background(), cfg, state, service)
+	if got := state.Service("custom").Accounts["a"].LastProbeError; strings.Contains(got, "opaque-command-secret") {
+		t.Fatalf("custom command diagnostic persisted: %q", got)
+	}
+}
+
+func TestLoadStateSanitizesLegacyProbeErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	state := NewState()
+	state.Service("codex").Accounts["a"] = AccountState{
+		Name:             "a",
+		CredentialsError: "stored credentials unusable; body={\n\"error\":\"opaque-legacy-secret\"}",
+		LastProbeError:   "\x1b[31mclaude usage API returned 500 Internal Server Error: diagnostic opaque-probe-secret\x1b[0m",
+	}
+	if err := SaveState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := loaded.Service("codex").Accounts["a"]
+	for name, value := range map[string]string{
+		"credentials": account.CredentialsError,
+		"probe":       account.LastProbeError,
+	} {
+		if strings.ContainsAny(value, "\n\r\x1b") || len(value) > maxProbeErrorBytes {
+			t.Fatalf("legacy %s error was not bounded and terminal-safe: %q", name, value)
+		}
+		if strings.Contains(value, "opaque-") {
+			t.Fatalf("legacy %s provider detail survived sanitization: %q", name, value)
+		}
+	}
+	rendered := RenderStatus([]ServiceStatus{{
+		Service: ServiceConfig{Name: "codex"},
+		Accounts: []AccountStatus{{
+			Service: "codex",
+			Account: account,
+			Reason:  account.LastProbeError,
+		}},
+	}}, nil, time.Now())
+	if strings.Contains(rendered, "opaque-") || strings.Contains(rendered, "\x1b") {
+		t.Fatalf("legacy provider detail reached status output: %q", rendered)
+	}
+}
+
+func TestRenderMonitorEventsReportsTransitionsOnce(t *testing.T) {
+	ready := []ServiceStatus{{
+		Service:  ServiceConfig{Name: "claude"},
+		Accounts: []AccountStatus{{Service: "claude", Account: AccountState{Name: "a"}, Reason: "ready", Selectable: true}},
+	}}
+	failing := []ServiceStatus{{
+		Service:  ServiceConfig{Name: "claude"},
+		Accounts: []AccountStatus{{Service: "claude", Account: AccountState{Name: "a"}, Reason: "ready (stale usage from Jul13 00:00: probe failed)", Selectable: true}},
+	}}
+	first := RenderMonitorEvents(ready, failing, nil)
+	if !strings.Contains(first, "claude/a") || !strings.Contains(first, "probe failed") {
+		t.Fatalf("missing failure event: %q", first)
+	}
+	if repeated := RenderMonitorEvents(failing, failing, nil); repeated != "" {
+		t.Fatalf("unchanged failure repeated: %q", repeated)
+	}
+	if recovered := RenderMonitorEvents(failing, ready, nil); !strings.Contains(recovered, "recovered claude/a") {
+		t.Fatalf("missing recovery event: %q", recovered)
+	}
+	if switched := RenderMonitorEvents(ready, ready, []SwitchEvent{{Service: "claude", Account: "b"}}); !strings.Contains(switched, "switched claude to b") {
+		t.Fatalf("missing switch event: %q", switched)
+	}
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
 
 func TestSafeNameNeverEscapesBackupRoot(t *testing.T) {
 	for _, name := range []string{".", "..", "..."} {
@@ -64,23 +639,30 @@ func TestCaptureRejectsCaseInsensitiveDuplicate(t *testing.T) {
 func TestSwitchAccountSyncsOutgoingAccountFiles(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "active-auth.json")
-	cfg := testConfig(dir, active)
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "backups"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services: []ServiceConfig{
+			{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(active, "auth.json")}},
+		},
+	}
 
-	captureWithUsage(t, cfg, "codex", active, "a1", "a", 10, 10)
-	captureWithUsage(t, cfg, "codex", active, "b1", "b", 10, 10)
+	captureWithUsage(t, cfg, "codex", active, `{"auth_mode":"chatgpt","tokens":{"access_token":"a1","account_id":"account-a"}}`, "a", 10, 10)
+	captureWithUsage(t, cfg, "codex", active, `{"auth_mode":"chatgpt","tokens":{"access_token":"b1","account_id":"account-b"}}`, "b", 10, 10)
 	// Simulate the live client rotating b's credentials after capture.
-	if err := os.WriteFile(active, []byte("b2"), 0o600); err != nil {
+	rotated := `{"auth_mode":"chatgpt","tokens":{"access_token":"b2","account_id":"account-b"}}`
+	if err := os.WriteFile(active, []byte(rotated), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := SwitchAccount(cfg, "codex", "a"); err != nil {
 		t.Fatal(err)
 	}
-	assertFileContent(t, active, "a1")
+	assertFileContent(t, active, `{"auth_mode":"chatgpt","tokens":{"access_token":"a1","account_id":"account-a"}}`)
 	if err := SwitchAccount(cfg, "codex", "b"); err != nil {
 		t.Fatal(err)
 	}
-	assertFileContent(t, active, "b2")
+	assertFileContent(t, active, rotated)
 }
 
 func TestSwitchAccountRefusesDisabledService(t *testing.T) {
@@ -374,9 +956,13 @@ func TestCollectServiceMarksAccountWithMissingBackupUnselectable(t *testing.T) {
 func TestSyncNeverOverwritesGoodBackupWithCorruptLiveFile(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "credentials.json")
+	liveConfig := filepath.Join(dir, "claude.json")
 	service := ServiceConfig{
 		Name: "claude", Kind: "claude",
-		Files: []ManagedFile{requiredFile(live, "credentials.json")},
+		Files: []ManagedFile{
+			requiredFile(live, "credentials.json"),
+			optionalFile(liveConfig, "claude.json"),
+		},
 	}
 	cfg := Config{
 		BackupRoot: filepath.Join(dir, "backups"),
@@ -391,6 +977,13 @@ func TestSyncNeverOverwritesGoodBackupWithCorruptLiveFile(t *testing.T) {
 	}
 	backupPath := filepath.Join(accountDir, "credentials.json")
 	if err := os.WriteFile(backupPath, []byte(goodBackup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := `{"oauthAccount":{"accountUuid":"account-a"}}`
+	if err := os.WriteFile(filepath.Join(accountDir, "claude.json"), []byte(identity), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(liveConfig, []byte(identity), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -903,6 +1496,7 @@ func TestCollectServiceOrdersAccountsByName(t *testing.T) {
 func TestFetchClaudeUsageActiveReadsLiveAndSyncsBackup(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "credentials.json")
+	liveConfig := filepath.Join(dir, "claude.json")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer live-token" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -923,7 +1517,10 @@ func TestFetchClaudeUsageActiveReadsLiveAndSyncsBackup(t *testing.T) {
 		BackupRoot: filepath.Join(dir, "backups"),
 		StatePath:  filepath.Join(dir, "state.json"),
 		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
+			{Name: "claude", Kind: "claude", Files: []ManagedFile{
+				requiredFile(live, "credentials.json"),
+				optionalFile(liveConfig, "claude.json"),
+			}},
 		},
 	}
 	liveCredentials := `{"claudeAiOauth":{"accessToken":"live-token"}}`
@@ -938,6 +1535,14 @@ func TestFetchClaudeUsageActiveReadsLiveAndSyncsBackup(t *testing.T) {
 	if err := os.WriteFile(backupPath, []byte(`{"claudeAiOauth":{"accessToken":"stale-token"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	identity := `{"oauthAccount":{"accountUuid":"account-main"}}`
+	if err := os.WriteFile(filepath.Join(accountDir, "claude.json"), []byte(identity), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(liveConfig, []byte(identity), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setActiveTestAccount(t, cfg, "claude", "main")
 
 	usage, err := fetchClaudeUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, true)
 	if err != nil {
@@ -952,7 +1557,7 @@ func TestFetchClaudeUsageActiveReadsLiveAndSyncsBackup(t *testing.T) {
 func TestFetchCodexUsageActiveSyncsRefreshedAuthToLiveAndBackup(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "auth.json")
-	refreshed := `{"auth_mode":"chatgpt","tokens":{"access_token":"refreshed","refresh_token":"r2"}}`
+	refreshed := `{"auth_mode":"chatgpt","tokens":{"access_token":"refreshed","refresh_token":"r2","account_id":"account-main"}}`
 	fakeCodex := filepath.Join(dir, "codex")
 	script := `#!/bin/sh
 while IFS= read -r line; do
@@ -982,7 +1587,7 @@ done
 			{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}},
 		},
 	}
-	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"live","refresh_token":"r1"}}`), 0o600); err != nil {
+	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"live","refresh_token":"r1","account_id":"account-main"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	accountDir := AccountDir(cfg, "codex", "main")
@@ -990,15 +1595,25 @@ done
 		t.Fatal(err)
 	}
 	backupPath := filepath.Join(accountDir, "auth.json")
-	if err := os.WriteFile(backupPath, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"stale","refresh_token":"r0"}}`), 0o600); err != nil {
+	if err := os.WriteFile(backupPath, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"stale","refresh_token":"r0","account_id":"account-main"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	setActiveTestAccount(t, cfg, "codex", "main")
 
 	if _, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, true); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContent(t, backupPath, refreshed)
 	assertFileContent(t, live, refreshed)
+}
+
+func setActiveTestAccount(t *testing.T, cfg Config, serviceName, accountName string) {
+	t.Helper()
+	state := NewState()
+	state.Service(serviceName).ActiveAccount = accountName
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestImportClaudeSwapSkipsExistingAccountsAndKeepsActive(t *testing.T) {
@@ -1038,6 +1653,38 @@ func TestImportClaudeSwapSkipsExistingAccountsAndKeepsActive(t *testing.T) {
 	}
 	if got := state.Service("claude").ActiveAccount; got != "cswap-2" {
 		t.Fatalf("expected active account preserved, got %q", got)
+	}
+}
+
+func TestImportClaudeSwapRollsBackFilesWhenStateCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	root := buildClaudeSwapFixture(t, dir)
+	cfg := testClaudeImportConfig(dir)
+	oldCommit := commitStagedFile
+	commitStagedFile = func(file stagedFile) error {
+		if file.target == ExpandPath(cfg.StatePath) {
+			return errors.New("injected state commit failure")
+		}
+		return file.commit()
+	}
+	t.Cleanup(func() { commitStagedFile = oldCommit })
+
+	if _, err := ImportClaudeSwap(cfg, root); err == nil || !strings.Contains(err.Error(), "injected state commit failure") {
+		t.Fatalf("expected state commit failure, got %v", err)
+	}
+	for _, account := range []string{"cswap-1", "cswap-2"} {
+		for _, name := range []string{"credentials.json", "claude.json"} {
+			if _, err := os.Stat(filepath.Join(AccountDir(cfg, "claude", account), name)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("expected %s/%s rollback, got %v", account, name, err)
+			}
+		}
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(state.Service("claude").Accounts); got != 0 {
+		t.Fatalf("imported state survived failed commit: %d accounts", got)
 	}
 }
 

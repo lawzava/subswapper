@@ -11,9 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type UsageSnapshot struct {
@@ -49,6 +52,8 @@ type ServiceStatus struct {
 // selectable off a cached snapshot.
 var errCredentialsInvalid = errors.New("stored credentials unusable")
 
+var errCredentialSourceChanged = errors.New("credential source changed during probe")
+
 // credentialSource is the managed file that holds an account's credentials.
 // For the active account the live file is preferred, since the running
 // client keeps it fresh; the backup copy is the fallback and the destination
@@ -58,6 +63,101 @@ type credentialSource struct {
 	livePath   string
 	backupPath string
 	fromLive   bool
+}
+
+func snapshotCredentialSource(
+	ctx context.Context,
+	cfg Config,
+	service ServiceConfig,
+	account AccountState,
+	active bool,
+	find func() (credentialSource, error),
+) (credentialSource, error) {
+	lock, err := AcquireStateLock(ctx, cfg)
+	if err != nil {
+		return credentialSource{}, err
+	}
+	defer lock.Release()
+	source, err := find()
+	if err != nil {
+		return credentialSource{}, err
+	}
+	if active && source.fromLive {
+		if err := verifyActiveIdentity(cfg, service, account); err != nil {
+			return credentialSource{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
+		}
+	}
+	return source, nil
+}
+
+func applyCredentialUpdate(
+	ctx context.Context,
+	cfg Config,
+	service ServiceConfig,
+	account AccountState,
+	source credentialSource,
+	updated []byte,
+	updateLiveIfActive bool,
+) error {
+	lock, err := AcquireStateLock(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		return err
+	}
+	if !account.AddedAt.IsZero() {
+		current, ok := state.Account(service.Name, account.Name)
+		if !ok || !current.AddedAt.Equal(account.AddedAt) {
+			return errCredentialSourceChanged
+		}
+	}
+	currentActive := state.Service(service.Name).ActiveAccount == account.Name
+	if currentActive {
+		if err := verifyActiveIdentity(cfg, service, account); err != nil {
+			return fmt.Errorf("%w: %v", errCredentialsInvalid, err)
+		}
+	}
+	sourcePath := source.backupPath
+	if source.fromLive && currentActive {
+		sourcePath = source.livePath
+	}
+	currentSource, err := os.ReadFile(sourcePath)
+	if err != nil || !bytes.Equal(currentSource, source.data) {
+		return errCredentialSourceChanged
+	}
+	if currentActive && !source.fromLive {
+		currentLive, err := os.ReadFile(source.livePath)
+		if err != nil || !bytes.Equal(currentLive, source.data) {
+			return errCredentialSourceChanged
+		}
+	}
+	staged := make([]stagedFile, 0, 2)
+	backup, err := stageFile(source.backupPath, bytes.NewReader(updated))
+	if err != nil {
+		return err
+	}
+	staged = append(staged, backup)
+	if updateLiveIfActive && currentActive {
+		live, err := stageFile(source.livePath, bytes.NewReader(updated))
+		if err != nil {
+			backup.discard()
+			return err
+		}
+		staged = append(staged, live)
+	}
+	if err := executeFileTransaction(cfg, staged); err != nil {
+		for _, file := range staged {
+			file.discard()
+		}
+		return err
+	}
+	for _, file := range staged {
+		file.discard()
+	}
+	return nil
 }
 
 // findCredentialSource returns the first managed file whose contents satisfy
@@ -110,6 +210,15 @@ const (
 	// inactiveUsageTTL is how long an inactive account's cached usage is
 	// considered fresh enough to skip the network fetch entirely.
 	inactiveUsageTTL = 5 * time.Minute
+)
+
+const maxProbeErrorBytes = 512
+
+var (
+	ansiEscapePattern           = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	bearerCredentialPattern     = regexp.MustCompile(`(?i)(\bbearer\s+)[^"\s,;}]+`)
+	credentialAssignmentPattern = regexp.MustCompile(`(?i)((?:"?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|openai[_-]?api[_-]?key|anthropic[_-]?api[_-]?key|api[_-]?key|token)"?\s*[:=]\s*"?))([^"\s,;}]+)`)
+	standaloneAPIKeyPattern     = regexp.MustCompile(`\b(?:sk|rk)-[A-Za-z0-9._-]{8,}`)
 )
 
 // rateLimitedError is a usage-fetch failure caused by provider rate limiting;
@@ -177,7 +286,11 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 				statuses = append(statuses, status)
 				continue
 			}
-			fetchErr = fmt.Errorf("usage checks paused until %s after rate limiting", retryAt)
+			reason := status.Account.LastProbeError
+			if reason == "" {
+				reason = "previous provider failure"
+			}
+			fetchErr = fmt.Errorf("usage checks paused until %s after %s", retryAt, reason)
 		case !status.Active && status.Account.CredentialsError == "" &&
 			!status.Account.Usage.ObservedAt.IsZero() &&
 			now.Sub(status.Account.Usage.ObservedAt) < inactiveUsageTTL:
@@ -191,30 +304,39 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 				status.Account.Usage = usage
 				status.Account.FetchBackoffUntil = time.Time{}
 				status.Account.CredentialsError = ""
+				status.Account.LastProbeError = ""
 				serviceState.Accounts[account.Name] = status.Account
 			case errors.Is(err, errCredentialsInvalid):
 				status.Account.FetchBackoffUntil = now.Add(credentialsErrorBackoff)
-				status.Account.CredentialsError = err.Error()
+				status.Account.CredentialsError = sanitizeProbeError(err)
+				status.Account.LastProbeError = ""
 				serviceState.Accounts[account.Name] = status.Account
-				status.Reason = err.Error()
+				status.Reason = status.Account.CredentialsError
 				statuses = append(statuses, status)
 				continue
 			case errors.As(err, &rateLimited):
 				status.Account.FetchBackoffUntil = now.Add(rateLimited.backoff())
+				status.Account.LastProbeError = sanitizeProbeError(err)
 				serviceState.Accounts[account.Name] = status.Account
 				if !status.Account.Usage.HasLimits() {
-					status.Reason = err.Error()
+					status.Reason = status.Account.LastProbeError
 					statuses = append(statuses, status)
 					continue
 				}
-				fetchErr = err
+				fetchErr = errors.New(status.Account.LastProbeError)
 			case !status.Account.Usage.HasLimits():
-				status.Reason = err.Error()
+				status.Account.FetchBackoffUntil = now.Add(transientProbeBackoff(cfg.Monitor.Interval.Duration))
+				status.Account.LastProbeError = sanitizeProbeError(err)
+				serviceState.Accounts[account.Name] = status.Account
+				status.Reason = status.Account.LastProbeError
 				statuses = append(statuses, status)
 				continue
 			default:
 				// Fall back to the cached snapshot, but surface the failure.
-				fetchErr = err
+				status.Account.FetchBackoffUntil = now.Add(transientProbeBackoff(cfg.Monitor.Interval.Duration))
+				status.Account.LastProbeError = sanitizeProbeError(err)
+				serviceState.Accounts[account.Name] = status.Account
+				fetchErr = errors.New(status.Account.LastProbeError)
 			}
 		}
 		markAccountSelectable(&status)
@@ -225,6 +347,42 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 		statuses = append(statuses, status)
 	}
 	return ServiceStatus{Service: service, Accounts: statuses}
+}
+
+func transientProbeBackoff(configured time.Duration) time.Duration {
+	return max(configured, time.Minute)
+}
+
+func sanitizeProbeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := ansiEscapePattern.ReplaceAllString(err.Error(), " ")
+	message = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, message)
+	message = strings.Join(strings.Fields(message), " ")
+	message = bearerCredentialPattern.ReplaceAllString(message, "${1}[REDACTED]")
+	message = credentialAssignmentPattern.ReplaceAllString(message, "${1}[REDACTED]")
+	message = standaloneAPIKeyPattern.ReplaceAllString(message, "[REDACTED]")
+	lower := strings.ToLower(message)
+	for _, marker := range []string{"; body=", ": warning:", ": {\"error\"", ": { \"error\""} {
+		if index := strings.Index(lower, marker); index >= 0 {
+			message = strings.TrimSpace(message[:index]) + " (provider detail omitted)"
+			break
+		}
+	}
+	if len(message) <= maxProbeErrorBytes {
+		return message
+	}
+	message = message[:maxProbeErrorBytes]
+	for !utf8.ValidString(message) {
+		message = message[:len(message)-1]
+	}
+	return strings.TrimSpace(message)
 }
 
 // missingRequiredBackups lists required managed files absent from the
@@ -292,17 +450,13 @@ func runUsageCommand(ctx context.Context, cfg Config, service ServiceConfig, acc
 	// Bound Wait after cancellation even if a grandchild keeps the pipes open.
 	cmd.WaitDelay = 10 * time.Second
 	if err := cmd.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = strings.TrimSpace(stdout.String())
-		}
-		return UsageSnapshot{}, fmt.Errorf("usage command failed: %w: %s", err, detail)
+		return UsageSnapshot{}, fmt.Errorf("usage command failed: %w", err)
 	}
 	var usage UsageSnapshot
 	if err := json.NewDecoder(&stdout).Decode(&usage); err != nil {
 		return UsageSnapshot{}, fmt.Errorf("usage command returned invalid JSON: %w", err)
 	}
-	if !usage.HasLimits() {
+	if !usage.HasCoreLimits() {
 		return UsageSnapshot{}, fmt.Errorf("usage command returned missing limits")
 	}
 	if usage.ObservedAt.IsZero() {
@@ -312,6 +466,14 @@ func runUsageCommand(ctx context.Context, cfg Config, service ServiceConfig, acc
 }
 
 func (u UsageSnapshot) HasLimits() bool {
+	return u.HasAnyLimit()
+}
+
+func (u UsageSnapshot) HasAnyLimit() bool {
+	return len(u.ratios()) > 0
+}
+
+func (u UsageSnapshot) HasCoreLimits() bool {
 	_, hasFiveHour := u.FiveHour.Ratio()
 	_, hasWeekly := u.Weekly.Ratio()
 	return hasFiveHour && hasWeekly
@@ -331,14 +493,13 @@ func (u UsageSnapshot) AtOrAbove(threshold float64) bool {
 }
 
 func (u UsageSnapshot) Score() float64 {
-	if !u.HasLimits() {
+	ratios := u.ratios()
+	if len(ratios) == 0 {
 		return math.Inf(1)
 	}
-	fiveHour, _ := u.FiveHour.Ratio()
-	weekly, _ := u.Weekly.Ratio()
-	score := max(fiveHour, weekly)
-	if fableWeekly, ok := u.FableWeekly.Ratio(); ok {
-		score = max(score, fableWeekly)
+	score := ratios[0]
+	for _, ratio := range ratios[1:] {
+		score = max(score, ratio)
 	}
 	return score
 }

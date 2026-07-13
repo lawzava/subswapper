@@ -2,6 +2,7 @@ package subswapper
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -75,7 +76,7 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 	}
 	usageCache := readClaudeSwapUsageCache(root)
 
-	lock, err := AcquireStateLock(cfg)
+	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -98,6 +99,7 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 	}
 
 	result := ImportResult{}
+	var staged []stagedFile
 	for _, number := range order {
 		numberString := strconv.Itoa(number)
 		entry, ok := sequence.Accounts[numberString]
@@ -122,15 +124,18 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 			continue
 		}
 		accountDir := AccountDir(cfg, service.Name, accountName)
-		if err := os.MkdirAll(accountDir, 0o700); err != nil {
+		stagedCredentials, err := stageFile(filepath.Join(accountDir, "credentials.json"), bytes.NewReader(credentials))
+		if err != nil {
+			discardStagedFiles(staged)
 			return ImportResult{}, err
 		}
-		if err := writeFileAtomic(filepath.Join(accountDir, "credentials.json"), credentials); err != nil {
+		staged = append(staged, stagedCredentials)
+		stagedConfig, err := stageFile(filepath.Join(accountDir, "claude.json"), bytes.NewReader(config))
+		if err != nil {
+			discardStagedFiles(staged)
 			return ImportResult{}, err
 		}
-		if err := writeFileAtomic(filepath.Join(accountDir, "claude.json"), config); err != nil {
-			return ImportResult{}, err
-		}
+		staged = append(staged, stagedConfig)
 
 		account := AccountState{
 			Name:     accountName,
@@ -150,31 +155,35 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 		// state from disk — and the sync-before-switch step would then copy
 		// a different login over this slot's backup.
 		if sequence.ActiveAccountNumber == number && serviceState.ActiveAccount == "" &&
-			liveFilesMatchBackup(service, accountDir) {
+			liveFilesMatchImport(service, map[string][]byte{
+				"credentials.json": credentials,
+				"claude.json":      config,
+			}) {
 			serviceState.ActiveAccount = accountName
 			result.Active = accountName
 		}
 		result.Imported = append(result.Imported, account)
 	}
 	if len(result.Imported) == 0 && len(result.Skipped) == 0 {
+		discardStagedFiles(staged)
 		return ImportResult{}, errors.Join(append([]error{errors.New("no claude-swap accounts found")}, result.Errors...)...)
 	}
-	if err := SaveState(cfg.StatePath, state); err != nil {
+	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
 		return ImportResult{}, err
 	}
 	return result, nil
 }
 
-// liveFilesMatchBackup reports whether every required live managed file is
-// byte-identical to the account's backup copy.
-func liveFilesMatchBackup(service ServiceConfig, accountDir string) bool {
+// liveFilesMatchImport reports whether every required live managed file is
+// byte-identical to the prospective imported backup.
+func liveFilesMatchImport(service ServiceConfig, imported map[string][]byte) bool {
 	matched := false
 	for _, file := range service.Files {
 		if !file.IsRequired() {
 			continue
 		}
-		backup, err := os.ReadFile(filepath.Join(accountDir, file.BackupName))
-		if err != nil {
+		backup, ok := imported[file.BackupName]
+		if !ok {
 			return false
 		}
 		live, err := os.ReadFile(ExpandPath(file.Path))

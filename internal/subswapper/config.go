@@ -81,7 +81,7 @@ func (c *Config) ApplyDefaults() {
 		c.StatePath = filepath.Join(dataRoot, "state.json")
 	}
 	if c.Monitor.Interval.Duration == 0 {
-		c.Monitor.Interval.Duration = time.Minute
+		c.Monitor.Interval.Duration = 5 * time.Minute
 	}
 	for index := range c.Services {
 		service := &c.Services[index]

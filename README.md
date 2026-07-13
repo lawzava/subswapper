@@ -12,23 +12,24 @@ approaches its usage limits.
 ## Features
 
 - **Capture once, switch instantly** — snapshots the credential files of the
-  logged-in account into a private backup, then swaps bundles atomically on
-  demand.
+  logged-in account into a private backup, then swaps bundles transactionally
+  with rollback and interrupted-operation recovery.
 - **Live usage tracking** — reads real usage windows (5-hour, weekly, and
   Claude's Fable-scoped weekly) straight from each provider using the stored
   credentials; no scraping, no extra logins.
 - **Automatic switching** — a monitor loop moves each service to the
   least-used healthy account when the active one crosses a configurable
   threshold, with cooldown and minimum-improvement pacing to avoid churn.
-- **Safe by design** — cross-process locking, atomic file replacement, `0600`
-  files under `0700` directories, and corruption guards that never overwrite a
-  good credential backup with a broken live file.
+- **Safe by design** — cross-process locking, atomic replacement of individual
+  files, transactional bundle recovery, `0600` files under `0700` directories,
+  and corruption guards that never overwrite a good credential backup with a
+  broken or foreign live file.
 - **Extensible** — any other service can be managed by listing its credential
   files in the config; plug in a custom `usage_command` for usage probing.
 
 ## Installation
 
-Requires Go 1.26+.
+Requires Go 1.26.5 or newer.
 
 ```sh
 go install github.com/lawzava/subswapper/cmd/subswapper@latest
@@ -94,7 +95,7 @@ value auto-switching compares.
 | `switch -service <name> [-account <name>\|auto]` | Restore an account's bundle; `auto` picks the least-used healthy account. |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
-| `monitor [-interval 30s] [-once] [-no-auto]` | Poll usage on a loop and auto-switch when thresholds are hit. |
+| `monitor [-interval 5m] [-once] [-no-auto] [-verbose]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table. |
 | `remove -service <name> -account <name> [-force]` (alias `rm`) | Delete a captured account and its backup. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
@@ -117,8 +118,9 @@ usage only when all of these hold:
 
 Both pacing rules are skipped when the active account is exhausted or its
 stored credentials stop working — the monitor escapes to the best healthy
-account on the next cycle. Accounts whose credentials are missing or rejected
-are never selected, whatever their cached usage says. A manual
+account on the next cycle. Accounts whose credentials are missing, rejected,
+or do not match the stable identity of the captured account are never selected,
+whatever their cached usage says. A manual
 `switch -account auto` always forces the best account immediately.
 
 Before every switch, the outgoing account's live files are synced back into
@@ -131,7 +133,7 @@ its backup so credentials rotated while it was active are never lost.
 ```json
 {
   "monitor": {
-    "interval": "30s",
+    "interval": "5m",
     "auto_switch": true
   },
   "services": [
@@ -145,7 +147,7 @@ The `monitor` block accepts these knobs (defaults shown):
 
 ```json
 "monitor": {
-  "interval": "1m",
+  "interval": "5m",
   "auto_switch": true,
   "switch_threshold": 0.90,
   "min_improvement": 0.10,
@@ -189,9 +191,10 @@ limits are ignored.
 **Codex** usage is read through the local `codex app-server` JSON-RPC
 interface. For each captured account, `subswapper` starts the app-server with
 a temporary `CODEX_HOME` containing that account's stored `auth.json` and maps
-the primary window to 5 hours and the secondary window to 7 days. This
-requires ChatGPT auth in file storage; API-key mode has no subscription limits
-to read.
+windows by their reported duration. Current plans may expose only a weekly
+window; any available provider window is displayed and included in scoring.
+This requires ChatGPT auth in file storage; API-key mode has no subscription
+limits to read.
 
 **Custom services** (or overrides) can set `usage_command`. The command runs
 once per captured account with these environment variables:
@@ -243,8 +246,17 @@ Defaults on Linux (macOS and Windows use their native config/data folders):
 Linux and macOS are tested in CI; Windows builds are cross-compiled but
 currently untested — treat Windows support as experimental.
 
+Before subswapper syncs token rotations back into a captured account, it
+checks Claude's account UUID or Codex's account ID. If the live client was
+logged into a different account outside subswapper, synchronization and
+automatic switching stop with an identity mismatch instead of overwriting a
+credential backup. Capture or reconcile that login explicitly before
+continuing.
+
 Credential backups and state are written with `0600` permissions under `0700`
-directories, and every write is atomic (staged to a temp file, then renamed).
+directories. Individual files are staged and renamed atomically. Multi-file
+bundle changes use rollback snapshots and a recovery journal so a failed or
+interrupted operation is restored before the next state operation.
 Still: **treat the backup directory like a password store** — it holds working
 OAuth tokens for every captured account.
 
@@ -268,6 +280,10 @@ WantedBy=default.target
 ```sh
 systemctl --user enable --now subswapper
 ```
+
+The default five-minute monitor writes startup, switch, failure-transition,
+and recovery events. Use `monitor -verbose` only for interactive diagnostics
+when a complete status table every cycle is useful.
 
 ## Contributing
 

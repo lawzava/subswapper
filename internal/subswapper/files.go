@@ -2,6 +2,7 @@ package subswapper
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,7 +28,7 @@ func CaptureAccount(cfg Config, serviceName, accountName, email string) (Account
 		return AccountState{}, fmt.Errorf("service %q is disabled", serviceName)
 	}
 
-	lock, err := AcquireStateLock(cfg)
+	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return AccountState{}, err
 	}
@@ -64,12 +65,10 @@ func CaptureAccount(cfg Config, serviceName, accountName, email string) (Account
 	if !copied {
 		return AccountState{}, fmt.Errorf("service %q had no active files to capture", service.Name)
 	}
-	if err := copyManagedFiles(specs); err != nil {
-		return AccountState{}, err
-	}
-
 	if email == "" {
-		email = inferAccountEmail(service, accountDir)
+		email = inferAccountEmailFromPaths(service, func(file ManagedFile) string {
+			return ExpandPath(file.Path)
+		})
 	}
 	account := AccountState{
 		Name:    accountName,
@@ -78,7 +77,11 @@ func CaptureAccount(cfg Config, serviceName, accountName, email string) (Account
 	}
 	serviceState.Accounts[accountName] = account
 	serviceState.ActiveAccount = accountName
-	if err := SaveState(cfg.StatePath, state); err != nil {
+	staged, err := stageManagedFiles(specs)
+	if err != nil {
+		return AccountState{}, err
+	}
+	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
 		return AccountState{}, err
 	}
 	return account, nil
@@ -92,7 +95,7 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 	if service.Disabled {
 		return fmt.Errorf("service %q is disabled", serviceName)
 	}
-	lock, err := AcquireStateLock(cfg)
+	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return err
 	}
@@ -110,13 +113,10 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 		// credentials the live client rotated since the last sync.
 		return nil
 	}
-	if err := switchServiceFiles(cfg, service, state, accountName); err != nil {
+	if err := switchServiceFiles(cfg, service, state, accountName, time.Now().UTC()); err != nil {
 		return err
 	}
-	serviceState := state.Service(service.Name)
-	serviceState.ActiveAccount = accountName
-	serviceState.LastSwitchedAt = time.Now().UTC()
-	return SaveState(cfg.StatePath, state)
+	return nil
 }
 
 func RemoveAccount(cfg Config, serviceName, accountName string, force bool) error {
@@ -127,7 +127,7 @@ func RemoveAccount(cfg Config, serviceName, accountName string, force bool) erro
 	if !ok {
 		return fmt.Errorf("service %q not found", serviceName)
 	}
-	lock, err := AcquireStateLock(cfg)
+	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return err
 	}
@@ -144,14 +144,22 @@ func RemoveAccount(cfg Config, serviceName, accountName string, force bool) erro
 	if serviceState.ActiveAccount == accountName && !force {
 		return fmt.Errorf("account %q is active; switch away first or pass -force", accountName)
 	}
+	accountDir := AccountDir(cfg, service.Name, accountName)
+	staged := make([]stagedFile, 0, len(service.Files))
+	for _, file := range service.Files {
+		staged = append(staged, stagedFile{
+			target: filepath.Join(accountDir, file.BackupName),
+			remove: true,
+		})
+	}
 	delete(serviceState.Accounts, accountName)
 	if serviceState.ActiveAccount == accountName {
 		serviceState.ActiveAccount = ""
 	}
-	if err := SaveState(cfg.StatePath, state); err != nil {
+	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
 		return err
 	}
-	return os.RemoveAll(AccountDir(cfg, service.Name, accountName))
+	return os.RemoveAll(accountDir)
 }
 
 func validateAccountName(name string) error {
@@ -167,10 +175,10 @@ func validateAccountName(name string) error {
 	return nil
 }
 
-// switchServiceFiles makes accountName's backup the live file set. It first
-// syncs the outgoing active account's live files back into its backup so
-// credentials rotated while it was active are not lost.
-func switchServiceFiles(cfg Config, service ServiceConfig, state *State, accountName string) error {
+// switchServiceFiles makes accountName's backup the live file set and commits
+// the matching active-account state in the same recoverable transaction. It
+// first syncs the outgoing account so rotated credentials are not lost.
+func switchServiceFiles(cfg Config, service ServiceConfig, state *State, accountName string, switchedAt time.Time) error {
 	serviceState := state.Service(service.Name)
 	outgoing := serviceState.ActiveAccount
 	if outgoing != "" && outgoing != accountName {
@@ -180,13 +188,36 @@ func switchServiceFiles(cfg Config, service ServiceConfig, state *State, account
 			}
 		}
 	}
-	return restoreAccountFiles(cfg, service, accountName)
+	specs, err := accountRestoreSpecs(cfg, service, accountName)
+	if err != nil {
+		return err
+	}
+	staged, err := stageManagedFiles(specs)
+	if err != nil {
+		return err
+	}
+	oldActive := serviceState.ActiveAccount
+	oldSwitchedAt := serviceState.LastSwitchedAt
+	restoreState := func() {
+		serviceState.ActiveAccount = oldActive
+		serviceState.LastSwitchedAt = oldSwitchedAt
+	}
+	serviceState.ActiveAccount = accountName
+	serviceState.LastSwitchedAt = switchedAt
+	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
+		restoreState()
+		return err
+	}
+	return nil
 }
 
 // syncAccountFiles copies the live managed files into accountName's backup.
 // A missing required live file keeps the existing backup copy; a missing
 // optional live file removes the stale backup, mirroring capture.
 func syncAccountFiles(cfg Config, service ServiceConfig, accountName string) error {
+	if err := verifyActiveIdentity(cfg, service, AccountState{Name: accountName}); err != nil {
+		return err
+	}
 	accountDir := AccountDir(cfg, service.Name, accountName)
 	if err := os.MkdirAll(accountDir, 0o700); err != nil {
 		return err
@@ -211,7 +242,7 @@ func syncAccountFiles(cfg Config, service ServiceConfig, accountName string) err
 			required: file.IsRequired(),
 		})
 	}
-	return copyManagedFiles(specs)
+	return copyManagedFiles(cfg, specs)
 }
 
 // syncWouldCorruptBackup reports whether copying the live file over the
@@ -244,14 +275,14 @@ func claudeCredentialsUsable(data []byte) bool {
 	return err == nil && (oauth.AccessToken != "" || oauth.RefreshToken != "")
 }
 
-func restoreAccountFiles(cfg Config, service ServiceConfig, accountName string) error {
+func accountRestoreSpecs(cfg Config, service ServiceConfig, accountName string) ([]copySpec, error) {
 	accountDir := AccountDir(cfg, service.Name, accountName)
 	specs := make([]copySpec, 0, len(service.Files))
 	for _, file := range service.Files {
 		sourcePath := filepath.Join(accountDir, file.BackupName)
 		if _, err := os.Stat(sourcePath); err != nil {
 			if !errors.Is(err, os.ErrNotExist) || file.IsRequired() {
-				return fmt.Errorf("account %q missing backup %s: %w", accountName, file.BackupName, err)
+				return nil, fmt.Errorf("account %q missing backup %s: %w", accountName, file.BackupName, err)
 			}
 		}
 		specs = append(specs, copySpec{
@@ -260,7 +291,7 @@ func restoreAccountFiles(cfg Config, service ServiceConfig, accountName string) 
 			required: file.IsRequired(),
 		})
 	}
-	return copyManagedFiles(specs)
+	return specs, nil
 }
 
 type copySpec struct {
@@ -272,28 +303,57 @@ type copySpec struct {
 // copyManagedFiles applies all copies in two phases: every source is staged
 // into a temp file next to its target first, then all targets are committed.
 // A failure while staging leaves every target untouched.
-func copyManagedFiles(specs []copySpec) error {
-	staged := make([]stagedFile, 0, len(specs))
+func copyManagedFiles(cfg Config, specs []copySpec) error {
+	staged, err := stageManagedFiles(specs)
+	if err != nil {
+		return err
+	}
 	discard := func() {
 		for _, s := range staged {
 			s.discard()
 		}
 	}
+	err = executeFileTransaction(cfg, staged)
+	discard()
+	return err
+}
+
+func stageManagedFiles(specs []copySpec) ([]stagedFile, error) {
+	staged := make([]stagedFile, 0, len(specs))
 	for _, spec := range specs {
 		s, err := stageCopy(spec.source, spec.target, spec.required)
 		if err != nil {
-			discard()
-			return err
+			for _, file := range staged {
+				file.discard()
+			}
+			return nil, err
 		}
 		staged = append(staged, s)
 	}
-	for _, s := range staged {
-		if err := s.commit(); err != nil {
-			discard()
-			return err
-		}
+	return staged, nil
+}
+
+func executeStagedFilesAndState(cfg Config, staged []stagedFile, state *State) error {
+	stateData, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		discardStagedFiles(staged)
+		return err
 	}
-	return nil
+	stagedState, err := stageFile(ExpandPath(cfg.StatePath), bytes.NewReader(stateData))
+	if err != nil {
+		discardStagedFiles(staged)
+		return err
+	}
+	staged = append(staged, stagedState)
+	err = executeFileTransaction(cfg, staged)
+	discardStagedFiles(staged)
+	return err
+}
+
+func discardStagedFiles(staged []stagedFile) {
+	for _, file := range staged {
+		file.discard()
+	}
 }
 
 type stagedFile struct {
@@ -310,7 +370,7 @@ func stageCopy(sourcePath, targetPath string, required bool) (stagedFile, error)
 		}
 		return stagedFile{}, err
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	return stageFile(targetPath, source)
 }
 
@@ -418,10 +478,9 @@ func safeName(value string) string {
 	return sanitized + "-" + hex.EncodeToString(sum[:])[:12]
 }
 
-func inferAccountEmail(service ServiceConfig, accountDir string) string {
+func inferAccountEmailFromPaths(service ServiceConfig, pathFor func(ManagedFile) string) string {
 	for _, file := range service.Files {
-		path := filepath.Join(accountDir, file.BackupName)
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(pathFor(file))
 		if err != nil {
 			continue
 		}

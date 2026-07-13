@@ -3,12 +3,14 @@
 package subswapper
 
 import (
+	"context"
 	"errors"
 	"os"
 	"syscall"
+	"time"
 )
 
-func openLockFile(path string) (*os.File, error) {
+func openLockFile(ctx context.Context, path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -24,27 +26,17 @@ func openLockFile(path string) (*os.File, error) {
 				notified = true
 				notifyLockWait(path)
 			}
-			if err := flockBlocking(file); err != nil {
+			select {
+			case <-ctx.Done():
 				_ = file.Close()
-				return nil, err
+				return nil, ctx.Err()
+			case <-time.After(25 * time.Millisecond):
 			}
-			return file, nil
+			continue
 		}
 		if !errors.Is(err, syscall.EINTR) {
 			_ = file.Close()
 			return nil, err
-		}
-	}
-}
-
-func flockBlocking(file *os.File) error {
-	for {
-		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, syscall.EINTR) {
-			return err
 		}
 	}
 }

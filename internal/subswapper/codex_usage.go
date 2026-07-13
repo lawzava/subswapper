@@ -55,8 +55,27 @@ type codexRPCError struct {
 	Message string `json:"message"`
 }
 
+type codexRPCFailure struct {
+	code    int
+	message string
+}
+
+func (e *codexRPCFailure) Error() string {
+	return fmt.Sprintf("codex app-server RPC error %d", e.code)
+}
+
+type codexAppServerError struct {
+	cause  error
+	stderr string
+}
+
+func (e *codexAppServerError) Error() string { return fmt.Sprintf("codex app-server: %v", e.cause) }
+func (e *codexAppServerError) Unwrap() error { return e.cause }
+
 func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, account AccountState, active bool) (UsageSnapshot, error) {
-	source, err := findCodexAuth(cfg, service, account, active)
+	source, err := snapshotCredentialSource(ctx, cfg, service, account, active, func() (credentialSource, error) {
+		return findCodexAuth(cfg, service, account, active)
+	})
 	if err != nil {
 		return UsageSnapshot{}, err
 	}
@@ -68,7 +87,7 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 	if err != nil {
 		return UsageSnapshot{}, err
 	}
-	defer os.RemoveAll(codexHome)
+	defer func() { _ = os.RemoveAll(codexHome) }()
 
 	if err := writeFileAtomic(filepath.Join(codexHome, "auth.json"), source.data); err != nil {
 		return UsageSnapshot{}, err
@@ -85,21 +104,16 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 	}
 	refreshed, readErr := os.ReadFile(filepath.Join(codexHome, "auth.json"))
 	if readErr == nil && !bytes.Equal(refreshed, source.data) && validateCodexAuth(refreshed) == nil {
-		if err := writeFileAtomic(source.backupPath, refreshed); err != nil {
-			return UsageSnapshot{}, err
-		}
 		// Only touch the live file when it was the source of these tokens;
 		// never clobber a live login we did not read.
-		if active && source.fromLive {
-			if err := writeFileAtomic(source.livePath, refreshed); err != nil {
-				return UsageSnapshot{}, err
-			}
+		if err := applyCredentialUpdate(ctx, cfg, service, account, source, refreshed, true); err != nil {
+			return UsageSnapshot{}, err
 		}
 	}
 
 	usage := convertCodexRateLimits(raw)
 	if !usage.HasLimits() {
-		return UsageSnapshot{}, errors.New("Codex rate limits returned missing limits")
+		return UsageSnapshot{}, errors.New("codex rate limits returned missing limits")
 	}
 	usage.ObservedAt = time.Now().UTC()
 	return usage, nil
@@ -119,7 +133,7 @@ func findCodexAuth(cfg Config, service ServiceConfig, account AccountState, acti
 }
 
 func isCodexRateLimitedError(err error) bool {
-	msg := strings.ToLower(err.Error())
+	msg := strings.ToLower(codexDiagnosticText(err))
 	return strings.Contains(msg, "429") || strings.Contains(msg, "too many requests")
 }
 
@@ -127,7 +141,7 @@ func isCodexRateLimitedError(err error) bool {
 // tokens (e.g. "failed to refresh token: 401 Unauthorized"), so the account
 // is marked unselectable instead of surviving on its cached usage snapshot.
 func isCodexAuthError(err error) bool {
-	msg := strings.ToLower(err.Error())
+	msg := strings.ToLower(codexDiagnosticText(err))
 	for _, marker := range []string{"unauthorized", "401", "403", "refresh token", "not logged in", "invalid_grant"} {
 		if strings.Contains(msg, marker) {
 			return true
@@ -136,16 +150,29 @@ func isCodexAuthError(err error) bool {
 	return false
 }
 
+func codexDiagnosticText(err error) string {
+	parts := []string{err.Error()}
+	var appServerErr *codexAppServerError
+	if errors.As(err, &appServerErr) && appServerErr.stderr != "" {
+		parts = append(parts, appServerErr.stderr)
+	}
+	var rpcErr *codexRPCFailure
+	if errors.As(err, &rpcErr) && rpcErr.message != "" {
+		parts = append(parts, rpcErr.message)
+	}
+	return strings.Join(parts, " ")
+}
+
 func validateCodexAuth(data []byte) error {
 	var auth codexAuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return fmt.Errorf("parse Codex auth: %w", err)
 	}
 	if auth.AuthMode != "" && auth.AuthMode != "chatgpt" {
-		return fmt.Errorf("Codex auth mode %q has no subscription limits", auth.AuthMode)
+		return fmt.Errorf("codex auth mode %q has no subscription limits", auth.AuthMode)
 	}
 	if auth.Tokens == nil || auth.Tokens.AccessToken == "" {
-		return errors.New("Codex ChatGPT access token missing")
+		return errors.New("codex ChatGPT access token missing")
 	}
 	return nil
 }
@@ -259,10 +286,10 @@ func readCodexRPCResponse(reader *bufio.Reader, id int) (json.RawMessage, error)
 			continue
 		}
 		if response.Error != nil {
-			return nil, errors.New(response.Error.Message)
+			return nil, &codexRPCFailure{code: response.Error.Code, message: response.Error.Message}
 		}
 		if len(response.Result) == 0 {
-			return nil, errors.New("Codex app-server response missing result")
+			return nil, errors.New("codex app-server response missing result")
 		}
 		return response.Result, nil
 	}
@@ -281,11 +308,7 @@ func codexRPCIDMatches(value any, want int) bool {
 }
 
 func wrapCodexAppServerError(err error, stderr string) error {
-	stderr = strings.TrimSpace(stderr)
-	if stderr == "" {
-		return fmt.Errorf("Codex app-server: %w", err)
-	}
-	return fmt.Errorf("Codex app-server: %w: %s", err, stderr)
+	return &codexAppServerError{cause: err, stderr: strings.TrimSpace(stderr)}
 }
 
 func envWithOverride(env []string, key, value string) []string {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,5 +49,23 @@ func TestWriteSampleConfigCreatesParentDirectory(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("expected 0600 permissions, got %o", got)
+	}
+}
+
+func TestDefaultMonitorIntervalIsFiveMinutes(t *testing.T) {
+	cfg := Config{Services: []ServiceConfig{{
+		Name:  "svc",
+		Kind:  "custom",
+		Files: []ManagedFile{{Path: "/tmp/source", BackupName: "source"}},
+	}}}
+	cfg.ApplyDefaults()
+	if got := cfg.Monitor.Interval.Duration; got != 5*time.Minute {
+		t.Fatalf("default interval = %s, want 5m", got)
+	}
+}
+
+func TestSampleConfigUsesFiveMinuteInterval(t *testing.T) {
+	if !strings.Contains(sampleConfig, `"interval": "5m"`) {
+		t.Fatalf("sample config does not use five minutes:\n%s", sampleConfig)
 	}
 }

@@ -1,6 +1,7 @@
 package subswapper
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,16 +15,21 @@ type StateLock struct {
 	file *os.File
 }
 
-func AcquireStateLock(cfg Config) (*StateLock, error) {
+func AcquireStateLock(ctx context.Context, cfg Config) (*StateLock, error) {
 	path := ExpandPath(cfg.StatePath) + ".lock"
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	file, err := openLockFile(path)
+	file, err := openLockFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("lock state file %s: %w", path, err)
 	}
-	return &StateLock{file: file}, nil
+	lock := &StateLock{file: file}
+	if err := recoverFileTransaction(cfg); err != nil {
+		lock.Release()
+		return nil, err
+	}
+	return lock, nil
 }
 
 func (l *StateLock) Release() {

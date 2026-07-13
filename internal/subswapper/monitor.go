@@ -25,40 +25,51 @@ const (
 )
 
 func StatusOnce(ctx context.Context, cfg Config) (CycleResult, error) {
-	lock, err := AcquireStateLock(cfg)
+	probed, results, err := collectUsageSnapshot(ctx, cfg)
+	if err != nil {
+		return CycleResult{}, err
+	}
+	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return CycleResult{}, err
 	}
 	defer lock.Release()
-
-	state, err := LoadState(cfg.StatePath)
+	current, err := LoadState(cfg.StatePath)
 	if err != nil {
 		return CycleResult{}, err
 	}
-	cycle := CycleResult{Results: CollectAll(ctx, cfg, state)}
-	if err := SaveState(cfg.StatePath, state); err != nil {
+	mergeProbeState(current, probed)
+	if err := SaveState(cfg.StatePath, current); err != nil {
 		return CycleResult{}, err
 	}
-	return cycle, nil
+	return CycleResult{Results: results}, nil
 }
 
 func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
-	lock, err := AcquireStateLock(cfg)
+	probed, results, err := collectUsageSnapshot(ctx, cfg)
+	if err != nil {
+		return CycleResult{Errors: []error{err}}
+	}
+	cycle := CycleResult{Results: results}
+	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return CycleResult{Errors: []error{err}}
 	}
 	defer lock.Release()
-
 	state, err := LoadState(cfg.StatePath)
 	if err != nil {
 		return CycleResult{Errors: []error{err}}
 	}
-	cycle := CycleResult{Results: CollectAll(ctx, cfg, state)}
+	mergeProbeState(state, probed)
 	if autoSwitch {
 		now := time.Now().UTC()
 		for index := range cycle.Results {
 			result := &cycle.Results[index]
 			serviceState := state.Service(result.Service.Name)
+			if !serviceStateMatchesSnapshot(serviceState, probed.Service(result.Service.Name)) {
+				cycle.Errors = append(cycle.Errors, fmt.Errorf("service %q changed during usage probe; automatic switch skipped", result.Service.Name))
+				continue
+			}
 			if result.Service.Disabled || len(serviceState.Accounts) == 0 {
 				continue
 			}
@@ -73,12 +84,10 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 			if !shouldAutoSwitch(cfg.Monitor, *result, best, serviceState.LastSwitchedAt, now) {
 				continue
 			}
-			if err := switchServiceFiles(cfg, result.Service, state, best.Account.Name); err != nil {
+			if err := switchServiceFiles(cfg, result.Service, state, best.Account.Name, now); err != nil {
 				cycle.Errors = append(cycle.Errors, fmt.Errorf("switch %s to %s: %w", result.Service.Name, best.Account.Name, err))
 				continue
 			}
-			serviceState.ActiveAccount = best.Account.Name
-			serviceState.LastSwitchedAt = now
 			markActive(result, best.Account.Name)
 			cycle.Switches = append(cycle.Switches, SwitchEvent{Service: result.Service.Name, Account: best.Account.Name})
 		}
@@ -90,22 +99,26 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 }
 
 func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEvent, error) {
-	lock, err := AcquireStateLock(cfg)
+	probed, results, err := collectUsageSnapshot(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer lock.Release()
-
 	state, err := LoadState(cfg.StatePath)
 	if err != nil {
 		return nil, err
 	}
+	mergeProbeState(state, probed)
 	all := serviceName == "all"
 	var switches []SwitchEvent
 	var errs []error
 	matched := false
 	actionable := false
-	for _, service := range cfg.Services {
+	for index, service := range cfg.Services {
 		if !all && service.Name != serviceName {
 			continue
 		}
@@ -124,7 +137,15 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 			continue
 		}
 		actionable = true
-		result := CollectService(ctx, cfg, state, service)
+		if !serviceStateMatchesSnapshot(serviceState, probed.Service(service.Name)) {
+			err := fmt.Errorf("service %q changed during usage probe; switch skipped", service.Name)
+			if !all {
+				return nil, err
+			}
+			errs = append(errs, err)
+			continue
+		}
+		result := results[index]
 		best, ok := BestAccount(result.Accounts)
 		if !ok {
 			err := fmt.Errorf("service %q has no selectable accounts", service.Name)
@@ -137,20 +158,13 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 		if best.Active {
 			continue
 		}
-		if err := switchServiceFiles(cfg, service, state, best.Account.Name); err != nil {
+		if err := switchServiceFiles(cfg, service, state, best.Account.Name, time.Now().UTC()); err != nil {
 			err = fmt.Errorf("switch %s to %s: %w", service.Name, best.Account.Name, err)
 			if !all {
 				return nil, err
 			}
 			errs = append(errs, err)
 			continue
-		}
-		serviceState.ActiveAccount = best.Account.Name
-		serviceState.LastSwitchedAt = time.Now().UTC()
-		// Persist immediately so a later failure cannot leave the swap
-		// unrecorded while the files are already on disk.
-		if err := SaveState(cfg.StatePath, state); err != nil {
-			return switches, err
 		}
 		switches = append(switches, SwitchEvent{Service: service.Name, Account: best.Account.Name})
 	}
@@ -164,6 +178,71 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 		errs = append(errs, err)
 	}
 	return switches, errors.Join(errs...)
+}
+
+func collectUsageSnapshot(ctx context.Context, cfg Config) (*State, []ServiceStatus, error) {
+	lock, err := AcquireStateLock(ctx, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	state, err := LoadState(cfg.StatePath)
+	lock.Release()
+	if err != nil {
+		return nil, nil, err
+	}
+	startedAt := time.Now().UTC()
+	for _, service := range state.Services {
+		if service == nil {
+			continue
+		}
+		for accountName, account := range service.Accounts {
+			account.LastProbeStartedAt = startedAt
+			service.Accounts[accountName] = account
+		}
+	}
+	return state, CollectAll(ctx, cfg, state), nil
+}
+
+func mergeProbeState(current, probed *State) {
+	for serviceName, probedService := range probed.Services {
+		if probedService == nil {
+			continue
+		}
+		currentService := current.Services[serviceName]
+		if currentService == nil {
+			continue
+		}
+		for accountName, probedAccount := range probedService.Accounts {
+			currentAccount, ok := currentService.Accounts[accountName]
+			if !ok || !currentAccount.AddedAt.Equal(probedAccount.AddedAt) {
+				continue
+			}
+			if currentAccount.LastProbeStartedAt.After(probedAccount.LastProbeStartedAt) {
+				continue
+			}
+			currentAccount.Usage = probedAccount.Usage
+			currentAccount.FetchBackoffUntil = probedAccount.FetchBackoffUntil
+			currentAccount.CredentialsError = probedAccount.CredentialsError
+			currentAccount.LastProbeError = probedAccount.LastProbeError
+			currentAccount.LastProbeStartedAt = probedAccount.LastProbeStartedAt
+			currentService.Accounts[accountName] = currentAccount
+		}
+	}
+}
+
+func serviceStateMatchesSnapshot(current, snapshot *ServiceState) bool {
+	if current == nil || snapshot == nil || current.ActiveAccount != snapshot.ActiveAccount ||
+		!current.LastSwitchedAt.Equal(snapshot.LastSwitchedAt) || len(current.Accounts) != len(snapshot.Accounts) {
+		return false
+	}
+	for name, snapshotAccount := range snapshot.Accounts {
+		currentAccount, ok := current.Accounts[name]
+		if !ok || !currentAccount.AddedAt.Equal(snapshotAccount.AddedAt) ||
+			!currentAccount.LastProbeStartedAt.Equal(snapshotAccount.LastProbeStartedAt) {
+			return false
+		}
+	}
+	return true
 }
 
 func shouldAutoSwitch(monitor MonitorConfig, result ServiceStatus, best AccountStatus, lastSwitchedAt, now time.Time) bool {

@@ -3,6 +3,7 @@
 package subswapper
 
 import (
+	"context"
 	"errors"
 	"os"
 	"syscall"
@@ -13,7 +14,7 @@ const errorSharingViolation = syscall.Errno(32)
 
 // openLockFile opens the lock file with no sharing allowed, so a second
 // process blocks (polling) until the handle is closed or its owner dies.
-func openLockFile(path string) (*os.File, error) {
+func openLockFile(ctx context.Context, path string) (*os.File, error) {
 	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -33,7 +34,11 @@ func openLockFile(path string) (*os.File, error) {
 			notified = true
 			notifyLockWait(path)
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 

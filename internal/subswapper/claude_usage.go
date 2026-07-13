@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -68,7 +67,9 @@ type claudeTokenResponse struct {
 }
 
 func fetchClaudeUsage(ctx context.Context, cfg Config, service ServiceConfig, account AccountState, active bool) (UsageSnapshot, error) {
-	source, err := findClaudeCredentials(cfg, service, account, active)
+	source, err := snapshotCredentialSource(ctx, cfg, service, account, active, func() (credentialSource, error) {
+		return findClaudeCredentials(cfg, service, account, active)
+	})
 	if err != nil {
 		return UsageSnapshot{}, err
 	}
@@ -78,7 +79,7 @@ func fetchClaudeUsage(ctx context.Context, cfg Config, service ServiceConfig, ac
 		if source.fromLive && !backupMatches(source.backupPath, source.data) {
 			// Opportunistically sync the live credentials into the backup so
 			// tokens rotated by the running client are never lost on switch.
-			if writeErr := writeFileAtomic(source.backupPath, source.data); writeErr != nil {
+			if writeErr := applyCredentialUpdate(ctx, cfg, service, account, source, source.data, false); writeErr != nil {
 				return UsageSnapshot{}, writeErr
 			}
 		}
@@ -95,13 +96,8 @@ func fetchClaudeUsage(ctx context.Context, cfg Config, service ServiceConfig, ac
 	if refreshErr != nil {
 		return UsageSnapshot{}, refreshErr
 	}
-	if err := writeFileAtomic(source.backupPath, refreshed); err != nil {
+	if err := applyCredentialUpdate(ctx, cfg, service, account, source, refreshed, true); err != nil {
 		return UsageSnapshot{}, err
-	}
-	if active {
-		if err := writeFileAtomic(source.livePath, refreshed); err != nil {
-			return UsageSnapshot{}, err
-		}
 	}
 	usage, err = fetchClaudeUsageWithCredentials(ctx, refreshed)
 	if errors.Is(err, errClaudeUnauthorized) {
@@ -146,20 +142,18 @@ func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (U
 	if err != nil {
 		return UsageSnapshot{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return UsageSnapshot{}, fmt.Errorf("%w (%s)", errClaudeUnauthorized, resp.Status)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return UsageSnapshot{}, &rateLimitedError{
 			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
-			message:    fmt.Sprintf("Claude usage API returned %s: %s", resp.Status, strings.TrimSpace(string(body))),
+			message:    fmt.Sprintf("Claude usage API returned %s", resp.Status),
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return UsageSnapshot{}, fmt.Errorf("Claude usage API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return UsageSnapshot{}, fmt.Errorf("claude usage API returned %s", resp.Status)
 	}
 
 	var raw claudeUsageAPIResponse
@@ -168,15 +162,15 @@ func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (U
 	}
 	usage := convertClaudeUsage(raw)
 	if !usage.HasLimits() {
-		return UsageSnapshot{}, errors.New("Claude usage API returned missing limits")
+		return UsageSnapshot{}, errors.New("claude usage API returned missing limits")
 	}
 	usage.ObservedAt = time.Now().UTC()
 	return usage, nil
 }
 
 var (
-	errClaudeUnauthorized = errors.New("Claude usage API unauthorized")
-	errClaudeTokenMissing = errors.New("Claude OAuth access token missing")
+	errClaudeUnauthorized = errors.New("claude usage API unauthorized")
+	errClaudeTokenMissing = errors.New("claude OAuth access token missing")
 )
 
 func shouldRefreshClaudeCredentials(err error, credentials []byte) bool {
@@ -206,11 +200,11 @@ func refreshClaudeCredentials(ctx context.Context, credentials []byte) ([]byte, 
 	}
 	oauthAny, ok := data["claudeAiOauth"].(map[string]any)
 	if !ok {
-		return nil, errors.New("Claude OAuth payload missing")
+		return nil, errors.New("claude OAuth payload missing")
 	}
 	refreshToken, ok := oauthAny["refreshToken"].(string)
 	if !ok || refreshToken == "" {
-		return nil, errors.New("Claude OAuth refresh token missing")
+		return nil, errors.New("claude OAuth refresh token missing")
 	}
 
 	body, err := json.Marshal(map[string]string{
@@ -232,10 +226,9 @@ func refreshClaudeCredentials(ctx context.Context, credentials []byte) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		refreshErr := fmt.Errorf("Claude token refresh returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		refreshErr := fmt.Errorf("claude token refresh returned %s", resp.Status)
 		switch resp.StatusCode {
 		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
 			return nil, fmt.Errorf("%w: %v", errCredentialsInvalid, refreshErr)
@@ -253,7 +246,7 @@ func refreshClaudeCredentials(ctx context.Context, credentials []byte) ([]byte, 
 		return nil, err
 	}
 	if token.AccessToken == "" {
-		return nil, errors.New("Claude token refresh response missing access token")
+		return nil, errors.New("claude token refresh response missing access token")
 	}
 	nowMS := time.Now().UnixMilli()
 	oauthAny["accessToken"] = token.AccessToken
@@ -273,7 +266,7 @@ func parseClaudeOAuth(credentials []byte) (claudeOAuth, error) {
 		return claudeOAuth{}, err
 	}
 	if decoded.ClaudeAiOauth == nil {
-		return claudeOAuth{}, errors.New("Claude OAuth payload missing")
+		return claudeOAuth{}, errors.New("claude OAuth payload missing")
 	}
 	return *decoded.ClaudeAiOauth, nil
 }

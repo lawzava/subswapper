@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -27,14 +28,16 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		printUsage(stderr)
+		if err := printUsage(stderr); err != nil {
+			return err
+		}
 		return errors.New("missing command")
 	}
 
@@ -54,13 +57,13 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "monitor":
 		return runMonitor(args[1:], stdout)
 	case "version", "-version", "--version":
-		printVersion(stdout)
-		return nil
+		return printVersion(stdout)
 	case "help", "-h", "--help":
-		printUsage(stdout)
-		return nil
+		return printUsage(stdout)
 	default:
-		printUsage(stderr)
+		if err := printUsage(stderr); err != nil {
+			return err
+		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
@@ -75,8 +78,8 @@ func runInit(args []string, stdout io.Writer) error {
 	if err := subswapper.WriteSampleConfig(*configPath); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "created %s\n", *configPath)
-	return nil
+	_, err := fmt.Fprintf(stdout, "created %s\n", *configPath)
+	return err
 }
 
 func runStatus(args []string, stdout io.Writer) error {
@@ -98,8 +101,8 @@ func runStatus(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now()))
-	return nil
+	_, err = io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now()))
+	return err
 }
 
 func runImportClaudeSwap(args []string, stdout io.Writer) error {
@@ -124,16 +127,24 @@ func runImportClaudeSwap(args []string, stdout io.Writer) error {
 			active = " active"
 		}
 		if account.Email != "" {
-			fmt.Fprintf(stdout, "imported claude account %s (%s)%s\n", account.Name, account.Email, active)
+			if _, err := fmt.Fprintf(stdout, "imported claude account %s (%s)%s\n", account.Name, account.Email, active); err != nil {
+				return err
+			}
 			continue
 		}
-		fmt.Fprintf(stdout, "imported claude account %s%s\n", account.Name, active)
+		if _, err := fmt.Fprintf(stdout, "imported claude account %s%s\n", account.Name, active); err != nil {
+			return err
+		}
 	}
 	for _, name := range result.Skipped {
-		fmt.Fprintf(stdout, "skipped existing account %s\n", name)
+		if _, err := fmt.Fprintf(stdout, "skipped existing account %s\n", name); err != nil {
+			return err
+		}
 	}
 	for _, importErr := range result.Errors {
-		fmt.Fprintf(stdout, "warning: %s\n", importErr)
+		if _, err := fmt.Fprintf(stdout, "warning: %s\n", importErr); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -163,11 +174,11 @@ func runCapture(args []string, stdout io.Writer) error {
 		return err
 	}
 	if account.Email != "" {
-		fmt.Fprintf(stdout, "captured %s account %s (%s)\n", *serviceName, account.Name, account.Email)
-		return nil
+		_, err := fmt.Fprintf(stdout, "captured %s account %s (%s)\n", *serviceName, account.Name, account.Email)
+		return err
 	}
-	fmt.Fprintf(stdout, "captured %s account %s\n", *serviceName, account.Name)
-	return nil
+	_, err = fmt.Fprintf(stdout, "captured %s account %s\n", *serviceName, account.Name)
+	return err
 }
 
 func runRemove(args []string, stdout io.Writer) error {
@@ -193,8 +204,8 @@ func runRemove(args []string, stdout io.Writer) error {
 	if err := subswapper.RemoveAccount(*cfg, *serviceName, *accountName, *force); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "removed %s account %s\n", *serviceName, *accountName)
-	return nil
+	_, err = fmt.Fprintf(stdout, "removed %s account %s\n", *serviceName, *accountName)
+	return err
 }
 
 func runSwitch(args []string, stdout io.Writer) error {
@@ -219,10 +230,12 @@ func runSwitch(args []string, stdout io.Writer) error {
 
 		switches, err := subswapper.SwitchBest(ctx, *cfg, *serviceName)
 		for _, event := range switches {
-			fmt.Fprintf(stdout, "switched %s to %s\n", event.Service, event.Account)
+			if _, writeErr := fmt.Fprintf(stdout, "switched %s to %s\n", event.Service, event.Account); writeErr != nil {
+				return errors.Join(err, writeErr)
+			}
 		}
 		if err == nil && len(switches) == 0 {
-			fmt.Fprintln(stdout, "already on the best account")
+			_, err = fmt.Fprintln(stdout, "already on the best account")
 		}
 		return err
 	}
@@ -232,8 +245,8 @@ func runSwitch(args []string, stdout io.Writer) error {
 	if err := subswapper.SwitchAccount(*cfg, *serviceName, *accountName); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "switched %s to %s\n", *serviceName, *accountName)
-	return nil
+	_, err = fmt.Fprintf(stdout, "switched %s to %s\n", *serviceName, *accountName)
+	return err
 }
 
 func runMonitor(args []string, stdout io.Writer) error {
@@ -242,6 +255,7 @@ func runMonitor(args []string, stdout io.Writer) error {
 	interval := fs.Duration("interval", 0, "override monitor interval")
 	once := fs.Bool("once", false, "run one monitor cycle")
 	noAuto := fs.Bool("no-auto", false, "observe without switching")
+	verbose := fs.Bool("verbose", false, "print the full status table every cycle")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -262,20 +276,63 @@ func runMonitor(args []string, stdout io.Writer) error {
 	defer stop()
 
 	autoSwitch := cfg.Monitor.AutoSwitchEnabled() && !*noAuto
+	return runMonitorLoop(ctx, *cfg, monitorInterval, *once, autoSwitch, *verbose, stdout, subswapper.MonitorOnce)
+}
+
+type monitorCycleRunner func(context.Context, subswapper.Config, bool) subswapper.CycleResult
+
+func runMonitorLoop(
+	ctx context.Context,
+	cfg subswapper.Config,
+	monitorInterval time.Duration,
+	once bool,
+	autoSwitch bool,
+	verbose bool,
+	stdout io.Writer,
+	runCycle monitorCycleRunner,
+) error {
+	var previous []subswapper.ServiceStatus
+	previousCycleError := ""
+	first := true
 	for {
 		cycleCtx, cancelCycle := context.WithTimeout(ctx, monitorCycleTimeout)
-		cycle := subswapper.MonitorOnce(cycleCtx, *cfg, autoSwitch)
+		cycle := runCycle(cycleCtx, cfg, autoSwitch)
 		cancelCycle()
-		fmt.Fprint(stdout, subswapper.RenderStatus(cycle.Results, cycle.Switches, time.Now()))
-		if len(cycle.Errors) > 0 {
-			fmt.Fprintf(stdout, "\nerrors:\n")
-			for _, cycleErr := range cycle.Errors {
-				fmt.Fprintf(stdout, "- %s\n", cycleErr)
+		if once || verbose {
+			if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, cycle.Switches, time.Now())); err != nil {
+				return err
+			}
+		} else {
+			if first {
+				if _, err := fmt.Fprintf(stdout, "subswapper monitor started, interval %s\n", monitorInterval); err != nil {
+					return err
+				}
+			}
+			if events := subswapper.RenderMonitorEvents(previous, cycle.Results, cycle.Switches); events != "" {
+				if _, err := io.WriteString(stdout, events); err != nil {
+					return err
+				}
 			}
 		}
-		if *once {
+		if !once {
+			cycleError := summarizeCycleErrors(cycle.Errors)
+			switch {
+			case cycleError != "" && cycleError != previousCycleError:
+				if _, err := fmt.Fprintf(stdout, "error monitor: %s\n", cycleError); err != nil {
+					return err
+				}
+			case cycleError == "" && previousCycleError != "":
+				if _, err := fmt.Fprintln(stdout, "recovered monitor"); err != nil {
+					return err
+				}
+			}
+			previousCycleError = cycleError
+		}
+		if once {
 			return errors.Join(cycle.Errors...)
 		}
+		previous = cycle.Results
+		first = false
 
 		timer := time.NewTimer(monitorInterval)
 		select {
@@ -286,21 +343,32 @@ func runMonitor(args []string, stdout io.Writer) error {
 			}
 			return ctx.Err()
 		case <-timer.C:
-			fmt.Fprintln(stdout, strings.Repeat("-", 80))
 		}
 	}
 }
 
-func printVersion(w io.Writer) {
+func summarizeCycleErrors(errs []error) string {
+	if len(errs) == 0 {
+		return ""
+	}
+	summary := strings.Join(strings.Fields(errors.Join(errs...).Error()), " ")
+	if len(summary) > 512 {
+		summary = summary[:512]
+	}
+	return summary
+}
+
+func printVersion(w io.Writer) error {
 	version := "unknown"
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
 		version = info.Main.Version
 	}
-	fmt.Fprintln(w, "subswapper", version)
+	_, err := fmt.Fprintln(w, "subswapper", version, runtime.Version())
+	return err
 }
 
-func printUsage(w io.Writer) {
-	fmt.Fprintln(w, `subswapper manages Claude Code and Codex subscription account bundles.
+func printUsage(w io.Writer) error {
+	_, err := fmt.Fprintln(w, `subswapper manages Claude Code and Codex subscription account bundles.
 
 Usage:
   subswapper init [-config ~/.config/subswapper/config.json]
@@ -309,6 +377,7 @@ Usage:
   subswapper remove -service claude|codex -account <name> [-force]
   subswapper status [-config ~/.config/subswapper/config.json]
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
-  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 30s] [-once] [-no-auto]
+  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose]
   subswapper version`)
+	return err
 }

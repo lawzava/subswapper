@@ -15,7 +15,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -24,8 +24,20 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: go vet
         run: go vet ./...
-      - name: go test
-        run: go test ./...
+      - name: go test with coverage
+        run: go test -coverprofile=coverage.out -count=1 ./...
+      - name: go test race detector
+        run: go test -race -count=1 ./...
+      - name: golangci-lint
+        if: runner.os == 'Linux'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+      - name: govulncheck
+        if: runner.os == 'Linux'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+          govulncheck ./...
       - name: cross-compile windows
         if: runner.os == 'Linux'
         run: GOOS=windows GOARCH=amd64 go build ./...

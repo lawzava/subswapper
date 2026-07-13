@@ -46,6 +46,44 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 	return b.String()
 }
 
+func RenderMonitorEvents(previous, current []ServiceStatus, switches []SwitchEvent) string {
+	previousReasons := make(map[string]string)
+	for _, result := range previous {
+		for _, account := range result.Accounts {
+			previousReasons[accountEventKey(account)] = monitorIssueReason(account)
+		}
+	}
+	var b strings.Builder
+	for _, event := range switches {
+		fmt.Fprintf(&b, "switched %s to %s\n", event.Service, event.Account)
+	}
+	for _, result := range current {
+		for _, account := range result.Accounts {
+			key := accountEventKey(account)
+			before := previousReasons[key]
+			after := monitorIssueReason(account)
+			switch {
+			case after != "" && after != before:
+				fmt.Fprintf(&b, "error %s: %s\n", key, after)
+			case after == "" && before != "":
+				fmt.Fprintf(&b, "recovered %s\n", key)
+			}
+		}
+	}
+	return b.String()
+}
+
+func accountEventKey(account AccountStatus) string {
+	return account.Service + "/" + account.Account.Name
+}
+
+func monitorIssueReason(account AccountStatus) string {
+	if account.Reason == "ready" || account.Reason == "service disabled" || account.Reason == "no captured accounts" {
+		return ""
+	}
+	return account.Reason
+}
+
 func formatWindow(window LimitWindow) string {
 	ratio, ok := window.Ratio()
 	if !ok {
