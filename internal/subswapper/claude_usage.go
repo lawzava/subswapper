@@ -85,6 +85,12 @@ func fetchClaudeUsage(ctx context.Context, cfg Config, service ServiceConfig, ac
 		}
 		return usage, nil
 	}
+	if service.UsesAccountHomes() && shouldRefreshClaudeCredentials(err, source.data) {
+		// The provider process owns refresh-token rotation for permanent homes.
+		// Refreshing a copied token here can race the running client and revoke
+		// the branch that an authenticated session still depends on.
+		return UsageSnapshot{}, fmt.Errorf("%w: Claude account home requires provider login or token refresh", errCredentialsInvalid)
+	}
 	if !shouldRefreshClaudeCredentials(err, source.data) {
 		if errors.Is(err, errClaudeUnauthorized) || errors.Is(err, errClaudeTokenMissing) {
 			return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)

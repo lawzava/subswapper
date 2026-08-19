@@ -115,7 +115,7 @@ func applyCredentialUpdate(
 		}
 	}
 	currentActive := state.Service(service.Name).ActiveAccount == account.Name
-	if currentActive {
+	if currentActive && !service.UsesAccountHomes() {
 		if err := verifyActiveIdentity(cfg, service, account); err != nil {
 			return fmt.Errorf("%w: %v", errCredentialsInvalid, err)
 		}
@@ -128,7 +128,7 @@ func applyCredentialUpdate(
 	if err != nil || !bytes.Equal(currentSource, source.data) {
 		return errCredentialSourceChanged
 	}
-	if currentActive && !source.fromLive {
+	if currentActive && !service.UsesAccountHomes() && !source.fromLive {
 		currentLive, err := os.ReadFile(source.livePath)
 		if err != nil || !bytes.Equal(currentLive, source.data) {
 			return errCredentialSourceChanged
@@ -140,7 +140,7 @@ func applyCredentialUpdate(
 		return err
 	}
 	staged = append(staged, backup)
-	if updateLiveIfActive && currentActive {
+	if updateLiveIfActive && currentActive && !service.UsesAccountHomes() {
 		live, err := stageFile(source.livePath, bytes.NewReader(updated))
 		if err != nil {
 			backup.discard()
@@ -172,7 +172,7 @@ func findCredentialSource(cfg Config, service ServiceConfig, account AccountStat
 			path     string
 			fromLive bool
 		}{{livePath, true}, {backupPath, false}}
-		if !active {
+		if service.UsesAccountHomes() || !active {
 			candidates = candidates[1:]
 		}
 		for _, candidate := range candidates {

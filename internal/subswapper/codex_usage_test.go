@@ -66,6 +66,56 @@ done
 	}
 }
 
+func TestFetchCodexUsageHomeModeUsesPermanentHome(t *testing.T) {
+	dir := t.TempDir()
+	fakeCodex := filepath.Join(dir, "codex")
+	if err := os.WriteFile(fakeCodex, []byte(`#!/bin/sh
+touch "$CODEX_HOME/probe-marker"
+while IFS= read -r line; do
+	case "$line" in
+		*'"id":1'*) printf '%s\n' '{"id":1,"result":{"userAgent":"test"}}' ;;
+		*'"id":2'*)
+			printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":7,"windowDurationMins":300,"resetsAt":1909954910}}}}'
+			exit 0
+			;;
+	esac
+done
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldCommand := codexCommand
+	codexCommand = fakeCodex
+	t.Cleanup(func() { codexCommand = oldCommand })
+
+	service := ServiceConfig{
+		Name:        "codex",
+		Kind:        "codex",
+		AccountMode: AccountModeHome,
+		Files:       []ManagedFile{requiredFile(filepath.Join(dir, "live-auth.json"), "auth.json")},
+	}
+	cfg := Config{BackupRoot: filepath.Join(dir, "accounts"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
+	home := AccountDir(cfg, "codex", "work")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","account_id":"work"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	account := AccountState{Name: "work"}
+	state := NewState()
+	state.Service("codex").Accounts["work"] = account
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fetchCodexUsage(testContext(t), cfg, service, account, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "probe-marker")); err != nil {
+		t.Fatalf("Codex app-server did not use permanent home: %v", err)
+	}
+}
+
 func TestFetchCodexUsageAcceptsWeeklyOnly(t *testing.T) {
 	dir := t.TempDir()
 	fakeCodex := filepath.Join(dir, "codex")

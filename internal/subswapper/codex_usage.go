@@ -83,14 +83,16 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 		return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
 	}
 
-	codexHome, err := os.MkdirTemp("", "subswapper-codex-*")
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-	defer func() { _ = os.RemoveAll(codexHome) }()
-
-	if err := writeFileAtomic(filepath.Join(codexHome, "auth.json"), source.data); err != nil {
-		return UsageSnapshot{}, err
+	codexHome := AccountDir(cfg, service.Name, account.Name)
+	if !service.UsesAccountHomes() {
+		codexHome, err = os.MkdirTemp("", "subswapper-codex-*")
+		if err != nil {
+			return UsageSnapshot{}, err
+		}
+		defer func() { _ = os.RemoveAll(codexHome) }()
+		if err := writeFileAtomic(filepath.Join(codexHome, "auth.json"), source.data); err != nil {
+			return UsageSnapshot{}, err
+		}
 	}
 	raw, err := readCodexRateLimits(ctx, codexHome)
 	if err != nil {
@@ -103,7 +105,7 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 		return UsageSnapshot{}, err
 	}
 	refreshed, readErr := os.ReadFile(filepath.Join(codexHome, "auth.json"))
-	if readErr == nil && !bytes.Equal(refreshed, source.data) && validateCodexAuth(refreshed) == nil {
+	if !service.UsesAccountHomes() && readErr == nil && !bytes.Equal(refreshed, source.data) && validateCodexAuth(refreshed) == nil {
 		// Only touch the live file when it was the source of these tokens;
 		// never clobber a live login we did not read.
 		if err := applyCredentialUpdate(ctx, cfg, service, account, source, refreshed, true); err != nil {

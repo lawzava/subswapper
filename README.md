@@ -3,27 +3,25 @@
 [![CI](https://github.com/lawzava/subswapper/actions/workflows/ci.yml/badge.svg)](https://github.com/lawzava/subswapper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`subswapper` is a small Go CLI that manages multiple [Claude Code](https://claude.com/claude-code)
-and [Codex](https://openai.com/codex/) subscription accounts on one machine.
-Capture each account's credential files once, then switch between them without
-logging in again — manually, or automatically when the active account
-approaches its usage limits.
+`subswapper` is a small Go CLI that manages isolated [Claude Code](https://claude.com/claude-code)
+and [Codex](https://openai.com/codex/) account homes on one machine. Each
+provider owns and refreshes the credentials in its permanent home. Subswapper
+tracks usage and chooses which home to use without replacing authentication
+files underneath running sessions.
 
 ## Features
 
-- **Capture once, switch instantly** — snapshots the credential files of the
-  logged-in account into a private backup, then swaps bundles transactionally
-  with rollback and interrupted-operation recovery.
+- **Permanent account homes** — creates private per-account directories for
+  `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, with commands to log in, print the
+  environment, and launch a client in the selected home.
 - **Live usage tracking** — reads real usage windows (5-hour, weekly, and
   Claude's Fable-scoped weekly) straight from each provider using the stored
   credentials; no scraping, no extra logins.
-- **Automatic switching** — a monitor loop moves each service to the
-  least-used healthy account when the active one crosses a configurable
-  threshold, with cooldown and minimum-improvement pacing to avoid churn.
-- **Safe by design** — cross-process locking, atomic replacement of individual
-  files, transactional bundle recovery, `0600` files under `0700` directories,
-  and corruption guards that never overwrite a good credential backup with a
-  broken or foreign live file.
+- **Quota-aware routing** — a monitor loop changes the preferred account when
+  the selected one crosses a configurable threshold, without mutating a
+  running provider's credentials.
+- **Safe by design** — cross-process locking, private `0700` homes, atomic
+  credential persistence, and non-destructive migration from old snapshots.
 - **Extensible** — any other service can be managed by listing its credential
   files in the config; plug in a custom `usage_command` for usage probing.
 
@@ -52,31 +50,37 @@ For Codex usage probing, the `codex` CLI must be on `PATH` (see
 # Create the default config (Claude Code + Codex)
 subswapper init
 
-# Log in to an account with the normal client, then snapshot it
-subswapper capture -service claude -account personal
-subswapper capture -service codex -account personal
+# Create and authenticate permanent homes
+subswapper home create -service claude -account personal
+subswapper home login  -service claude -account personal
+subswapper home create -service codex  -account personal
+subswapper home login  -service codex  -account personal
 
-# Log in to the next account and snapshot that too
-subswapper capture -service claude -account work
+# Create another account without touching the first account's credentials
+subswapper home create -service claude -account work
+subswapper home login  -service claude -account work
 
 # See every account's usage windows
 subswapper status
 
-# Switch to a specific account, or let subswapper pick the least-used one
+# Select a preferred account, or let subswapper pick the least-used one
 subswapper switch -service claude -account work
 subswapper switch -service all -account auto
 
-# Keep switching automatically in the background
+# Run a client with the selected account home
+subswapper home run -service claude -- claude
+
+# Keep the preferred route current in the background
 subswapper monitor
 ```
 
-`status` prints one row per captured account:
+`status` prints one row per registered account:
 
 ```
 subswapper status 2026-07-02T14:07:31Z
 
-SERVICE    ACCOUNT                  ACTIVE  5H                           WEEKLY                       FABLE5                       SCORE    STATE
--------    -------                  ------  --                           ------                       ------                       -----    -----
+SERVICE    ACCOUNT                  SELECTED  5H                           WEEKLY                       FABLE5                       SCORE    STATE
+-------    -------                  --------  --                           ------                       ------                       -----    -----
 claude     personal                 yes     62% reset Jul02 15:00        31% reset Jul05 23:00        18% reset Jul05 23:00        62%      ready
 claude     work                             12% reset Jul02 19:00        8% reset Jul07 11:00         4% reset Jul07 11:00         12%      ready
 codex      personal                 yes     91% reset Jul02 16:30        44% reset Jul06 09:00        -                            91%      ready
@@ -91,17 +95,41 @@ value auto-switching compares.
 | Command | Description |
 | --- | --- |
 | `init` | Write a starter config file. |
-| `capture -service <name> -account <name> [-email <label>]` | Snapshot the currently logged-in account's credential files. |
-| `switch -service <name> [-account <name>\|auto]` | Restore an account's bundle; `auto` picks the least-used healthy account. |
+| `home create -service <name> -account <name> [-email <label>]` | Create and register an empty private account home. |
+| `home login -service <name> [-account <name>]` | Run the provider's login command in that account home. |
+| `home path\|env -service <name> [-account <name>]` | Print a home path or shell export for configuring other tools. |
+| `home run -service <name> [-account <name>] [-- command...]` | Run a command with the selected account's home environment. |
+| `home migrate` | Copy legacy snapshots into native home filenames without deleting or overwriting files. |
+| `capture -service <name> -account <name> [-email <label>]` | Import the current login into a home; retained for migration and bundle-mode services. |
+| `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the least-used healthy account. |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table. |
-| `remove -service <name> -account <name> [-force]` (alias `rm`) | Delete a captured account and its backup. |
+| `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
 
 All commands accept `-config <path>` (default
 `~/.config/subswapper/config.json` on Linux).
+
+## Using homes with T3 Code
+
+For Claude, use the path printed by:
+
+```sh
+subswapper home path -service claude -account work
+```
+
+as that provider instance's `CLAUDE_CONFIG_DIR`.
+
+For Codex, configure every T3 provider with the same shared `CODEX_HOME` path
+(normally `~/.codex`) and use each Subswapper Codex account path as its
+**Shadow home path**. This keeps every `auth.json` private while T3 shares
+sessions and lets an existing thread continue with another account.
+
+`home run` is useful outside T3. A child process receives the selected
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Subswapper cannot change the environment
+of a shell or provider process that is already running.
 
 ## How auto-switching works
 
@@ -123,8 +151,10 @@ or do not match the stable identity of the captured account are never selected,
 whatever their cached usage says. A manual
 `switch -account auto` always forces the best account immediately.
 
-Before every switch, the outgoing account's live files are synced back into
-its backup so credentials rotated while it was active are never lost.
+In account-home mode, switching updates routing state only. Existing T3 or CLI
+processes are not silently rebound; select the recommended provider in T3 or
+start the next command through `home run`. Explicit custom file-bundle
+services retain the legacy transactional switching behavior.
 
 ## Configuration
 
@@ -137,8 +167,8 @@ its backup so credentials rotated while it was active are never lost.
     "auto_switch": true
   },
   "services": [
-    { "name": "claude", "kind": "claude", "display_name": "Claude Code" },
-    { "name": "codex", "kind": "codex", "display_name": "Codex" }
+    { "name": "claude", "kind": "claude", "display_name": "Claude Code", "account_mode": "home" },
+    { "name": "codex", "kind": "codex", "display_name": "Codex", "account_mode": "home" }
   ]
 }
 ```
@@ -155,20 +185,16 @@ The `monitor` block accepts these knobs (defaults shown):
 }
 ```
 
-Top-level `backup_root` and `state_path` override where backups and state are
-stored. Each service may list explicit `files` (path + `backup_name` +
-optional `required: false`) to manage any credential layout; services of kind
-`claude`/`claude-code` and `codex` get sensible defaults:
+Top-level `backup_root` and `state_path` override where account homes and state
+are stored. (`backup_root` keeps its historical name for compatibility.)
+Built-in services without explicit `files` default to `account_mode: "home"`.
+Native credentials are stored as:
 
-Claude Code:
+- Claude: `<account-home>/.credentials.json` and optional `.config.json`
+- Codex: `<account-home>/auth.json`
 
-- credentials: `${CLAUDE_CONFIG_DIR:-~/.claude}/.credentials.json`
-- config: `${CLAUDE_CONFIG_DIR:-~}/.claude.json`, or legacy
-  `${CLAUDE_CONFIG_DIR:-~/.claude}/.config.json` when present
-
-Codex:
-
-- auth: `${CODEX_HOME:-~/.codex}/auth.json`
+An explicit `files` list defaults a service to `account_mode: "bundle"`. This
+keeps custom-service support and legacy transactional switching available.
 
 Codex can also store credentials in an OS keyring. `subswapper` manages
 file-backed credentials only, so configure Codex with:
@@ -177,21 +203,24 @@ file-backed credentials only, so configure Codex with:
 cli_auth_credentials_store = "file"
 ```
 
-Then log in before capturing.
+`home login` authenticates directly inside the selected permanent home.
 
 ## Usage probes
 
 **Claude** usage is fetched from Anthropic's OAuth usage endpoint using the
-stored credentials, refreshing expired tokens automatically. The weekly limit
+access token in each home. In home mode, Subswapper never rotates Claude's
+refresh token: the provider owns that operation, preventing a monitor probe
+from creating a competing token branch. An expired home is marked as requiring
+provider login or refresh. The weekly limit
 scoped to Anthropic's Fable models is tracked as its own window — the `FABLE5`
 column in `status` output, JSON key `fable_weekly` — shown alongside the
 standard windows and included in autoswitch scoring. Other model-scoped
 limits are ignored.
 
 **Codex** usage is read through the local `codex app-server` JSON-RPC
-interface. For each captured account, `subswapper` starts the app-server with
-a temporary `CODEX_HOME` containing that account's stored `auth.json` and maps
-windows by their reported duration. Current plans may expose only a weekly
+interface using the permanent account `CODEX_HOME`, so an official credential
+refresh stays in that home. Subswapper does not create a disposable copy of
+the refresh token. Current plans may expose only a weekly
 window; any available provider window is displayed and included in scoring.
 This requires ChatGPT auth in file storage; API-key mode has no subscription
 limits to read.
@@ -235,30 +264,36 @@ copies config snapshots, and imports the usage cache, naming each slot
 credential files still match it. After import, the `cswap` binary is no
 longer needed.
 
+## Migrating from Subswapper 0.1
+
+After upgrading an existing installation, run:
+
+```sh
+subswapper home migrate
+```
+
+Legacy Claude `credentials.json` and `claude.json` snapshots are copied to
+their native home names, `.credentials.json` and `.config.json`. Existing
+native files win; nothing is overwritten or deleted. Codex `auth.json` files
+already have their native filename. Verify with `subswapper status`, then use
+`home path` to configure T3 provider instances.
+
 ## Data & security
 
 Defaults on Linux (macOS and Windows use their native config/data folders):
 
 - config: `~/.config/subswapper/config.json`
 - state: `~/.local/share/subswapper/state.json`
-- backups: `~/.local/share/subswapper/accounts/`
+- account homes: `~/.local/share/subswapper/accounts/`
 
 Linux and macOS are tested in CI; Windows builds are cross-compiled but
 currently untested — treat Windows support as experimental.
 
-Before subswapper syncs token rotations back into a captured account, it
-checks Claude's account UUID or Codex's account ID. If the live client was
-logged into a different account outside subswapper, synchronization and
-automatic switching stop with an identity mismatch instead of overwriting a
-credential backup. Capture or reconcile that login explicitly before
-continuing.
-
-Credential backups and state are written with `0600` permissions under `0700`
-directories. Individual files are staged and renamed atomically. Multi-file
-bundle changes use rollback snapshots and a recovery journal so a failed or
-interrupted operation is restored before the next state operation.
-Still: **treat the backup directory like a password store** — it holds working
-OAuth tokens for every captured account.
+Credentials and state are written with `0600` permissions under `0700`
+directories. Home removal preserves the directory by default;
+`-delete-home` is required to erase it. Explicit bundle-mode changes still use
+rollback snapshots and a recovery journal. **Treat the account root like a
+password store** — it holds working OAuth tokens.
 
 ## Running as a service
 
@@ -267,7 +302,7 @@ To keep the monitor running, a systemd user unit works well:
 ```ini
 # ~/.config/systemd/user/subswapper.service
 [Unit]
-Description=subswapper account monitor
+Description=subswapper account-home quota monitor
 
 [Service]
 ExecStart=%h/go/bin/subswapper monitor

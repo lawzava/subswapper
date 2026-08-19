@@ -38,6 +38,9 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage:") {
 		t.Fatalf("help output:\n%s", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "home create") || !strings.Contains(stdout.String(), "home run") {
+		t.Fatalf("help output lacks account-home commands:\n%s", stdout.String())
+	}
 	stdout.Reset()
 	if err := run([]string{"version"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
@@ -51,6 +54,111 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	if err := run(nil, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "missing command") {
 		t.Fatalf("missing command error = %v", err)
 	}
+}
+
+func TestRunHomeCreatePathAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "claude")
+	var stdout, stderr bytes.Buffer
+
+	if err := run([]string{"home", "create", "-config", configPath, "-service", "claude", "-account", "work", "-email", "work@example.com"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	wantHome := filepath.Join(dir, "accounts", "claude", "work")
+	if !strings.Contains(stdout.String(), wantHome) {
+		t.Fatalf("create output = %q, want home %q", stdout.String(), wantHome)
+	}
+
+	stdout.Reset()
+	if err := run([]string{"home", "path", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(stdout.String()) != wantHome {
+		t.Fatalf("path output = %q, want %q", stdout.String(), wantHome)
+	}
+
+	stdout.Reset()
+	if err := run([]string{"home", "env", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "export CLAUDE_CONFIG_DIR='"+wantHome+"'" {
+		t.Fatalf("env output = %q", got)
+	}
+}
+
+func TestRunHomeCommandReceivesSelectedEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "codex")
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"home", "create", "-config", configPath, "-service", "codex", "-account", "personal"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+
+	if err := run([]string{"home", "run", "-config", configPath, "-service", "codex", "-account", "personal", "--", "sh", "-c", `printf %s "$CODEX_HOME"`}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	wantHome := filepath.Join(dir, "accounts", "codex", "personal")
+	if stdout.String() != wantHome {
+		t.Fatalf("run output = %q, want %q", stdout.String(), wantHome)
+	}
+}
+
+func TestRemoveHomeAccountPreservesHomeUnlessDeleteRequested(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		deleteHome bool
+	}{
+		{name: "preserve"},
+		{name: "delete", deleteHome: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := writeHomeModeConfig(t, dir, "codex")
+			var stdout, stderr bytes.Buffer
+			if err := run([]string{"home", "create", "-config", configPath, "-service", "codex", "-account", "work"}, &stdout, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			home := filepath.Join(dir, "accounts", "codex", "work")
+			marker := filepath.Join(home, "keep-me")
+			if err := os.WriteFile(marker, []byte("state"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"remove", "-config", configPath, "-service", "codex", "-account", "work", "-force"}
+			if test.deleteHome {
+				args = append(args, "-delete-home")
+			}
+			if err := run(args, &stdout, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			_, err := os.Stat(marker)
+			if test.deleteHome && !os.IsNotExist(err) {
+				t.Fatalf("home was not deleted: %v", err)
+			}
+			if !test.deleteHome && err != nil {
+				t.Fatalf("home was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+func writeHomeModeConfig(t *testing.T, dir, kind string) string {
+	t.Helper()
+	cfg := subswapper.Config{
+		BackupRoot: filepath.Join(dir, "accounts"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []subswapper.ServiceConfig{{Name: kind, Kind: kind}},
+	}
+	cfg.ApplyDefaults()
+	path := filepath.Join(dir, "config.json")
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestRunStatusWithCustomProbe(t *testing.T) {

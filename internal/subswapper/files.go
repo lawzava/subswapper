@@ -113,6 +113,12 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 		// credentials the live client rotated since the last sync.
 		return nil
 	}
+	if service.UsesAccountHomes() {
+		serviceState := state.Service(service.Name)
+		serviceState.ActiveAccount = accountName
+		serviceState.LastSwitchedAt = time.Now().UTC()
+		return SaveState(cfg.StatePath, state)
+	}
 	if err := switchServiceFiles(cfg, service, state, accountName, time.Now().UTC()); err != nil {
 		return err
 	}
@@ -120,6 +126,10 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 }
 
 func RemoveAccount(cfg Config, serviceName, accountName string, force bool) error {
+	return RemoveAccountWithOptions(cfg, serviceName, accountName, force, false)
+}
+
+func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force, deleteHome bool) error {
 	if strings.TrimSpace(accountName) == "" {
 		return errors.New("account name is required")
 	}
@@ -156,6 +166,9 @@ func RemoveAccount(cfg Config, serviceName, accountName string, force bool) erro
 	if serviceState.ActiveAccount == accountName {
 		serviceState.ActiveAccount = ""
 	}
+	if service.UsesAccountHomes() && !deleteHome {
+		return SaveState(cfg.StatePath, state)
+	}
 	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
 		return err
 	}
@@ -180,6 +193,11 @@ func validateAccountName(name string) error {
 // first syncs the outgoing account so rotated credentials are not lost.
 func switchServiceFiles(cfg Config, service ServiceConfig, state *State, accountName string, switchedAt time.Time) error {
 	serviceState := state.Service(service.Name)
+	if service.UsesAccountHomes() {
+		serviceState.ActiveAccount = accountName
+		serviceState.LastSwitchedAt = switchedAt
+		return nil
+	}
 	outgoing := serviceState.ActiveAccount
 	if outgoing != "" && outgoing != accountName {
 		if _, ok := serviceState.Accounts[outgoing]; ok {

@@ -100,6 +100,12 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 
 	result := ImportResult{}
 	var staged []stagedFile
+	credentialsName := "credentials.json"
+	configName := "claude.json"
+	if service.UsesAccountHomes() {
+		credentialsName = ".credentials.json"
+		configName = ".config.json"
+	}
 	for _, number := range order {
 		numberString := strconv.Itoa(number)
 		entry, ok := sequence.Accounts[numberString]
@@ -124,13 +130,13 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 			continue
 		}
 		accountDir := AccountDir(cfg, service.Name, accountName)
-		stagedCredentials, err := stageFile(filepath.Join(accountDir, "credentials.json"), bytes.NewReader(credentials))
+		stagedCredentials, err := stageFile(filepath.Join(accountDir, credentialsName), bytes.NewReader(credentials))
 		if err != nil {
 			discardStagedFiles(staged)
 			return ImportResult{}, err
 		}
 		staged = append(staged, stagedCredentials)
-		stagedConfig, err := stageFile(filepath.Join(accountDir, "claude.json"), bytes.NewReader(config))
+		stagedConfig, err := stageFile(filepath.Join(accountDir, configName), bytes.NewReader(config))
 		if err != nil {
 			discardStagedFiles(staged)
 			return ImportResult{}, err
@@ -156,8 +162,8 @@ func ImportClaudeSwap(cfg Config, root string) (ImportResult, error) {
 		// a different login over this slot's backup.
 		if sequence.ActiveAccountNumber == number && serviceState.ActiveAccount == "" &&
 			liveFilesMatchImport(service, map[string][]byte{
-				"credentials.json": credentials,
-				"claude.json":      config,
+				credentialsName: credentials,
+				configName:      config,
 			}) {
 			serviceState.ActiveAccount = accountName
 			result.Active = accountName

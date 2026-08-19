@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -48,6 +49,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runImportClaudeSwap(args[1:], stdout)
 	case "capture":
 		return runCapture(args[1:], stdout)
+	case "home":
+		return runHome(args[1:], stdout, stderr)
 	case "remove", "rm":
 		return runRemove(args[1:], stdout)
 	case "status", "list":
@@ -66,6 +69,150 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runHome(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("missing home command: create, path, env, login, run, or migrate")
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("home "+action, flag.ContinueOnError)
+	configPath := fs.String("config", defaultConfigPath, "config file")
+	serviceName := fs.String("service", "", "service name")
+	accountName := fs.String("account", "", "account name; defaults to the selected account")
+	email := fs.String("email", "", "account email label")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	cfg, err := subswapper.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if action == "migrate" {
+		result, err := subswapper.MigrateAccountHomes(*cfg)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "migrated account homes: copied %d, preserved %d existing files\n", result.Copied, result.Skipped)
+		return err
+	}
+	if *serviceName == "" {
+		return errors.New("missing -service")
+	}
+	if action == "create" {
+		if *accountName == "" {
+			return errors.New("missing -account")
+		}
+		account, home, err := subswapper.CreateAccountHome(*cfg, *serviceName, *accountName, *email)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "created %s account home %s at %s\n", *serviceName, account.Name, home)
+		return err
+	}
+	service, account, home, err := resolveHomeSelection(*cfg, *serviceName, *accountName)
+	if err != nil {
+		return err
+	}
+	switch action {
+	case "path":
+		_, err = fmt.Fprintln(stdout, home)
+		return err
+	case "env":
+		environment := subswapper.AccountEnvironment(*cfg, service, account)
+		for key, value := range environment {
+			if _, err := fmt.Fprintf(stdout, "export %s=%s\n", key, shellQuote(value)); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "login":
+		command, commandArgs, err := providerLoginCommand(service)
+		if err != nil {
+			return err
+		}
+		if err := runWithAccountHome(*cfg, service, account, command, commandArgs, stdout, stderr); err != nil {
+			return err
+		}
+		return subswapper.ResetAccountProbeState(*cfg, service.Name, account)
+	case "run":
+		commandArgs := fs.Args()
+		if len(commandArgs) == 0 {
+			commandArgs = []string{providerBinary(service)}
+		}
+		return runWithAccountHome(*cfg, service, account, commandArgs[0], commandArgs[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown home command %q", action)
+	}
+}
+
+func resolveHomeSelection(cfg subswapper.Config, serviceName, accountName string) (subswapper.ServiceConfig, string, string, error) {
+	service, ok := cfg.Service(serviceName)
+	if !ok {
+		return subswapper.ServiceConfig{}, "", "", fmt.Errorf("service %q not found", serviceName)
+	}
+	if !service.UsesAccountHomes() {
+		return subswapper.ServiceConfig{}, "", "", fmt.Errorf("service %q does not use account homes", serviceName)
+	}
+	state, err := subswapper.LoadState(cfg.StatePath)
+	if err != nil {
+		return subswapper.ServiceConfig{}, "", "", err
+	}
+	if accountName == "" {
+		accountName = state.Service(service.Name).ActiveAccount
+	}
+	if accountName == "" {
+		return subswapper.ServiceConfig{}, "", "", fmt.Errorf("service %q has no selected account", serviceName)
+	}
+	if _, ok := state.Account(service.Name, accountName); !ok {
+		return subswapper.ServiceConfig{}, "", "", fmt.Errorf("account %q not found for service %q", accountName, service.Name)
+	}
+	return service, accountName, subswapper.AccountDir(cfg, service.Name, accountName), nil
+}
+
+func providerBinary(service subswapper.ServiceConfig) string {
+	if strings.EqualFold(service.Kind, "codex") {
+		return "codex"
+	}
+	return "claude"
+}
+
+func providerLoginCommand(service subswapper.ServiceConfig) (string, []string, error) {
+	switch strings.ToLower(service.Kind) {
+	case "claude", "claude-code":
+		return "claude", []string{"auth", "login"}, nil
+	case "codex":
+		return "codex", []string{"login"}, nil
+	default:
+		return "", nil, fmt.Errorf("service %q does not have a built-in login command", service.Name)
+	}
+}
+
+func runWithAccountHome(cfg subswapper.Config, service subswapper.ServiceConfig, account, command string, args []string, stdout, stderr io.Writer) error {
+	cmd := exec.Command(command, args...)
+	cmd.Env = accountProcessEnvironment(os.Environ(), subswapper.AccountEnvironment(cfg, service, account))
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
+func accountProcessEnvironment(base []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(base)+len(overrides))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := overrides[key]; !replaced {
+			result = append(result, entry)
+		}
+	}
+	for key, value := range overrides {
+		result = append(result, key+"="+value)
+	}
+	return result
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 func runInit(args []string, stdout io.Writer) error {
@@ -187,6 +334,7 @@ func runRemove(args []string, stdout io.Writer) error {
 	serviceName := fs.String("service", "", "service name")
 	accountName := fs.String("account", "", "account name")
 	force := fs.Bool("force", false, "remove even if this account is active")
+	deleteHome := fs.Bool("delete-home", false, "also permanently delete an account home and its contents")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -201,10 +349,14 @@ func runRemove(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := subswapper.RemoveAccount(*cfg, *serviceName, *accountName, *force); err != nil {
+	if err := subswapper.RemoveAccountWithOptions(*cfg, *serviceName, *accountName, *force, *deleteHome); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "removed %s account %s\n", *serviceName, *accountName)
+	action := "unregistered"
+	if *deleteHome {
+		action = "removed"
+	}
+	_, err = fmt.Fprintf(stdout, "%s %s account %s\n", action, *serviceName, *accountName)
 	return err
 }
 
@@ -368,13 +520,18 @@ func printVersion(w io.Writer) error {
 }
 
 func printUsage(w io.Writer) error {
-	_, err := fmt.Fprintln(w, `subswapper manages Claude Code and Codex subscription account bundles.
+	_, err := fmt.Fprintln(w, `subswapper manages isolated Claude Code and Codex account homes and usage limits.
 
 Usage:
   subswapper init [-config ~/.config/subswapper/config.json]
   subswapper import-cswap [-root ~/.local/share/claude-swap]
+  subswapper home create -service claude|codex -account <name> [-email user@example.com]
+  subswapper home path|env -service claude|codex [-account <name>]
+  subswapper home login -service claude|codex [-account <name>]
+  subswapper home run -service claude|codex [-account <name>] [-- command args...]
+  subswapper home migrate [-config ~/.config/subswapper/config.json]
   subswapper capture -service claude|codex -account <name> [-email user@example.com]
-  subswapper remove -service claude|codex -account <name> [-force]
+  subswapper remove -service claude|codex -account <name> [-force] [-delete-home]
   subswapper status [-config ~/.config/subswapper/config.json]
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
   subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose]

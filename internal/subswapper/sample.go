@@ -13,14 +13,16 @@ const sampleConfig = `{
   },
   "services": [
     {
-      "name": "claude",
-      "kind": "claude",
-      "display_name": "Claude Code"
+	      "name": "claude",
+	      "kind": "claude",
+	      "display_name": "Claude Code",
+	      "account_mode": "home"
     },
     {
-      "name": "codex",
-      "kind": "codex",
-      "display_name": "Codex"
+	      "name": "codex",
+	      "kind": "codex",
+	      "display_name": "Codex",
+	      "account_mode": "home"
     }
   ]
 }

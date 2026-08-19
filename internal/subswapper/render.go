@@ -9,11 +9,11 @@ import (
 func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "subswapper status %s\n\n", observedAt.Format(time.RFC3339))
-	fmt.Fprintf(&b, "%-10s %-24s %-7s %-28s %-28s %-28s %-8s %s\n", "SERVICE", "ACCOUNT", "ACTIVE", "5H", "WEEKLY", "FABLE5", "SCORE", "STATE")
-	fmt.Fprintf(&b, "%-10s %-24s %-7s %-28s %-28s %-28s %-8s %s\n", "-------", "-------", "------", "--", "------", "------", "-----", "-----")
+	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", "SERVICE", "ACCOUNT", "SELECTED", "5H", "WEEKLY", "FABLE5", "SCORE", "STATE")
+	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", "-------", "-------", "--------", "--", "------", "------", "-----", "-----")
 	for _, result := range results {
 		if len(result.Accounts) == 0 {
-			fmt.Fprintf(&b, "%-10s %-24s %-7s %-28s %-28s %-28s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", "no captured accounts")
+			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", "no registered accounts")
 			continue
 		}
 		for _, account := range result.Accounts {
@@ -25,7 +25,7 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 			if account.Selectable {
 				score = fmt.Sprintf("%.0f%%", account.Score*100)
 			}
-			fmt.Fprintf(&b, "%-10s %-24s %-7s %-28s %-28s %-28s %-8s %s\n",
+			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n",
 				account.Service,
 				account.Account.Name,
 				active,
@@ -78,7 +78,7 @@ func accountEventKey(account AccountStatus) string {
 }
 
 func monitorIssueReason(account AccountStatus) string {
-	if account.Reason == "ready" || account.Reason == "service disabled" || account.Reason == "no captured accounts" {
+	if account.Reason == "ready" || account.Reason == "service disabled" || account.Reason == "no registered accounts" {
 		return ""
 	}
 	return account.Reason

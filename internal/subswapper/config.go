@@ -42,6 +42,7 @@ type ServiceConfig struct {
 	Name         string        `json:"name"`
 	Kind         string        `json:"kind"`
 	DisplayName  string        `json:"display_name,omitempty"`
+	AccountMode  string        `json:"account_mode,omitempty"`
 	Files        []ManagedFile `json:"files,omitempty"`
 	UsageCommand []string      `json:"usage_command,omitempty"`
 	Disabled     bool          `json:"disabled,omitempty"`
@@ -91,8 +92,15 @@ func (c *Config) ApplyDefaults() {
 		if service.DisplayName == "" {
 			service.DisplayName = service.Name
 		}
+		if service.AccountMode == "" {
+			if len(service.Files) == 0 && isBuiltInKind(service.Kind) {
+				service.AccountMode = AccountModeHome
+			} else {
+				service.AccountMode = AccountModeBundle
+			}
+		}
 		if len(service.Files) == 0 {
-			service.Files = defaultManagedFiles(service.Kind)
+			service.Files = defaultManagedFiles(service.Kind, service.UsesAccountHomes())
 		}
 	}
 }
@@ -125,6 +133,12 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate service %q (names may not differ only by letter case)", service.Name)
 		}
 		seen[serviceKey] = struct{}{}
+		if service.AccountMode != AccountModeHome && service.AccountMode != AccountModeBundle {
+			return fmt.Errorf("service %q account_mode must be %q or %q", service.Name, AccountModeHome, AccountModeBundle)
+		}
+		if service.UsesAccountHomes() && !isBuiltInKind(service.Kind) {
+			return fmt.Errorf("service %q account_mode %q requires kind claude or codex", service.Name, AccountModeHome)
+		}
 		if len(service.Files) == 0 {
 			return fmt.Errorf("service %q has no managed files", service.Name)
 		}
@@ -277,10 +291,10 @@ func ExpandPath(path string) string {
 	return expanded
 }
 
-func defaultManagedFiles(kind string) []ManagedFile {
+func defaultManagedFiles(kind string, accountHomes bool) []ManagedFile {
 	switch strings.ToLower(kind) {
 	case "claude", "claude-code":
-		return defaultClaudeFiles()
+		return defaultClaudeFiles(accountHomes)
 	case "codex":
 		return []ManagedFile{
 			requiredFile(codexHomeFile("auth.json"), "auth.json"),
@@ -290,7 +304,7 @@ func defaultManagedFiles(kind string) []ManagedFile {
 	}
 }
 
-func defaultClaudeFiles() []ManagedFile {
+func defaultClaudeFiles(accountHomes bool) []ManagedFile {
 	configHome := os.Getenv("CLAUDE_CONFIG_DIR")
 	fallbackDir := configHome
 	if configHome == "" {
@@ -301,9 +315,15 @@ func defaultClaudeFiles() []ManagedFile {
 	if _, err := os.Stat(ExpandPath(globalConfig)); err != nil {
 		globalConfig = filepath.Join(fallbackDir, ".claude.json")
 	}
+	credentialName := "credentials.json"
+	configName := "claude.json"
+	if accountHomes {
+		credentialName = ".credentials.json"
+		configName = ".config.json"
+	}
 	return []ManagedFile{
-		requiredFile(filepath.Join(configHome, ".credentials.json"), "credentials.json"),
-		optionalFile(globalConfig, "claude.json"),
+		requiredFile(filepath.Join(configHome, ".credentials.json"), credentialName),
+		optionalFile(globalConfig, configName),
 	}
 }
 

@@ -72,6 +72,35 @@ func TestImportClaudeSwap(t *testing.T) {
 	}
 }
 
+func TestImportClaudeSwapWritesNativeHomeFilesInHomeMode(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "claude-swap")
+	for _, name := range []string{"configs", "credentials", "cache"} {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sequence := `{"sequence":[1],"accounts":{"1":{"email":"one@example.com"}}}`
+	if err := os.WriteFile(filepath.Join(root, "sequence.json"), []byte(sequence), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSwapFixtureAccount(t, root, "1", "one@example.com", `{"claudeAiOauth":{"accessToken":"one"}}`, `{"account":"one"}`)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "unused-live-home"))
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "accounts"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []ServiceConfig{{Name: "claude", Kind: "claude"}},
+	}
+	cfg.ApplyDefaults()
+
+	if _, err := ImportClaudeSwap(cfg, root); err != nil {
+		t.Fatal(err)
+	}
+	home := AccountDir(cfg, "claude", "cswap-1")
+	assertFileContent(t, filepath.Join(home, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"one"}}`)
+	assertFileContent(t, filepath.Join(home, ".config.json"), `{"account":"one"}`)
+}
+
 func testClaudeImportConfig(dir string) Config {
 	cfg := Config{
 		BackupRoot: filepath.Join(dir, "backups"),
