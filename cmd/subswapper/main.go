@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -16,16 +19,21 @@ import (
 	"time"
 
 	"github.com/lawzava/subswapper/internal/subswapper"
+	"golang.org/x/term"
 )
 
 var defaultConfigPath = subswapper.DefaultConfigPath()
+
+var lookupClaudeSetupTokenIdentity = subswapper.LookupClaudeSetupTokenIdentity
 
 // monitorCycleTimeout bounds a single monitor cycle so a wedged usage probe
 // (e.g. a hung codex app-server) cannot stall the loop forever.
 const monitorCycleTimeout = 2 * time.Minute
 
+var claudeAuthStatusTimeout = 15 * time.Second
+
 func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	if err := runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
@@ -35,6 +43,10 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	return runWithInput(args, os.Stdin, stdout, stderr)
+}
+
+func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		if err := printUsage(stderr); err != nil {
 			return err
@@ -50,7 +62,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "capture":
 		return runCapture(args[1:], stdout)
 	case "home":
-		return runHome(args[1:], stdout, stderr)
+		return runHome(args[1:], stdin, stdout, stderr)
+	case "claude-statusline":
+		return runClaudeStatusLine(stdin, stdout)
 	case "remove", "rm":
 		return runRemove(args[1:], stdout)
 	case "status", "list":
@@ -71,12 +85,16 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-func runHome(args []string, stdout, stderr io.Writer) error {
+func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("missing home command: create, path, env, login, run, or migrate")
+		return errors.New("missing home command: create, path, env, login, run, token, or migrate")
 	}
 	action := args[0]
+	if action == "token" {
+		return runHomeToken(args[1:], stdin, stdout, stderr)
+	}
 	fs := flag.NewFlagSet("home "+action, flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	configPath := fs.String("config", defaultConfigPath, "config file")
 	serviceName := fs.String("service", "", "service name")
 	accountName := fs.String("account", "", "account name; defaults to the selected account")
@@ -131,7 +149,7 @@ func runHome(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if err := runWithAccountHome(*cfg, service, account, command, commandArgs, stdout, stderr); err != nil {
+		if err := runWithAccountHome(*cfg, service, account, command, commandArgs, stdin, stdout, stderr); err != nil {
 			return err
 		}
 		return subswapper.ResetAccountProbeState(*cfg, service.Name, account)
@@ -140,10 +158,120 @@ func runHome(args []string, stdout, stderr io.Writer) error {
 		if len(commandArgs) == 0 {
 			commandArgs = []string{providerBinary(service)}
 		}
-		return runWithAccountHome(*cfg, service, account, commandArgs[0], commandArgs[1:], stdout, stderr)
+		if isClaudeServiceConfig(service) {
+			return runClaudeWithSetupToken(*cfg, *configPath, service, account, home, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
+		}
+		return runWithAccountHome(*cfg, service, account, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown home command %q", action)
 	}
+}
+
+func runHomeToken(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("missing home token command: set, status, or remove")
+	}
+	action := args[0]
+	if action != "set" && action != "status" && action != "remove" {
+		return errors.New("unknown home token command")
+	}
+	fs := flag.NewFlagSet("home token", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", defaultConfigPath, "config file")
+	serviceName := fs.String("service", "", "service name")
+	accountName := fs.String("account", "", "account name; defaults to the selected account")
+	if err := fs.Parse(args[1:]); err != nil {
+		return errors.New("invalid home token options")
+	}
+	if len(fs.Args()) != 0 {
+		return errors.New("setup tokens must be provided through stdin or the interactive prompt")
+	}
+	if *serviceName == "" {
+		return errors.New("missing -service")
+	}
+	cfg, err := subswapper.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	service, account, _, err := resolveHomeSelection(*cfg, *serviceName, *accountName)
+	if err != nil {
+		return err
+	}
+	if !isClaudeServiceConfig(service) {
+		return fmt.Errorf("service %q does not support Claude setup tokens", service.Name)
+	}
+
+	switch action {
+	case "set":
+		token, err := readClaudeSetupToken(stdin, stderr)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		status, err := subswapper.ReplaceClaudeSetupToken(ctx, *cfg, service.Name, account, token, lookupClaudeSetupTokenIdentity)
+		if err != nil {
+			return errors.New("claude setup token was rejected")
+		}
+		identity := "identity unknown"
+		if status.IdentityKnown {
+			identity = "identity known"
+		}
+		_, err = fmt.Fprintf(stdout, "stored Claude setup token for %s; %s\n", account, identity)
+		return err
+	case "status":
+		status, err := subswapper.ClaudeSetupTokenStatusForAccount(*cfg, service.Name, account)
+		if err != nil {
+			return errors.New("claude setup token status is unavailable")
+		}
+		state := "not configured"
+		switch {
+		case status.Expired:
+			state = "expired"
+		case status.Usable:
+			state = "configured"
+		}
+		identity := "identity unknown"
+		if status.IdentityKnown {
+			identity = "identity known"
+		}
+		_, err = fmt.Fprintf(stdout, "Claude setup token for %s: %s; %s\n", account, state, identity)
+		return err
+	case "remove":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := subswapper.RemoveClaudeSetupToken(ctx, *cfg, service.Name, account); err != nil {
+			return errors.New("claude setup token removal failed")
+		}
+		_, err = fmt.Fprintf(stdout, "removed Claude setup token for %s\n", account)
+		return err
+	default:
+		return errors.New("unknown home token command")
+	}
+}
+
+func readClaudeSetupToken(stdin io.Reader, prompt io.Writer) (string, error) {
+	if stdin == nil {
+		return "", errors.New("claude setup token input is unavailable")
+	}
+	if file, ok := stdin.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		_, _ = fmt.Fprint(prompt, "Claude setup token: ")
+		value, err := term.ReadPassword(int(file.Fd()))
+		_, _ = fmt.Fprintln(prompt)
+		if err != nil {
+			return "", errors.New("claude setup token input failed")
+		}
+		return string(value), nil
+	}
+	const maxTokenBytes = 64 << 10
+	value, err := io.ReadAll(io.LimitReader(stdin, maxTokenBytes+1))
+	if err != nil {
+		return "", errors.New("claude setup token input failed")
+	}
+	if len(value) > maxTokenBytes {
+		return "", errors.New("claude setup token input is too large")
+	}
+	return string(value), nil
 }
 
 func resolveHomeSelection(cfg subswapper.Config, serviceName, accountName string) (subswapper.ServiceConfig, string, string, error) {
@@ -188,13 +316,283 @@ func providerLoginCommand(service subswapper.ServiceConfig) (string, []string, e
 	}
 }
 
-func runWithAccountHome(cfg subswapper.Config, service subswapper.ServiceConfig, account, command string, args []string, stdout, stderr io.Writer) error {
+func runWithAccountHome(cfg subswapper.Config, service subswapper.ServiceConfig, account, command string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	cmd := exec.Command(command, args...)
 	cmd.Env = accountProcessEnvironment(os.Environ(), subswapper.AccountEnvironment(cfg, service, account))
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+func isClaudeServiceConfig(service subswapper.ServiceConfig) bool {
+	return strings.EqualFold(service.Kind, "claude") || strings.EqualFold(service.Kind, "claude-code")
+}
+
+func runClaudeWithSetupToken(
+	cfg subswapper.Config,
+	configPath string,
+	service subswapper.ServiceConfig,
+	account string,
+	accountHome string,
+	command string,
+	args []string,
+	stdin io.Reader,
+	stdout io.Writer,
+	stderr io.Writer,
+) error {
+	token, status, err := subswapper.LoadClaudeSetupTokenWithStatus(cfg, service.Name, account)
+	if err != nil || !status.Usable {
+		return errors.New("selected Claude account has no usable setup token")
+	}
+	if err := subswapper.PrepareClaudeAccountHome(accountHome); err != nil {
+		return err
+	}
+	metadata := map[string]string{
+		"SUBSWAPPER_CONFIG_PATH":    configPath,
+		"SUBSWAPPER_SERVICE":        service.Name,
+		"SUBSWAPPER_ACCOUNT":        account,
+		"SUBSWAPPER_TOKEN_REVISION": status.Revision,
+	}
+	environment, err := subswapper.BuildClaudeLaunchEnvironment(os.Environ(), accountHome, token, metadata)
+	if err != nil {
+		return errors.New("selected Claude account environment is unusable")
+	}
+	commandArgs := append([]string(nil), args...)
+	if isClaudeExecutable(command) {
+		if err := checkClaudeAuthentication(command, environment); err != nil {
+			return err
+		}
+		overlay, err := claudeStatusLineSettingsOverlay()
+		if err != nil {
+			return err
+		}
+		commandArgs = append([]string{"--settings", overlay}, commandArgs...)
+	}
+	cmd := exec.Command(command, commandArgs...)
+	cmd.Env = environment
+	if handled, terminalErr := runClaudeTerminalCommand(cmd, stdin, stdout, stderr, token); handled {
+		return terminalErr
+	}
+	cmd.Stdin = stdin
+	redactedStdout := newSecretRedactingWriter(stdout, token)
+	redactedStderr := newSecretRedactingWriter(stderr, token)
+	cmd.Stdout = redactedStdout
+	cmd.Stderr = redactedStderr
+	runErr := cmd.Run()
+	if err := errors.Join(redactedStdout.Flush(), redactedStderr.Flush()); err != nil {
+		return errors.New("claude output forwarding failed")
+	}
+	return runErr
+}
+
+func isClaudeExecutable(command string) bool {
+	name := strings.ToLower(filepath.Base(command))
+	name = strings.TrimSuffix(name, ".exe")
+	return name == "claude"
+}
+
+type secretRedactingWriter struct {
+	destination io.Writer
+	secret      []byte
+	pending     []byte
+}
+
+func newSecretRedactingWriter(destination io.Writer, secret string) *secretRedactingWriter {
+	if destination == nil {
+		destination = io.Discard
+	}
+	return &secretRedactingWriter{destination: destination, secret: []byte(secret)}
+}
+
+func (w *secretRedactingWriter) Write(data []byte) (int, error) {
+	w.pending = append(w.pending, data...)
+	if err := w.drain(false); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func (w *secretRedactingWriter) Flush() error {
+	return w.drain(true)
+}
+
+func (w *secretRedactingWriter) drain(final bool) error {
+	if len(w.secret) == 0 {
+		return errors.New("output redaction is unavailable")
+	}
+	for len(w.pending) > 0 {
+		if index := bytes.Index(w.pending, w.secret); index >= 0 {
+			if err := writeAll(w.destination, w.pending[:index]); err != nil {
+				return err
+			}
+			if err := writeAll(w.destination, []byte("[REDACTED]")); err != nil {
+				return err
+			}
+			w.pending = w.pending[index+len(w.secret):]
+			continue
+		}
+		if final {
+			output := w.pending
+			if bytes.HasPrefix(w.secret, w.pending) {
+				output = []byte("[REDACTED]")
+			}
+			if err := writeAll(w.destination, output); err != nil {
+				return err
+			}
+			w.pending = nil
+			return nil
+		}
+		retain := longestSecretPrefixSuffix(w.pending, w.secret)
+		emitLimit := len(w.pending) - retain
+		if err := writeAll(w.destination, w.pending[:emitLimit]); err != nil {
+			return err
+		}
+		w.pending = w.pending[emitLimit:]
+		return nil
+	}
+	return nil
+}
+
+func longestSecretPrefixSuffix(data, secret []byte) int {
+	limit := min(len(data), len(secret)-1)
+	for length := limit; length > 0; length-- {
+		if bytes.Equal(data[len(data)-length:], secret[:length]) {
+			return length
+		}
+	}
+	return 0
+}
+
+func writeAll(destination io.Writer, data []byte) error {
+	for len(data) > 0 {
+		written, err := destination.Write(data)
+		if err != nil {
+			return err
+		}
+		if written <= 0 || written > len(data) {
+			return io.ErrShortWrite
+		}
+		data = data[written:]
+	}
+	return nil
+}
+
+type limitedOutput struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (w *limitedOutput) Write(data []byte) (int, error) {
+	remaining := w.limit - w.buffer.Len()
+	if remaining > 0 {
+		if len(data) > remaining {
+			_, _ = w.buffer.Write(data[:remaining])
+		} else {
+			_, _ = w.buffer.Write(data)
+		}
+	}
+	return len(data), nil
+}
+
+func checkClaudeAuthentication(command string, environment []string) error {
+	// Use the selected executable so diagnostics and launch cannot select
+	// different Claude installations.
+	ctx, cancel := context.WithTimeout(context.Background(), claudeAuthStatusTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, "auth", "status")
+	cmd.WaitDelay = 250 * time.Millisecond
+	cmd.Env = environment
+	cmd.Stdin = nil
+	output := &limitedOutput{limit: 64 << 10}
+	cmd.Stdout = output
+	cmd.Stderr = &limitedOutput{limit: 64 << 10}
+	if err := cmd.Run(); err != nil {
+		return errors.New("selected Claude account authentication check failed")
+	}
+	var status struct {
+		LoggedIn    bool   `json:"loggedIn"`
+		AuthMethod  string `json:"authMethod"`
+		APIProvider string `json:"apiProvider"`
+	}
+	if err := json.Unmarshal(output.buffer.Bytes(), &status); err != nil ||
+		!status.LoggedIn || status.AuthMethod != "oauth_token" || status.APIProvider != "firstParty" {
+		return errors.New("selected Claude account authentication is not usable")
+	}
+	return nil
+}
+
+func claudeStatusLineSettingsOverlay() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", errors.New("cannot configure Claude usage capture")
+	}
+	overlay := struct {
+		StatusLine struct {
+			Type    string `json:"type"`
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}{}
+	overlay.StatusLine.Type = "command"
+	overlay.StatusLine.Command = shellQuote(executable) + " claude-statusline"
+	data, err := json.Marshal(overlay)
+	if err != nil {
+		return "", errors.New("cannot configure Claude usage capture")
+	}
+	return string(data), nil
+}
+
+func runClaudeStatusLine(stdin io.Reader, stdout io.Writer) error {
+	const maxPayloadBytes = 1 << 20
+	input, err := io.ReadAll(io.LimitReader(stdin, maxPayloadBytes+1))
+	if err != nil || len(input) > maxPayloadBytes {
+		return errors.New("claude status-line input is unavailable")
+	}
+	configPath := os.Getenv("SUBSWAPPER_CONFIG_PATH")
+	serviceName := os.Getenv("SUBSWAPPER_SERVICE")
+	accountName := os.Getenv("SUBSWAPPER_ACCOUNT")
+	tokenRevision := os.Getenv("SUBSWAPPER_TOKEN_REVISION")
+	if configPath == "" || serviceName == "" || accountName == "" || tokenRevision == "" {
+		return errors.New("claude status-line routing context is unavailable")
+	}
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		return errors.New("claude status-line configuration is unavailable")
+	}
+	service, ok := cfg.Service(serviceName)
+	if !ok || !isClaudeServiceConfig(service) {
+		return errors.New("claude status-line service is unavailable")
+	}
+
+	var contextPayload struct {
+		Workspace struct {
+			ProjectDir string `json:"project_dir"`
+			CurrentDir string `json:"current_dir"`
+		} `json:"workspace"`
+	}
+	_ = json.Unmarshal(input, &contextPayload)
+	workspaceRoot := contextPayload.Workspace.ProjectDir
+	if workspaceRoot == "" {
+		workspaceRoot = contextPayload.Workspace.CurrentDir
+	}
+	accountHome := subswapper.AccountDir(*cfg, serviceName, accountName)
+	command, found, resolveErr := subswapper.ResolveClaudeStatusLineCommand(accountHome, workspaceRoot)
+	if resolveErr != nil {
+		return errors.New("claude status-line settings are unavailable")
+	}
+
+	observedAt := time.Now().UTC()
+	if sample, parseErr := subswapper.ParseClaudeStatusLine(input, observedAt, tokenRevision); parseErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = subswapper.RecordClaudeStatusLineUsage(ctx, *cfg, serviceName, accountName, sample)
+		cancel()
+	}
+	if !found {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return subswapper.RunClaudeStatusLineCommand(ctx, command, input, stdout)
 }
 
 func accountProcessEnvironment(base []string, overrides map[string]string) []string {
@@ -528,6 +926,7 @@ Usage:
   subswapper home create -service claude|codex -account <name> [-email user@example.com]
   subswapper home path|env -service claude|codex [-account <name>]
   subswapper home login -service claude|codex [-account <name>]
+  subswapper home token set|status|remove -service claude [-account <name>]
   subswapper home run -service claude|codex [-account <name>] [-- command args...]
   subswapper home migrate [-config ~/.config/subswapper/config.json]
   subswapper capture -service claude|codex -account <name> [-email user@example.com]

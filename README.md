@@ -4,19 +4,19 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `subswapper` is a small Go CLI that manages isolated [Claude Code](https://claude.com/claude-code)
-and [Codex](https://openai.com/codex/) account homes on one machine. Each
-provider owns and refreshes the credentials in its permanent home. Subswapper
-tracks usage and chooses which home to use without replacing authentication
-files underneath running sessions.
+and [Codex](https://openai.com/codex/) account homes on one machine. Claude
+launches use a separate long-lived setup token for each account. Subswapper
+tracks trusted usage and chooses a home without changing credentials in an
+existing process.
 
 ## Features
 
 - **Permanent account homes** — creates private per-account directories for
   `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, with commands to log in, print the
   environment, and launch a client in the selected home.
-- **Live usage tracking** — reads real usage windows (5-hour, weekly, and
-  Claude's Fable-scoped weekly) straight from each provider using the stored
-  credentials; no scraping, no extra logins.
+- **Live usage tracking** — uses fresh provider usage data. Claude setup-token
+  accounts fall back to Claude's normal status-line response data when the
+  OAuth usage endpoint rejects inference-only tokens.
 - **Quota-aware routing** — a monitor loop changes the preferred account when
   the selected one crosses a configurable threshold, without mutating a
   running provider's credentials.
@@ -27,7 +27,7 @@ files underneath running sessions.
 
 ## Installation
 
-Requires Go 1.26.5 or newer.
+Requires Go 1.26.6 or newer.
 
 ```sh
 go install github.com/lawzava/subswapper/cmd/subswapper@latest
@@ -50,15 +50,15 @@ For Codex usage probing, the `codex` CLI must be on `PATH` (see
 # Create the default config (Claude Code + Codex)
 subswapper init
 
-# Create and authenticate permanent homes
+# Create permanent homes
 subswapper home create -service claude -account personal
-subswapper home login  -service claude -account personal
 subswapper home create -service codex  -account personal
 subswapper home login  -service codex  -account personal
 
-# Create another account without touching the first account's credentials
+# Store each pre-created Claude setup token through a hidden prompt
+subswapper home token set -service claude -account personal
 subswapper home create -service claude -account work
-subswapper home login  -service claude -account work
+subswapper home token set -service claude -account work
 
 # See every account's usage windows
 subswapper status
@@ -96,7 +96,8 @@ value auto-switching compares.
 | --- | --- |
 | `init` | Write a starter config file. |
 | `home create -service <name> -account <name> [-email <label>]` | Create and register an empty private account home. |
-| `home login -service <name> [-account <name>]` | Run the provider's login command in that account home. |
+| `home token set\|status\|remove -service claude [-account <name>]` | Manage a Claude setup token without printing its value. `set` accepts the token only through stdin or a hidden prompt. |
+| `home login -service <name> [-account <name>]` | Run the provider's legacy login command in that account home. Do not use this for setup-token routing. |
 | `home path\|env -service <name> [-account <name>]` | Print a home path or shell export for configuring other tools. |
 | `home run -service <name> [-account <name>] [-- command...]` | Run a command with the selected account's home environment. |
 | `home migrate` | Copy legacy snapshots into native home filenames without deleting or overwriting files. |
@@ -105,31 +106,35 @@ value auto-switching compares.
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table. |
-| `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. |
+| `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
 
 All commands accept `-config <path>` (default
 `~/.config/subswapper/config.json` on Linux).
 
-## Using homes with T3 Code
+## Using homes with external launchers
 
-For Claude, use the path printed by:
+Configure any process supervisor or agent launcher to start Claude through
+Subswapper:
 
 ```sh
-subswapper home path -service claude -account work
+subswapper home run -service claude -- claude
 ```
 
-as that provider instance's `CLAUDE_CONFIG_DIR`.
+Subswapper selects the routed account for each new process. It injects the
+account's setup token, isolated `CLAUDE_CONFIG_DIR`, and
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. It removes conflicting Anthropic,
+Bedrock, Vertex, and Foundry variables described by Anthropic's
+[environment guide](https://code.claude.com/docs/en/env-vars). Changing the
+route does not change an existing agent.
 
-For Codex, configure every T3 provider with the same shared `CODEX_HOME` path
-(normally `~/.codex`) and use each Subswapper Codex account path as its
-**Shadow home path**. This keeps every `auth.json` private while T3 shares
-sessions and lets an existing thread continue with another account.
+For Codex launchers that support shadow homes, use a shared `CODEX_HOME`
+(normally `~/.codex`) and each Subswapper Codex account path as its shadow
+home. This keeps every `auth.json` private while the launcher shares sessions.
 
-`home run` is useful outside T3. A child process receives the selected
-`CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Subswapper cannot change the environment
-of a shell or provider process that is already running.
+Transparent mid-agent failover is not supported. Start a new process through
+`home run` to use a newly selected account.
 
 ## How auto-switching works
 
@@ -145,16 +150,16 @@ usage only when all of these hold:
   automatically — has passed (default **30 minutes**).
 
 Both pacing rules are skipped when the active account is exhausted or its
-stored credentials stop working — the monitor escapes to the best healthy
-account on the next cycle. Accounts whose credentials are missing, rejected,
-or do not match the stable identity of the captured account are never selected,
-whatever their cached usage says. A manual
+stored credentials stop working. The monitor escapes to the best healthy
+account on the next cycle. Claude accounts with missing, expired, rejected, or
+unsafe setup tokens are never selected. Accounts without fresh trusted usage
+are also excluded. A manual
 `switch -account auto` always forces the best account immediately.
 
-In account-home mode, switching updates routing state only. Existing T3 or CLI
-processes are not silently rebound; select the recommended provider in T3 or
-start the next command through `home run`. Explicit custom file-bundle
-services retain the legacy transactional switching behavior.
+In account-home mode, switching updates routing state only. Existing launcher
+or CLI processes are not silently rebound; start the next command through
+`home run`. Explicit custom file-bundle services retain the legacy
+transactional switching behavior.
 
 ## Configuration
 
@@ -188,7 +193,7 @@ The `monitor` block accepts these knobs (defaults shown):
 Top-level `backup_root` and `state_path` override where account homes and state
 are stored. (`backup_root` keeps its historical name for compatibility.)
 Built-in services without explicit `files` default to `account_mode: "home"`.
-Native credentials are stored as:
+Account-home files use these native names:
 
 - Claude: `<account-home>/.credentials.json` and optional `.config.json`
 - Codex: `<account-home>/auth.json`
@@ -203,19 +208,30 @@ file-backed credentials only, so configure Codex with:
 cli_auth_credentials_store = "file"
 ```
 
-`home login` authenticates directly inside the selected permanent home.
+Claude setup tokens are not stored in account homes. Token files use `0600`
+mode under separate `0700` directories. Token values never enter config or
+state. Identity remains `unknown` when Anthropic does not expose a trusted
+`accountUuid` for an inference-only token. Anthropic documents setup-token
+creation and lifetime in its [authentication guide](https://code.claude.com/docs/en/authentication).
+The isolation design was also compared with the MIT-licensed
+[claude-code-account-switcher](https://github.com/claude-code-tools/claude-code-account-switcher);
+Subswapper uses an independent implementation.
 
 ## Usage probes
 
-**Claude** usage is fetched from Anthropic's OAuth usage endpoint using the
-access token in each home. In home mode, Subswapper never rotates Claude's
-refresh token: the provider owns that operation, preventing a monitor probe
-from creating a competing token branch. An expired home is marked as requiring
-provider login or refresh. The weekly limit
-scoped to Anthropic's Fable models is tracked as its own window — the `FABLE5`
-column in `status` output, JSON key `fable_weekly` — shown alongside the
-standard windows and included in autoswitch scoring. Other model-scoped
-limits are ignored.
+**Claude** home-mode usage first probes Subswapper's existing OAuth usage
+endpoint with the setup token. Subswapper never refreshes, exchanges, or
+rotates a setup token. If the endpoint does not support that token, a launch
+wrapper captures the documented five-hour and seven-day limits from Claude's
+normal status-line response data. It runs any existing user or workspace
+status-line command with the original input. Cached data expires after five
+minutes and is bound to the random revision of the current token. Anthropic
+documents the response fields in its [status-line guide](https://code.claude.com/docs/en/statusline).
+
+Anthropic does not document a Fable-specific status-line window. `FABLE5`
+therefore shows `-` for status-line-only setup-token accounts. Subswapper
+reports usage as unavailable when neither a direct response nor a fresh,
+complete status-line sample exists.
 
 **Codex** usage is read through the local `codex app-server` JSON-RPC
 interface using the permanent account `CODEX_HOME`, so an official credential
@@ -276,7 +292,28 @@ Legacy Claude `credentials.json` and `claude.json` snapshots are copied to
 their native home names, `.credentials.json` and `.config.json`. Existing
 native files win; nothing is overwritten or deleted. Codex `auth.json` files
 already have their native filename. Verify with `subswapper status`, then use
-`home path` to configure T3 provider instances.
+`home path` to configure external launcher instances.
+
+### Safe Claude setup-token migration
+
+Do not restart a launcher or Subswapper for this migration. Existing agents
+keep their original process environment.
+
+1. List active agents and record the current Subswapper route.
+2. Obtain explicit approval before creating any setup token.
+3. Open a private browser profile that is signed out of Claude.
+4. Run `claude setup-token` and authenticate only the intended subscription.
+5. Abort if the browser identity is absent or ambiguous.
+6. Run `subswapper home token set -service claude -account <name>`.
+7. Paste the token only into the hidden prompt.
+8. Run `subswapper home token status -service claude -account <name>`.
+9. Launch one explicit test process with `subswapper home run -service claude -account <name> -- claude`.
+10. Wait for a normal response and fresh usage before enabling auto-selection.
+11. Repeat for each account.
+12. Obtain explicit approval before replacing or removing any live token.
+
+Rollback affects only new launches. With approval, use `home token remove` for
+the affected account. Existing processes retain the token supplied at launch.
 
 ## Data & security
 
@@ -285,12 +322,16 @@ Defaults on Linux (macOS and Windows use their native config/data folders):
 - config: `~/.config/subswapper/config.json`
 - state: `~/.local/share/subswapper/state.json`
 - account homes: `~/.local/share/subswapper/accounts/`
+- Claude setup tokens: `~/.local/share/subswapper/tokens/`
 
 Linux and macOS are tested in CI; Windows builds are cross-compiled but
-currently untested — treat Windows support as experimental.
+currently untested. Claude setup-token storage requires POSIX `0600` and
+`0700` permission checks, so it fails closed on Windows. Other Windows support
+remains experimental.
 
 Credentials and state are written with `0600` permissions under `0700`
-directories. Home removal preserves the directory by default;
+directories. Setup-token replacement uses atomic rename and directory sync.
+Home removal preserves the directory by default;
 `-delete-home` is required to erase it. Explicit bundle-mode changes still use
 rollback snapshots and a recovery journal. **Treat the account root like a
 password store** — it holds working OAuth tokens.

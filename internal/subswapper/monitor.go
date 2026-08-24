@@ -217,6 +217,9 @@ func mergeProbeState(current, probed *State) {
 			if !ok || !currentAccount.AddedAt.Equal(probedAccount.AddedAt) {
 				continue
 			}
+			if currentAccount.SetupTokenRevision != probedAccount.SetupTokenRevision {
+				continue
+			}
 			if currentAccount.LastProbeStartedAt.After(probedAccount.LastProbeStartedAt) {
 				continue
 			}
@@ -238,6 +241,7 @@ func serviceStateMatchesSnapshot(current, snapshot *ServiceState) bool {
 	for name, snapshotAccount := range snapshot.Accounts {
 		currentAccount, ok := current.Accounts[name]
 		if !ok || !currentAccount.AddedAt.Equal(snapshotAccount.AddedAt) ||
+			currentAccount.SetupTokenRevision != snapshotAccount.SetupTokenRevision ||
 			!currentAccount.LastProbeStartedAt.Equal(snapshotAccount.LastProbeStartedAt) {
 			return false
 		}

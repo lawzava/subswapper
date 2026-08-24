@@ -24,7 +24,16 @@ type UsageSnapshot struct {
 	Weekly      LimitWindow `json:"weekly,omitzero"`
 	FableWeekly LimitWindow `json:"fable_weekly,omitzero"`
 	ObservedAt  time.Time   `json:"observed_at,omitzero"`
+	Source      string      `json:"source,omitempty"`
+	// TokenRevision binds cached setup-token usage without storing a token.
+	TokenRevision string `json:"token_revision,omitempty"`
 }
+
+const (
+	claudeUsageSourceSetupTokenDirect = "setup-token-direct"
+	claudeUsageSourceStatusLine       = "status-line"
+	claudeUsageSourceCommand          = "usage-command"
+)
 
 type LimitWindow struct {
 	Used     float64   `json:"used,omitempty"`
@@ -254,6 +263,11 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 		}
 		if service.Disabled {
 			status.Reason = "service disabled"
+			statuses = append(statuses, status)
+			continue
+		}
+		if isClaudeService(service) && service.UsesAccountHomes() {
+			collectClaudeSetupTokenAccount(ctx, cfg, serviceState, &status, service)
 			statuses = append(statuses, status)
 			continue
 		}

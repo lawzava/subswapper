@@ -19,9 +19,10 @@ const (
 )
 
 var (
-	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	claudeTokenURL = "https://platform.claude.com/v1/oauth/token"
-	httpClient     = &http.Client{Timeout: 10 * time.Second}
+	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
+	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
+	claudeTokenURL   = "https://platform.claude.com/v1/oauth/token"
+	httpClient       = &http.Client{Timeout: 10 * time.Second}
 )
 
 type claudeCredentials struct {
@@ -135,12 +136,40 @@ func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (U
 	if oauth.AccessToken == "" {
 		return UsageSnapshot{}, errClaudeTokenMissing
 	}
+	return fetchClaudeUsageWithAccessToken(ctx, oauth.AccessToken, false)
+}
+
+func fetchClaudeUsageWithSetupToken(ctx context.Context, token string) (UsageSnapshot, error) {
+	if token == "" {
+		return UsageSnapshot{}, errClaudeTokenMissing
+	}
+	usage, err := fetchClaudeUsageWithAccessToken(ctx, token, true)
+	if err != nil {
+		return UsageSnapshot{}, err
+	}
+	if !usage.HasCoreLimits() {
+		return UsageSnapshot{}, errSetupTokenUsageUnavailable
+	}
+	now := usage.ObservedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if !validClaudeRoutingWindow(usage.FiveHour, now) || !validClaudeRoutingWindow(usage.Weekly, now) {
+		return UsageSnapshot{}, errSetupTokenUsageUnavailable
+	}
+	if usage.FableWeekly.Pct != nil && !validClaudeRoutingWindow(usage.FableWeekly, now) {
+		return UsageSnapshot{}, errSetupTokenUsageUnavailable
+	}
+	return usage, nil
+}
+
+func fetchClaudeUsageWithAccessToken(ctx context.Context, accessToken string, setupToken bool) (UsageSnapshot, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeUsageURL, nil)
 	if err != nil {
 		return UsageSnapshot{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+oauth.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", claudeOAuthBetaHeader)
 	req.Header.Set("User-Agent", "subswapper/1.0")
 
@@ -149,6 +178,9 @@ func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (U
 		return UsageSnapshot{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusForbidden && setupToken {
+		return UsageSnapshot{}, errSetupTokenUsageUnavailable
+	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return UsageSnapshot{}, fmt.Errorf("%w (%s)", errClaudeUnauthorized, resp.Status)
 	}
@@ -174,9 +206,58 @@ func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (U
 	return usage, nil
 }
 
+// lookupClaudeSetupTokenIdentity returns a provider-issued account UUID when
+// the token has profile scope. Inference-only setup tokens normally return 403,
+// which is a valid unknown-identity result rather than a label-derived guess.
+func lookupClaudeSetupTokenIdentity(ctx context.Context, token string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeProfileURL, nil)
+	if err != nil {
+		return "", nil
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", claudeOAuthBetaHeader)
+	req.Header.Set("User-Agent", "subswapper/1.0")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", errClaudeUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", nil
+	}
+	var profile struct {
+		Account struct {
+			UUID        string `json:"uuid"`
+			AccountUUID string `json:"account_uuid"`
+		} `json:"account"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&profile) != nil {
+		return "", nil
+	}
+	if profile.Account.AccountUUID != "" {
+		return profile.Account.AccountUUID, nil
+	}
+	return profile.Account.UUID, nil
+}
+
+// LookupClaudeSetupTokenIdentity returns only provider-issued identity data.
+// An inference-only token normally has no profile scope, so identity is unknown.
+func LookupClaudeSetupTokenIdentity(ctx context.Context, token string) (ClaudeSetupTokenIdentity, error) {
+	accountUUID, err := lookupClaudeSetupTokenIdentity(ctx, token)
+	if err != nil {
+		return ClaudeSetupTokenIdentity{}, err
+	}
+	return ClaudeSetupTokenIdentity{AccountUUID: accountUUID}, nil
+}
+
 var (
-	errClaudeUnauthorized = errors.New("claude usage API unauthorized")
-	errClaudeTokenMissing = errors.New("claude OAuth access token missing")
+	errClaudeUnauthorized         = errors.New("claude usage API unauthorized")
+	errClaudeTokenMissing         = errors.New("claude OAuth access token missing")
+	errSetupTokenUsageUnavailable = errors.New("setup-token usage unavailable")
 )
 
 func shouldRefreshClaudeCredentials(err error, credentials []byte) bool {

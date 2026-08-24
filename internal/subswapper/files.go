@@ -148,11 +148,21 @@ func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force
 		return err
 	}
 	serviceState := state.Service(service.Name)
-	if _, ok := serviceState.Accounts[accountName]; !ok {
+	account, ok := serviceState.Accounts[accountName]
+	if !ok {
 		return fmt.Errorf("account %q not found for service %q", accountName, service.Name)
 	}
 	if serviceState.ActiveAccount == accountName && !force {
 		return fmt.Errorf("account %q is active; switch away first or pass -force", accountName)
+	}
+	if isClaudeService(service) && service.UsesAccountHomes() {
+		_, tokenExists, tokenErr := readClaudeSetupTokenEnvelope(cfg, service.Name, accountName)
+		if tokenErr != nil {
+			return tokenErr
+		}
+		if tokenExists || account.SetupTokenRevision != "" {
+			return errors.New("remove the Claude setup token before unregistering this account")
+		}
 	}
 	accountDir := AccountDir(cfg, service.Name, accountName)
 	staged := make([]stagedFile, 0, len(service.Files))

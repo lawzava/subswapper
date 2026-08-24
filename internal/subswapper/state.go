@@ -23,12 +23,14 @@ type ServiceState struct {
 }
 
 type AccountState struct {
-	Name     string        `json:"name"`
-	Email    string        `json:"email,omitempty"`
-	Provider string        `json:"provider,omitempty"`
-	Slot     string        `json:"slot,omitempty"`
-	AddedAt  time.Time     `json:"added_at"`
-	Usage    UsageSnapshot `json:"usage,omitzero"`
+	Name               string        `json:"name"`
+	Email              string        `json:"email,omitempty"`
+	Provider           string        `json:"provider,omitempty"`
+	Slot               string        `json:"slot,omitempty"`
+	AddedAt            time.Time     `json:"added_at"`
+	Usage              UsageSnapshot `json:"usage,omitzero"`
+	AccountUUID        string        `json:"account_uuid,omitempty"`
+	SetupTokenRevision string        `json:"setup_token_revision,omitempty"`
 	// FetchBackoffUntil pauses usage fetches for this account after rate
 	// limiting or a credentials failure; the cached snapshot is used instead.
 	FetchBackoffUntil time.Time `json:"fetch_backoff_until,omitzero"`
