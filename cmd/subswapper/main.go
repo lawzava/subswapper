@@ -87,7 +87,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 
 func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("missing home command: create, path, env, login, run, token, or migrate")
+		return errors.New("missing home command: create, repair, path, env, login, run, token, or migrate")
 	}
 	action := args[0]
 	if action == "token" {
@@ -133,6 +133,21 @@ func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 	switch action {
+	case "repair":
+		result, repairErr := subswapper.RepairAccountHome(*cfg, service.Name, account)
+		if repairErr != nil && len(result.Linked)+len(result.Unchanged)+len(result.Missing)+len(result.Conflicts) == 0 {
+			return repairErr
+		}
+		if err := printHomeRepairResult(stdout, service.Name, account, result); err != nil {
+			return err
+		}
+		if repairErr != nil {
+			return repairErr
+		}
+		if len(result.Conflicts) != 0 {
+			return fmt.Errorf("claude home repair found %d conflicts", len(result.Conflicts))
+		}
+		return nil
 	case "path":
 		_, err = fmt.Fprintln(stdout, home)
 		return err
@@ -159,12 +174,37 @@ func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			commandArgs = []string{providerBinary(service)}
 		}
 		if isClaudeServiceConfig(service) {
-			return runClaudeWithSetupToken(*cfg, *configPath, service, account, home, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
+			runtimeHome := subswapper.RuntimeHome(*cfg, service, account)
+			return runClaudeWithSetupToken(*cfg, *configPath, service, account, runtimeHome, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
 		}
 		return runWithAccountHome(*cfg, service, account, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown home command %q", action)
 	}
+}
+
+func printHomeRepairResult(w io.Writer, serviceName, accountName string, result subswapper.HomeRepairResult) error {
+	if _, err := fmt.Fprintf(w, "repaired %s account home %s: linked %d, unchanged %d, missing %d, conflicts %d\n",
+		serviceName, accountName, len(result.Linked), len(result.Unchanged), len(result.Missing), len(result.Conflicts)); err != nil {
+		return err
+	}
+	for _, detail := range []struct {
+		label string
+		items []string
+	}{
+		{label: "linked", items: result.Linked},
+		{label: "unchanged", items: result.Unchanged},
+		{label: "missing sources", items: result.Missing},
+		{label: "conflicts", items: result.Conflicts},
+	} {
+		if len(detail.items) == 0 {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "%s: %s\n", detail.label, strings.Join(detail.items, ", ")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runHomeToken(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -334,7 +374,7 @@ func runClaudeWithSetupToken(
 	configPath string,
 	service subswapper.ServiceConfig,
 	account string,
-	accountHome string,
+	runtimeHome string,
 	command string,
 	args []string,
 	stdin io.Reader,
@@ -345,7 +385,11 @@ func runClaudeWithSetupToken(
 	if err != nil || !status.Usable {
 		return errors.New("selected Claude account has no usable setup token")
 	}
-	if err := subswapper.PrepareClaudeAccountHome(accountHome); err != nil {
+	prepareRuntimeHome := subswapper.PrepareClaudeAccountHome
+	if service.SharedRuntimeHome != "" {
+		prepareRuntimeHome = subswapper.PrepareClaudeSharedRuntimeHome
+	}
+	if err := prepareRuntimeHome(runtimeHome); err != nil {
 		return err
 	}
 	metadata := map[string]string{
@@ -354,7 +398,7 @@ func runClaudeWithSetupToken(
 		"SUBSWAPPER_ACCOUNT":        account,
 		"SUBSWAPPER_TOKEN_REVISION": status.Revision,
 	}
-	environment, err := subswapper.BuildClaudeLaunchEnvironment(os.Environ(), accountHome, token, metadata)
+	environment, err := subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata)
 	if err != nil {
 		return errors.New("selected Claude account environment is unusable")
 	}
@@ -575,8 +619,8 @@ func runClaudeStatusLine(stdin io.Reader, stdout io.Writer) error {
 	if workspaceRoot == "" {
 		workspaceRoot = contextPayload.Workspace.CurrentDir
 	}
-	accountHome := subswapper.AccountDir(*cfg, serviceName, accountName)
-	command, found, resolveErr := subswapper.ResolveClaudeStatusLineCommand(accountHome, workspaceRoot)
+	runtimeHome := subswapper.RuntimeHome(*cfg, service, accountName)
+	command, found, resolveErr := subswapper.ResolveClaudeStatusLineCommand(runtimeHome, workspaceRoot)
 	if resolveErr != nil {
 		return errors.New("claude status-line settings are unavailable")
 	}
@@ -924,6 +968,7 @@ Usage:
   subswapper init [-config ~/.config/subswapper/config.json]
   subswapper import-cswap [-root ~/.local/share/claude-swap]
   subswapper home create -service claude|codex -account <name> [-email user@example.com]
+  subswapper home repair -service claude [-account <name>]
   subswapper home path|env -service claude|codex [-account <name>]
   subswapper home login -service claude|codex [-account <name>]
   subswapper home token set|status|remove -service claude [-account <name>]

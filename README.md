@@ -70,6 +70,9 @@ subswapper switch -service all -account auto
 # Run a client with the selected account home
 subswapper home run -service claude -- claude
 
+# Add missing shared user-configuration links to an existing Claude home
+subswapper home repair -service claude -account work
+
 # Keep the preferred route current in the background
 subswapper monitor
 ```
@@ -95,7 +98,8 @@ value auto-switching compares.
 | Command | Description |
 | --- | --- |
 | `init` | Write a starter config file. |
-| `home create -service <name> -account <name> [-email <label>]` | Create and register an empty private account home. |
+| `home create -service <name> -account <name> [-email <label>]` | Create and register a private account home. New Claude homes inherit allowlisted user configuration. |
+| `home repair -service claude [-account <name>]` | Add missing allowlisted user-configuration links without replacing existing entries. |
 | `home token set\|status\|remove -service claude [-account <name>]` | Manage a Claude setup token without printing its value. `set` accepts the token only through stdin or a hidden prompt. |
 | `home login -service <name> [-account <name>]` | Run the provider's legacy login command in that account home. Do not use this for setup-token routing. |
 | `home path\|env -service <name> [-account <name>]` | Print a home path or shell export for configuring other tools. |
@@ -123,7 +127,7 @@ subswapper home run -service claude -- claude
 ```
 
 Subswapper selects the routed account for each new process. It injects the
-account's setup token, isolated `CLAUDE_CONFIG_DIR`, and
+account's setup token, a controlled `CLAUDE_CONFIG_DIR`, and
 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. It removes conflicting Anthropic,
 Bedrock, Vertex, and Foundry variables described by Anthropic's
 [environment guide](https://code.claude.com/docs/en/env-vars). Changing the
@@ -135,6 +139,65 @@ home. This keeps every `auth.json` private while the launcher shares sessions.
 
 Transparent mid-agent failover is not supported. Start a new process through
 `home run` to use a newly selected account.
+
+### Shared Claude user configuration
+
+Claude treats `CLAUDE_CONFIG_DIR` as the location for every documented
+`~/.claude` path. Subswapper keeps runtime state in each account home and links
+only this explicit user-configuration allowlist from the native `~/.claude`:
+
+| Shared from native `~/.claude` | Kept inside each account home |
+| --- | --- |
+| `CLAUDE.md`, `settings.json`, `keybindings.json` | `.credentials.json`, `.config.json`, `mcp-needs-auth-cache.json` |
+| `plugins/`, `skills/`, `agents/`, `output-styles/` | `projects/`, including transcripts and auto-memory |
+| `rules/`, `commands/`, `workflows/`, `themes/` | `sessions/`, `history.jsonl`, `agent-memory/`, and all other generated state |
+
+This allowlist follows Claude's documented
+[user directory layout](https://code.claude.com/docs/en/claude-directory).
+Missing native sources are skipped and reported. Existing files, directories,
+and links to other targets are conflicts and are never replaced. Run
+`subswapper home repair -service claude -account <name>` after an upgrade to
+repair an existing home. The command is idempotent and reports names only; it
+does not read or print file contents.
+
+Subswapper uses symbolic links so later user-configuration changes apply to
+every account. On Windows, enable Developer Mode or grant symbolic-link
+privilege. Creation or repair stops with an explicit error if Windows cannot
+create a link.
+
+### Optional shared Claude runtime
+
+By default, each Claude account has a separate runtime home. User-scoped MCP
+configuration and MCP OAuth state therefore follow the selected account home.
+To keep one MCP state across setup-token account switches, configure a shared
+runtime home:
+
+```json
+{
+  "name": "claude",
+  "kind": "claude",
+  "account_mode": "home",
+  "shared_runtime_home": "~/.local/share/subswapper/shared/claude"
+}
+```
+
+Every setup-token launch then uses that path as `CLAUDE_CONFIG_DIR`.
+Subswapper still selects and injects one account token per new process. Usage
+captured through Claude's status line remains bound to that token and account.
+Existing processes keep their launch token.
+
+The shared directory keeps MCP configuration, MCP OAuth, settings, plugins,
+credentials, history, sessions, and auto-memory together. This option disables
+the account-state isolation described above. Subswapper removes only stale
+top-level `oauthAccount` metadata before launch. It preserves `.credentials.json`
+contents and secures the file to `0600`. The native user home and native
+`~/.claude` directory remain prohibited as shared runtime paths.
+
+An empty shared directory starts without user-scoped MCP registrations. Seed
+it from one trusted Subswapper account home while no Claude process uses that
+home, or configure MCP servers again in the shared runtime. The
+`shared_runtime_home` path must resolve to an absolute path. Omitting it keeps
+the original per-account behavior.
 
 ## How auto-switching works
 
@@ -197,6 +260,10 @@ Account-home files use these native names:
 
 - Claude: `<account-home>/.credentials.json` and optional `.config.json`
 - Codex: `<account-home>/auth.json`
+
+Claude home-mode services may set `shared_runtime_home`. This changes only the
+runtime home used by setup-token launches and status-line settings. Registered
+account homes and setup-token storage remain separate.
 
 An explicit `files` list defaults a service to `account_mode: "bundle"`. This
 keeps custom-service support and legacy transactional switching available.
@@ -286,12 +353,14 @@ After upgrading an existing installation, run:
 
 ```sh
 subswapper home migrate
+subswapper home repair -service claude -account <name>
 ```
 
 Legacy Claude `credentials.json` and `claude.json` snapshots are copied to
 their native home names, `.credentials.json` and `.config.json`. Existing
 native files win; nothing is overwritten or deleted. Codex `auth.json` files
-already have their native filename. Verify with `subswapper status`, then use
+already have their native filename. `home repair` adds only missing allowlisted
+Claude user-configuration links. Verify with `subswapper status`, then use
 `home path` to configure external launcher instances.
 
 ### Safe Claude setup-token migration
@@ -327,7 +396,8 @@ Defaults on Linux (macOS and Windows use their native config/data folders):
 Linux and macOS are tested in CI; Windows builds are cross-compiled but
 currently untested. Claude setup-token storage requires POSIX `0600` and
 `0700` permission checks, so it fails closed on Windows. Other Windows support
-remains experimental.
+remains experimental. Claude user-configuration inheritance also needs Windows
+Developer Mode or symbolic-link privilege.
 
 Credentials and state are written with `0600` permissions under `0700`
 directories. Setup-token replacement uses atomic rename and directory sync.

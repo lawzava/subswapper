@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"testing"
 	"time"
 )
@@ -50,6 +52,7 @@ func TestExplicitManagedFilesRemainBundleMode(t *testing.T) {
 
 func TestCreateAccountHomeRegistersEmptyPrivateHome(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
 	cfg := Config{
 		BackupRoot: filepath.Join(dir, "accounts"),
 		StatePath:  filepath.Join(dir, "state.json"),
@@ -86,6 +89,193 @@ func TestCreateAccountHomeRegistersEmptyPrivateHome(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".credentials.json")); !os.IsNotExist(err) {
 		t.Fatalf("creating a home unexpectedly created credentials: %v", err)
+	}
+}
+
+func TestCreateClaudeAccountHomeLinksOnlyAllowlistedNativeConfiguration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows symlink creation depends on Developer Mode or elevated privileges")
+	}
+	dir := t.TempDir()
+	nativeHome := filepath.Join(dir, "native-home")
+	nativeClaude := filepath.Join(nativeHome, ".claude")
+	t.Setenv("HOME", nativeHome)
+	if err := os.MkdirAll(nativeClaude, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sharedFiles := []string{"CLAUDE.md", "settings.json", "keybindings.json"}
+	sharedDirs := []string{"plugins", "skills", "agents", "output-styles", "rules", "commands", "workflows", "themes"}
+	for _, name := range sharedFiles {
+		if err := os.WriteFile(filepath.Join(nativeClaude, name), []byte("shared configuration"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range sharedDirs {
+		if err := os.Mkdir(filepath.Join(nativeClaude, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	isolatedFiles := []string{".credentials.json", ".config.json", "history.jsonl", "stats-cache.json", "mcp-needs-auth-cache.json"}
+	isolatedDirs := []string{"projects", "sessions", "agent-memory", "file-history", "tasks", "teams"}
+	for _, name := range isolatedFiles {
+		if err := os.WriteFile(filepath.Join(nativeClaude, name), []byte("private runtime state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range isolatedDirs {
+		if err := os.Mkdir(filepath.Join(nativeClaude, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "accounts"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []ServiceConfig{{Name: "claude", Kind: "claude"}},
+	}
+	cfg.ApplyDefaults()
+	_, home, err := CreateAccountHome(cfg, "claude", "work", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(sharedFiles, sharedDirs...) {
+		target := filepath.Join(home, name)
+		info, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("shared configuration %s: %v", name, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("shared configuration %s is not a symlink", name)
+		}
+		link, err := os.Readlink(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := filepath.Join(nativeClaude, name); link != want {
+			t.Fatalf("shared configuration %s links to %q, want %q", name, link, want)
+		}
+	}
+	for _, name := range append(isolatedFiles, isolatedDirs...) {
+		if _, err := os.Lstat(filepath.Join(home, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("isolated path %s was inherited: %v", name, err)
+		}
+	}
+}
+
+func TestRepairClaudeAccountHomeIsIdempotentAndReportsMissingSources(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows symlink creation depends on Developer Mode or elevated privileges")
+	}
+	dir := t.TempDir()
+	nativeHome := filepath.Join(dir, "native-home")
+	nativeClaude := filepath.Join(nativeHome, ".claude")
+	t.Setenv("HOME", nativeHome)
+	if err := os.MkdirAll(nativeClaude, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"CLAUDE.md", "settings.json"} {
+		if err := os.WriteFile(filepath.Join(nativeClaude, name), []byte("shared"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "accounts"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []ServiceConfig{{Name: "claude", Kind: "claude"}},
+	}
+	cfg.ApplyDefaults()
+	home := AccountDir(cfg, "claude", "work")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := NewState()
+	state.Service("claude").Accounts["work"] = AccountState{Name: "work"}
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := RepairAccountHome(cfg, "claude", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(first.Linked, []string{"CLAUDE.md", "settings.json"}) {
+		t.Fatalf("first linked = %v", first.Linked)
+	}
+	if len(first.Unchanged) != 0 || len(first.Missing) == 0 || len(first.Conflicts) != 0 {
+		t.Fatalf("first repair = %#v", first)
+	}
+	second, err := RepairAccountHome(cfg, "claude", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(second.Unchanged, []string{"CLAUDE.md", "settings.json"}) || len(second.Linked) != 0 {
+		t.Fatalf("second repair = %#v", second)
+	}
+	if !slices.Equal(second.Missing, first.Missing) || len(second.Conflicts) != 0 {
+		t.Fatalf("second repair changed missing sources or conflicts: %#v", second)
+	}
+}
+
+func TestRepairClaudeAccountHomePreservesFilesDirectoriesAndMismatchedSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows symlink creation depends on Developer Mode or elevated privileges")
+	}
+	dir := t.TempDir()
+	nativeHome := filepath.Join(dir, "native-home")
+	nativeClaude := filepath.Join(nativeHome, ".claude")
+	t.Setenv("HOME", nativeHome)
+	for _, name := range []string{"settings.json", "agents", "skills", "CLAUDE.md"} {
+		path := filepath.Join(nativeClaude, name)
+		if filepath.Ext(name) != "" {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("native"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "accounts"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []ServiceConfig{{Name: "claude", Kind: "claude"}},
+	}
+	cfg.ApplyDefaults()
+	home := AccountDir(cfg, "claude", "work")
+	if err := os.MkdirAll(filepath.Join(home, "agents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte("account settings stay private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrongTarget := filepath.Join(dir, "other-skills")
+	if err := os.Symlink(wrongTarget, filepath.Join(home, "skills")); err != nil {
+		t.Fatal(err)
+	}
+	state := NewState()
+	state.Service("claude").Accounts["work"] = AccountState{Name: "work"}
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RepairAccountHome(cfg, "claude", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(result.Conflicts, []string{"settings.json", "skills", "agents"}) {
+		t.Fatalf("conflicts = %v", result.Conflicts)
+	}
+	if !slices.Contains(result.Linked, "CLAUDE.md") {
+		t.Fatalf("non-conflicting source was not linked: %#v", result)
+	}
+	assertFileContent(t, filepath.Join(home, "settings.json"), "account settings stay private")
+	if info, err := os.Stat(filepath.Join(home, "agents")); err != nil || !info.IsDir() {
+		t.Fatalf("existing agents directory changed: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(home, "skills")); err != nil || got != wrongTarget {
+		t.Fatalf("mismatched skills symlink changed: target=%q err=%v", got, err)
 	}
 }
 
@@ -126,6 +316,22 @@ func TestAccountEnvironmentUsesProviderHome(t *testing.T) {
 	}
 	if got := AccountEnvironment(cfg, codex, "personal"); got["CODEX_HOME"] != AccountDir(cfg, "codex", "personal") {
 		t.Fatalf("Codex environment = %#v", got)
+	}
+}
+
+func TestRuntimeHomeUsesSharedClaudePathOnlyWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	cfg := Config{BackupRoot: filepath.Join(dir, "accounts")}
+	isolated := ServiceConfig{Name: "claude", Kind: "claude", AccountMode: AccountModeHome}
+	shared := isolated
+	shared.SharedRuntimeHome = "~/.local/share/subswapper/shared-claude"
+
+	if got, want := RuntimeHome(cfg, isolated, "work"), AccountDir(cfg, "claude", "work"); got != want {
+		t.Fatalf("isolated runtime home = %q, want %q", got, want)
+	}
+	if got, want := RuntimeHome(cfg, shared, "work"), filepath.Join(dir, ".local", "share", "subswapper", "shared-claude"); got != want {
+		t.Fatalf("shared runtime home = %q, want %q", got, want)
 	}
 }
 

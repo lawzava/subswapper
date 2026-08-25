@@ -248,6 +248,56 @@ func TestPrepareClaudeAccountHomeRemovesOnlyTopLevelOAuthAccount(t *testing.T) {
 	}
 }
 
+func TestPrepareClaudeSharedRuntimeHomePreservesStoredAuthentication(t *testing.T) {
+	homeRoot := t.TempDir()
+	t.Setenv("HOME", filepath.Join(homeRoot, "native"))
+	if err := os.MkdirAll(os.Getenv("HOME"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeHome := filepath.Join(homeRoot, "shared")
+	if err := os.MkdirAll(runtimeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	credentialsPath := filepath.Join(runtimeHome, ".credentials.json")
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"claude-secret"},"mcpOAuth":{"server":{"accessToken":"mcp-secret"}},"other":true}`)
+	if err := os.WriteFile(credentialsPath, credentials, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PrepareClaudeSharedRuntimeHome(runtimeHome); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	var claudeLogin map[string]string
+	if err := json.Unmarshal(got["claudeAiOauth"], &claudeLogin); err != nil {
+		t.Fatal(err)
+	}
+	if claudeLogin["accessToken"] != "claude-secret" {
+		t.Fatalf("shared credentials changed Claude login: %s", data)
+	}
+	var mcpOAuth map[string]map[string]string
+	if err := json.Unmarshal(got["mcpOAuth"], &mcpOAuth); err != nil {
+		t.Fatal(err)
+	}
+	if mcpOAuth["server"]["accessToken"] != "mcp-secret" || string(got["other"]) != "true" {
+		t.Fatalf("shared credentials changed unrelated state: %s", data)
+	}
+	info, err := os.Stat(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("shared credentials mode = %o, want 600", mode)
+	}
+}
+
 func TestPrepareClaudeAccountHomeFailsClosedBeforeAnyRewrite(t *testing.T) {
 	homeRoot := t.TempDir()
 	t.Setenv("HOME", filepath.Join(homeRoot, "native"))

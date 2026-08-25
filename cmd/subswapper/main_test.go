@@ -40,7 +40,7 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage:") {
 		t.Fatalf("help output:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "home create") || !strings.Contains(stdout.String(), "home run") {
+	if !strings.Contains(stdout.String(), "home create") || !strings.Contains(stdout.String(), "home repair") || !strings.Contains(stdout.String(), "home run") {
 		t.Fatalf("help output lacks account-home commands:\n%s", stdout.String())
 	}
 	stdout.Reset()
@@ -55,6 +55,65 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	}
 	if err := run(nil, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "missing command") {
 		t.Fatalf("missing command error = %v", err)
+	}
+}
+
+func TestRunHomeRepairReportsConflictsWithoutContents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows symlink creation depends on Developer Mode or elevated privileges")
+	}
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "claude")
+	createHomeAccount(t, configPath, "claude", "work")
+	nativeClaude := filepath.Join(dir, "native-home", ".claude")
+	if err := os.MkdirAll(nativeClaude, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeClaude, "CLAUDE.md"), []byte("native secret marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(dir, "accounts", "claude", "work")
+	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte("account secret marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeClaude, "settings.json"), []byte("native settings marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"home", "repair", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "1 conflict") {
+		t.Fatalf("repair error = %v", err)
+	}
+	combined := stdout.String() + stderr.String() + err.Error()
+	for _, want := range []string{"linked 1", "conflicts 1", "settings.json"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("repair output lacks %q: %s", want, combined)
+		}
+	}
+	for _, secret := range []string{"native secret marker", "account secret marker", "native settings marker"} {
+		if strings.Contains(combined, secret) {
+			t.Fatalf("repair exposed file contents: %q", combined)
+		}
+	}
+}
+
+func TestRunHomeRepairDoesNotReportSuccessBeforeAnEarlyFailure(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "claude")
+	createHomeAccount(t, configPath, "claude", "work")
+	home := filepath.Join(dir, "accounts", "claude", "work")
+	if err := os.Remove(home); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"home", "repair", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "inspect account home") {
+		t.Fatalf("repair error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("repair reported success before failure: %q", stdout.String())
 	}
 }
 
@@ -230,6 +289,85 @@ printf '<%s>' "$@"
 	}
 	if strings.Contains(got+stderr.String(), secret) {
 		t.Fatalf("home run exposed setup token: %q", got+stderr.String())
+	}
+}
+
+func TestRunHomeClaudeSharesRuntimeStateWithoutSharingSetupTokens(t *testing.T) {
+	dir := t.TempDir()
+	sharedHome := filepath.Join(dir, "shared-claude-runtime")
+	configPath := writeSharedClaudeRuntimeConfig(t, dir, sharedHome)
+	createHomeAccount(t, configPath, "claude", "a")
+	createHomeAccount(t, configPath, "claude", "b")
+	const tokenA = "sk-ant-oat01-shared-runtime-a"
+	const tokenB = "sk-ant-oat01-shared-runtime-b"
+	storeTestSetupToken(t, configPath, "a", tokenA)
+	storeTestSetupToken(t, configPath, "b", tokenB)
+	if err := os.MkdirAll(sharedHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sharedCredentials := []byte(`{"claudeAiOauth":{"accessToken":"existing-login"},"mcpOAuth":{"server":{"accessToken":"mcp-state"}}}`)
+	if err := os.WriteFile(filepath.Join(sharedHome, ".credentials.json"), sharedCredentials, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedHome, "mcp-state"), []byte("connected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeClaude := writeFakeClaude(t, dir, `
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  printf '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}\n'
+  exit 0
+fi
+token=wrong
+case "$SUBSWAPPER_ACCOUNT:$CLAUDE_CODE_OAUTH_TOKEN" in
+  a:`+tokenA+`|b:`+tokenB+`) token=selected ;;
+esac
+mcp=missing
+if [ -f "$CLAUDE_CONFIG_DIR/mcp-state" ]; then mcp=connected; fi
+printf 'account=%s token=%s config=%s mcp=%s\n' "$SUBSWAPPER_ACCOUNT" "$token" "$CLAUDE_CONFIG_DIR" "$mcp"
+`)
+
+	for _, account := range []string{"a", "b"} {
+		var stdout, stderr bytes.Buffer
+		err := runWithInput(
+			[]string{"home", "run", "-config", configPath, "-service", "claude", "-account", account, "--", fakeClaude},
+			strings.NewReader(""),
+			&stdout,
+			&stderr,
+		)
+		if err != nil {
+			t.Fatalf("run account %s: %v; stderr=%s", account, err, stderr.String())
+		}
+		got := stdout.String()
+		for _, want := range []string{"account=" + account, "token=selected", "config=" + sharedHome, "mcp=connected"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("account %s output lacks %q:\n%s", account, want, got)
+			}
+		}
+		if strings.Contains(got+stderr.String(), tokenA) || strings.Contains(got+stderr.String(), tokenB) {
+			t.Fatalf("account %s exposed a setup token", account)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(sharedHome, ".credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var credentials map[string]json.RawMessage
+	if err := json.Unmarshal(data, &credentials); err != nil {
+		t.Fatal(err)
+	}
+	var claudeLogin map[string]string
+	if err := json.Unmarshal(credentials["claudeAiOauth"], &claudeLogin); err != nil {
+		t.Fatalf("shared runtime lost stored Claude login credentials: %v", err)
+	}
+	if claudeLogin["accessToken"] != "existing-login" {
+		t.Fatalf("shared runtime changed stored Claude login credentials: %#v", claudeLogin)
+	}
+	var mcpOAuth map[string]map[string]string
+	if err := json.Unmarshal(credentials["mcpOAuth"], &mcpOAuth); err != nil {
+		t.Fatalf("shared runtime lost MCP OAuth state: %v", err)
+	}
+	if mcpOAuth["server"]["accessToken"] != "mcp-state" {
+		t.Fatalf("shared runtime changed MCP OAuth state: %#v", mcpOAuth)
 	}
 }
 
@@ -500,6 +638,64 @@ func TestClaudeStatusLineRecordsUsageAndPreservesExistingCommand(t *testing.T) {
 	}
 }
 
+func TestClaudeStatusLineUsesSharedRuntimeSettingsAndSelectedAccountUsage(t *testing.T) {
+	dir := t.TempDir()
+	sharedHome := filepath.Join(dir, "shared-claude-runtime")
+	configPath := writeSharedClaudeRuntimeConfig(t, dir, sharedHome)
+	createHomeAccount(t, configPath, "claude", "work")
+	storeTestSetupToken(t, configPath, "work", "sk-ant-oat01-shared-statusline")
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := subswapper.ClaudeSetupTokenStatusForAccount(*cfg, "claude", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedSettingsPath := filepath.Join(sharedHome, "settings.json")
+	sharedSettings := []byte(`{"statusLine":{"type":"command","command":"cat"},"mcpShared":true}`)
+	if err := os.MkdirAll(sharedHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedSettingsPath, sharedSettings, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accountHome := filepath.Join(dir, "accounts", "claude", "work")
+	if err := os.WriteFile(filepath.Join(accountHome, "settings.json"), []byte(`{"statusLine":{"type":"command","command":"printf account-home"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	payload := []byte(fmt.Sprintf(`{"workspace":{"project_dir":%q},"rate_limits":{"five_hour":{"used_percentage":21,"resets_at":%d},"seven_day":{"used_percentage":43,"resets_at":%d}}}`,
+		dir, now.Add(time.Hour).Unix(), now.Add(24*time.Hour).Unix()))
+	t.Setenv("SUBSWAPPER_CONFIG_PATH", configPath)
+	t.Setenv("SUBSWAPPER_SERVICE", "claude")
+	t.Setenv("SUBSWAPPER_ACCOUNT", "work")
+	t.Setenv("SUBSWAPPER_TOKEN_REVISION", status.Revision)
+	var stdout, stderr bytes.Buffer
+	if err := runWithInput([]string{"claude-statusline"}, bytes.NewReader(payload), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stdout.Bytes(), payload) {
+		t.Fatalf("shared status-line output changed:\n got %q\nwant %q", stdout.Bytes(), payload)
+	}
+	storedSettings, err := os.ReadFile(sharedSettingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedSettings, sharedSettings) {
+		t.Fatalf("shared settings changed:\n got %s\nwant %s", storedSettings, sharedSettings)
+	}
+	state, err := subswapper.LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, ok := state.Account("claude", "work")
+	if !ok || !account.Usage.HasCoreLimits() || account.Usage.TokenRevision != status.Revision {
+		t.Fatalf("shared runtime usage was not attributed to work: %#v", account.Usage)
+	}
+}
+
 func createHomeAccount(t *testing.T, configPath, service, account string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
@@ -589,6 +785,9 @@ func TestRemoveHomeAccountPreservesHomeUnlessDeleteRequested(t *testing.T) {
 
 func writeHomeModeConfig(t *testing.T, dir, kind string) string {
 	t.Helper()
+	if kind == "claude" {
+		t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	}
 	cfg := subswapper.Config{
 		BackupRoot: filepath.Join(dir, "accounts"),
 		StatePath:  filepath.Join(dir, "state.json"),
@@ -600,6 +799,31 @@ func writeHomeModeConfig(t *testing.T, dir, kind string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSharedClaudeRuntimeConfig(t *testing.T, dir, sharedHome string) string {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	config := map[string]any{
+		"backup_root": filepath.Join(dir, "accounts"),
+		"state_path":  filepath.Join(dir, "state.json"),
+		"monitor":     map[string]any{"interval": "5m", "auto_switch": true},
+		"services": []any{map[string]any{
+			"name":                "claude",
+			"kind":                "claude",
+			"account_mode":        "home",
+			"shared_runtime_home": sharedHome,
+		}},
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -39,13 +39,16 @@ type Duration struct {
 }
 
 type ServiceConfig struct {
-	Name         string        `json:"name"`
-	Kind         string        `json:"kind"`
-	DisplayName  string        `json:"display_name,omitempty"`
-	AccountMode  string        `json:"account_mode,omitempty"`
-	Files        []ManagedFile `json:"files,omitempty"`
-	UsageCommand []string      `json:"usage_command,omitempty"`
-	Disabled     bool          `json:"disabled,omitempty"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	DisplayName string `json:"display_name,omitempty"`
+	AccountMode string `json:"account_mode,omitempty"`
+	// SharedRuntimeHome keeps Claude runtime and MCP state stable while setup
+	// tokens remain selected per process. It applies only to Claude home mode.
+	SharedRuntimeHome string        `json:"shared_runtime_home,omitempty"`
+	Files             []ManagedFile `json:"files,omitempty"`
+	UsageCommand      []string      `json:"usage_command,omitempty"`
+	Disabled          bool          `json:"disabled,omitempty"`
 }
 
 type ManagedFile struct {
@@ -138,6 +141,17 @@ func (c Config) Validate() error {
 		}
 		if service.UsesAccountHomes() && !isBuiltInKind(service.Kind) {
 			return fmt.Errorf("service %q account_mode %q requires kind claude or codex", service.Name, AccountModeHome)
+		}
+		if service.SharedRuntimeHome != "" {
+			if strings.TrimSpace(service.SharedRuntimeHome) == "" {
+				return fmt.Errorf("service %q shared_runtime_home must not be blank", service.Name)
+			}
+			if !isClaudeService(service) || !service.UsesAccountHomes() {
+				return fmt.Errorf("service %q shared_runtime_home requires Claude account_mode %q", service.Name, AccountModeHome)
+			}
+			if !filepath.IsAbs(ExpandPath(service.SharedRuntimeHome)) {
+				return fmt.Errorf("service %q shared_runtime_home must resolve to an absolute path", service.Name)
+			}
 		}
 		if len(service.Files) == 0 {
 			return fmt.Errorf("service %q has no managed files", service.Name)

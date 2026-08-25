@@ -33,6 +33,14 @@ func (s ServiceConfig) UsesAccountHomes() bool {
 	return s.AccountMode == AccountModeHome
 }
 
+// RuntimeHome returns the state directory used by a launched provider.
+func RuntimeHome(cfg Config, service ServiceConfig, accountName string) string {
+	if isClaudeService(service) && service.SharedRuntimeHome != "" {
+		return ExpandPath(service.SharedRuntimeHome)
+	}
+	return AccountDir(cfg, service.Name, accountName)
+}
+
 func AccountEnvironment(cfg Config, service ServiceConfig, accountName string) map[string]string {
 	home := AccountDir(cfg, service.Name, accountName)
 	switch {
@@ -88,6 +96,24 @@ func CreateAccountHome(cfg Config, serviceName, accountName, email string) (Acco
 	if err := os.Chmod(home, 0o700); err != nil {
 		return AccountState{}, "", err
 	}
+	repair := HomeRepairResult{}
+	if isClaudeService(service) {
+		repair, err = repairClaudeSharedConfig(home)
+		if err != nil {
+			removeClaudeSharedConfigLinks(home, repair.Linked)
+			if !existed {
+				_ = os.Remove(home)
+			}
+			return AccountState{}, "", err
+		}
+		if len(repair.Conflicts) != 0 {
+			removeClaudeSharedConfigLinks(home, repair.Linked)
+			if !existed {
+				_ = os.Remove(home)
+			}
+			return AccountState{}, "", fmt.Errorf("claude account home has %d shared configuration conflicts", len(repair.Conflicts))
+		}
+	}
 	account := AccountState{Name: accountName, Email: email, AddedAt: time.Now().UTC()}
 	serviceState.Accounts[accountName] = account
 	if serviceState.ActiveAccount == "" {
@@ -95,6 +121,7 @@ func CreateAccountHome(cfg Config, serviceName, accountName, email string) (Acco
 	}
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		delete(serviceState.Accounts, accountName)
+		removeClaudeSharedConfigLinks(home, repair.Linked)
 		if !existed {
 			_ = os.Remove(home)
 		}

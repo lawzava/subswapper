@@ -180,6 +180,16 @@ type claudeConfigRewrite struct {
 // Claude config filenames used by account homes. It never opens or writes a
 // native Claude config file.
 func PrepareClaudeAccountHome(accountHome string) error {
+	return prepareClaudeRuntimeHome(accountHome, false)
+}
+
+// PrepareClaudeSharedRuntimeHome preserves all stored authentication while
+// securing the credentials file shared by multiple setup-token launches.
+func PrepareClaudeSharedRuntimeHome(runtimeHome string) error {
+	return prepareClaudeRuntimeHome(runtimeHome, true)
+}
+
+func prepareClaudeRuntimeHome(accountHome string, secureCredentials bool) error {
 	accountPath, err := canonicalPathWithMissingLeaf(accountHome)
 	if err != nil {
 		return fmt.Errorf("resolve Claude account home: %w", err)
@@ -207,7 +217,7 @@ func PrepareClaudeAccountHome(accountHome string) error {
 		return fmt.Errorf("secure Claude account home: %w", err)
 	}
 
-	rewrites := make([]claudeConfigRewrite, 0, 2)
+	rewrites := make([]claudeConfigRewrite, 0, 3)
 	for _, name := range []string{".claude.json", ".config.json"} {
 		path := filepath.Join(accountHome, name)
 		data, mode, exists, err := readRegularClaudeConfig(path)
@@ -230,6 +240,16 @@ func PrepareClaudeAccountHome(accountHome string) error {
 			}
 		}
 		if hadOAuthAccount || mode.Perm() != 0o600 {
+			rewrites = append(rewrites, claudeConfigRewrite{path: path, data: data})
+		}
+	}
+	if secureCredentials {
+		path := filepath.Join(accountHome, ".credentials.json")
+		data, mode, exists, err := readRegularClaudeConfig(path)
+		if err != nil {
+			return err
+		}
+		if exists && mode.Perm() != 0o600 {
 			rewrites = append(rewrites, claudeConfigRewrite{path: path, data: data})
 		}
 	}
