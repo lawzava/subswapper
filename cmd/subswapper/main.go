@@ -73,6 +73,8 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return runSwitch(args[1:], stdout)
 	case "monitor":
 		return runMonitor(args[1:], stdout)
+	case "proxy":
+		return runProxy(args[1:], stdout)
 	case "version", "-version", "--version":
 		return printVersion(stdout)
 	case "help", "-h", "--help":
@@ -385,12 +387,37 @@ func runClaudeWithSetupToken(
 	if err != nil || !status.Usable {
 		return errors.New("selected Claude account has no usable setup token")
 	}
-	prepareRuntimeHome := subswapper.PrepareClaudeAccountHome
-	if service.SharedRuntimeHome != "" {
-		prepareRuntimeHome = subswapper.PrepareClaudeSharedRuntimeHome
+	// Through the proxy the process only ever holds the shared secret; the
+	// proxy swaps real tokens per request. A proxy that is configured but not
+	// running degrades to a fixed-token launch so work is never blocked.
+	proxyMode := false
+	if service.ClaudeProxyEnabled() {
+		secret, secretErr := subswapper.LoadOrCreateClaudeProxySecret(cfg, service.Name)
+		switch {
+		case secretErr != nil:
+			_, _ = fmt.Fprintf(stderr, "subswapper: Claude proxy secret unavailable (%v); launching with a fixed account token\n", secretErr)
+		case !subswapper.ClaudeProxyReachable(service, secret):
+			_, _ = fmt.Fprintf(stderr, "subswapper: Claude proxy at %s is not running; launching with a fixed account token\n", service.ProxyListen)
+		default:
+			proxyMode = true
+			token = secret
+		}
 	}
-	if err := prepareRuntimeHome(runtimeHome); err != nil {
-		return err
+	// With the native home Claude keeps its own files; there is nothing to
+	// prepare and the real token never reaches this process. A fallback launch
+	// still isolates the fixed token in the account home.
+	nativeHome := proxyMode && service.UsesNativeRuntimeHome()
+	if !nativeHome {
+		if service.UsesNativeRuntimeHome() {
+			runtimeHome = subswapper.AccountDir(cfg, service.Name, account)
+		}
+		prepareRuntimeHome := subswapper.PrepareClaudeAccountHome
+		if service.SharedRuntimeHome != "" {
+			prepareRuntimeHome = subswapper.PrepareClaudeSharedRuntimeHome
+		}
+		if err := prepareRuntimeHome(runtimeHome); err != nil {
+			return err
+		}
 	}
 	metadata := map[string]string{
 		"SUBSWAPPER_CONFIG_PATH":    configPath,
@@ -398,7 +425,17 @@ func runClaudeWithSetupToken(
 		"SUBSWAPPER_ACCOUNT":        account,
 		"SUBSWAPPER_TOKEN_REVISION": status.Revision,
 	}
-	environment, err := subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata)
+	var environment []string
+	if proxyMode {
+		metadata["SUBSWAPPER_PROXY"] = "1"
+		launchHome := runtimeHome
+		if nativeHome {
+			launchHome = ""
+		}
+		environment, err = subswapper.BuildClaudeProxyLaunchEnvironment(os.Environ(), launchHome, token, service.ProxyListen, metadata)
+	} else {
+		environment, err = subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata)
+	}
 	if err != nil {
 		return errors.New("selected Claude account environment is unusable")
 	}
@@ -626,7 +663,9 @@ func runClaudeStatusLine(stdin io.Reader, stdout io.Writer) error {
 	}
 
 	observedAt := time.Now().UTC()
-	if sample, parseErr := subswapper.ParseClaudeStatusLine(input, observedAt, tokenRevision); parseErr == nil {
+	// Behind the proxy the status line reflects whichever account served the
+	// last request, so it cannot be attributed to the launch account.
+	if sample, parseErr := subswapper.ParseClaudeStatusLine(input, observedAt, tokenRevision); parseErr == nil && os.Getenv("SUBSWAPPER_PROXY") != "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = subswapper.RecordClaudeStatusLineUsage(ctx, *cfg, serviceName, accountName, sample)
 		cancel()
@@ -850,6 +889,7 @@ func runMonitor(args []string, stdout io.Writer) error {
 	once := fs.Bool("once", false, "run one monitor cycle")
 	noAuto := fs.Bool("no-auto", false, "observe without switching")
 	verbose := fs.Bool("verbose", false, "print the full status table every cycle")
+	withProxy := fs.Bool("proxy", false, "also serve the Claude auth proxy configured by proxy_listen")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -858,19 +898,107 @@ func runMonitor(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if *withProxy {
+		proxyService, ok := configuredProxyService(*cfg, "")
+		if !ok {
+			return errors.New("monitor -proxy requires a Claude service with proxy_listen")
+		}
+		proxy, err := subswapper.NewClaudeProxy(*cfg, proxyService.Name, proxyLogger(stdout))
+		if err != nil {
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		ctx, cancel := context.WithCancelCause(ctx)
+		defer cancel(nil)
+		go func() {
+			if serveErr := proxy.Serve(ctx); serveErr != nil {
+				cancel(serveErr)
+				return
+			}
+			cancel(nil)
+		}()
+		if _, err := fmt.Fprintf(stdout, "subswapper proxy listening on %s\n", proxyService.ProxyListen); err != nil {
+			return err
+		}
+		monitorErr := runMonitorWithConfig(ctx, *cfg, *interval, *once, *noAuto, *verbose, stdout)
+		cancel(nil)
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+			return cause
+		}
+		return monitorErr
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runMonitorWithConfig(ctx, *cfg, *interval, *once, *noAuto, *verbose, stdout)
+}
+
+func runMonitorWithConfig(ctx context.Context, cfg subswapper.Config, interval time.Duration, once, noAuto, verbose bool, stdout io.Writer) error {
 	monitorInterval := cfg.Monitor.Interval.Duration
-	if *interval > 0 {
-		monitorInterval = *interval
+	if interval > 0 {
+		monitorInterval = interval
 	}
 	if monitorInterval <= 0 {
 		monitorInterval = time.Minute
 	}
+	autoSwitch := cfg.Monitor.AutoSwitchEnabled() && !noAuto
+	return runMonitorLoop(ctx, cfg, monitorInterval, once, autoSwitch, verbose, stdout, subswapper.MonitorOnce)
+}
 
+func configuredProxyService(cfg subswapper.Config, name string) (subswapper.ServiceConfig, bool) {
+	for _, service := range cfg.Services {
+		if name != "" && service.Name != name {
+			continue
+		}
+		if service.ClaudeProxyEnabled() && !service.Disabled {
+			return service, true
+		}
+	}
+	return subswapper.ServiceConfig{}, false
+}
+
+func proxyLogger(stdout io.Writer) func(string, ...any) {
+	return func(format string, args ...any) {
+		_, _ = fmt.Fprintf(stdout, format+"\n", args...)
+	}
+}
+
+func runProxy(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	configPath := fs.String("config", defaultConfigPath, "config file")
+	serviceName := fs.String("service", "claude", "Claude service name")
+	listen := fs.String("listen", "", "override the configured proxy_listen address")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := subswapper.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *listen != "" {
+		if err := subswapper.ValidateClaudeProxyListen(*listen); err != nil {
+			return fmt.Errorf("-listen: %w", err)
+		}
+		for index := range cfg.Services {
+			if cfg.Services[index].Name == *serviceName {
+				cfg.Services[index].ProxyListen = *listen
+			}
+		}
+	}
+	service, ok := configuredProxyService(*cfg, *serviceName)
+	if !ok {
+		return fmt.Errorf("service %q has no proxy_listen configured; set it in the config or pass -listen", *serviceName)
+	}
+	proxy, err := subswapper.NewClaudeProxy(*cfg, service.Name, proxyLogger(stdout))
+	if err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	autoSwitch := cfg.Monitor.AutoSwitchEnabled() && !*noAuto
-	return runMonitorLoop(ctx, *cfg, monitorInterval, *once, autoSwitch, *verbose, stdout, subswapper.MonitorOnce)
+	if _, err := fmt.Fprintf(stdout, "subswapper proxy listening on %s\n", service.ProxyListen); err != nil {
+		return err
+	}
+	return proxy.Serve(ctx)
 }
 
 type monitorCycleRunner func(context.Context, subswapper.Config, bool) subswapper.CycleResult
@@ -978,7 +1106,8 @@ Usage:
   subswapper remove -service claude|codex -account <name> [-force] [-delete-home]
   subswapper status [-config ~/.config/subswapper/config.json]
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
-  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose]
+  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]
+  subswapper proxy [-config ~/.config/subswapper/config.json] [-service claude] [-listen 127.0.0.1:7878]
   subswapper version`)
 	return err
 }

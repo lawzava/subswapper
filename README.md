@@ -20,6 +20,10 @@ existing process.
 - **Quota-aware routing** — a monitor loop changes the preferred account when
   the selected one crosses a configurable threshold, without mutating a
   running provider's credentials.
+- **Live swapping through a local proxy** — an optional loopback auth proxy
+  holds the setup tokens, picks the account per request, fails over on a
+  rejected rate limit, and records the real rate-limit headers. Running
+  Claude sessions keep going across a switch.
 - **Safe by design** — cross-process locking, private `0700` homes, atomic
   credential persistence, and non-destructive migration from old snapshots.
 - **Extensible** — any other service can be managed by listing its credential
@@ -109,7 +113,8 @@ value auto-switching compares.
 | `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the least-used healthy account. |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
-| `monitor [-interval 5m] [-once] [-no-auto] [-verbose]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table. |
+| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves the Claude auth proxy. |
+| `proxy [-service claude] [-listen 127.0.0.1:7878]` | Serve only the Claude auth proxy configured by `proxy_listen`. |
 | `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
@@ -137,8 +142,59 @@ For Codex launchers that support shadow homes, use a shared `CODEX_HOME`
 (normally `~/.codex`) and each Subswapper Codex account path as its shadow
 home. This keeps every `auth.json` private while the launcher shares sessions.
 
-Transparent mid-agent failover is not supported. Start a new process through
-`home run` to use a newly selected account.
+Without the proxy below, a process keeps the token it was launched with.
+Start a new process through `home run` to use a newly selected account.
+
+### Live account swapping through the local proxy
+
+Set `proxy_listen` on the Claude service and run the proxy next to the
+monitor:
+
+```json
+{
+  "name": "claude",
+  "kind": "claude",
+  "account_mode": "home",
+  "proxy_listen": "127.0.0.1:7878",
+  "shared_runtime_home": "native"
+}
+```
+
+```sh
+subswapper monitor -interval 5m -proxy   # or: subswapper proxy
+subswapper home run -service claude -- claude
+```
+
+While the proxy is reachable, `home run` launches Claude with
+`ANTHROPIC_BASE_URL` pointing at the proxy and a per-install placeholder
+secret in `CLAUDE_CODE_OAUTH_TOKEN`. Real setup tokens never enter the
+process environment. For every request the proxy replaces the bearer token
+with the selected account's token, so `switch` and the monitor take effect on
+the next request of every running session. If the proxy is down, `home run`
+warns and falls back to a fixed-token launch.
+
+The proxy reads Anthropic's `anthropic-ratelimit-unified-*` response headers
+and stores them as `proxy_usage` for the account that served the request.
+This is the usage source for setup-token accounts, which the OAuth usage
+endpoint rejects. An unused account keeps its last sample; a window counts as
+0% once its reset time passes, and the proxy corrects the estimate on the
+first real response. When a response is rejected for a rate limit (HTTP 429
+or `anthropic-ratelimit-unified-status: rejected`), the proxy replays the
+buffered request against the least-used alternative and makes that account
+the selected route. A 401 marks the token rejected for 30 minutes.
+
+`shared_runtime_home: "native"` is only valid with `proxy_listen`. Proxy
+launches then leave `CLAUDE_CONFIG_DIR` alone, so Claude uses its own
+`~/.claude`: settings, hooks, plugins, skills, MCP servers and their OAuth
+state, transcripts, `--resume`, and auto-memory are the same for every
+account and for plain `claude`. The account homes are still used when the
+proxy is down, because a fixed-token launch must not touch the native home.
+Any other absolute `shared_runtime_home` keeps a separate managed directory.
+
+The listen address must be a loopback address; the port is fixed so launched
+processes can find it. Requests without the placeholder secret get 401.
+Request bodies are buffered up to 64 MiB for replay. Each switch costs one
+prompt-cache miss.
 
 ### Shared Claude user configuration
 
@@ -212,8 +268,9 @@ usage only when all of these hold:
 - the cooldown since the service last switched accounts — manually or
   automatically — has passed (default **30 minutes**).
 
-Both pacing rules are skipped when the active account is exhausted or its
-stored credentials stop working. The monitor escapes to the best healthy
+Proxy samples are trusted without an age limit, since an unused account's
+windows only fall until their reset. Both pacing rules are skipped when the
+active account is exhausted or its stored credentials stop working. The monitor escapes to the best healthy
 account on the next cycle. Claude accounts with missing, expired, rejected, or
 unsafe setup tokens are never selected. Accounts without fresh trusted usage
 are also excluded. A manual
@@ -263,7 +320,8 @@ Account-home files use these native names:
 
 Claude home-mode services may set `shared_runtime_home`. This changes only the
 runtime home used by setup-token launches and status-line settings. Registered
-account homes and setup-token storage remain separate.
+account homes and setup-token storage remain separate. `proxy_listen` enables
+the local auth proxy; `proxy_upstream` overrides the API origin for testing.
 
 An explicit `files` list defaults a service to `account_mode: "bundle"`. This
 keeps custom-service support and legacy transactional switching available.
@@ -392,6 +450,7 @@ Defaults on Linux (macOS and Windows use their native config/data folders):
 - state: `~/.local/share/subswapper/state.json`
 - account homes: `~/.local/share/subswapper/accounts/`
 - Claude setup tokens: `~/.local/share/subswapper/tokens/`
+- Claude proxy secret: `~/.local/share/subswapper/tokens/claude/proxy-secret.json`
 
 Linux and macOS are tested in CI; Windows builds are cross-compiled but
 currently untested. Claude setup-token storage requires POSIX `0600` and

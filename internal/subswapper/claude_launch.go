@@ -102,7 +102,11 @@ var claudeConflictingEnvironmentPrefixes = []string{
 // account. Metadata keys must use the SUBSWAPPER_ namespace, and their values
 // must not contain secrets.
 func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string) ([]string, error) {
-	if strings.TrimSpace(configDir) == "" || strings.IndexByte(configDir, 0) >= 0 {
+	return buildClaudeLaunchEnvironment(base, configDir, setupToken, metadata, false)
+}
+
+func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string, inheritConfigDir bool) ([]string, error) {
+	if !inheritConfigDir && (strings.TrimSpace(configDir) == "" || strings.IndexByte(configDir, 0) >= 0) {
 		return nil, errors.New("claude account config directory is invalid")
 	}
 	if strings.TrimSpace(setupToken) == "" || strings.IndexByte(setupToken, 0) >= 0 {
@@ -110,9 +114,11 @@ func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, m
 	}
 
 	overrides := map[string]string{
-		"CLAUDE_CONFIG_DIR":                configDir,
 		"CLAUDE_CODE_OAUTH_TOKEN":          setupToken,
 		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+	}
+	if !inheritConfigDir {
+		overrides["CLAUDE_CONFIG_DIR"] = configDir
 	}
 	for key, value := range metadata {
 		if !strings.HasPrefix(key, "SUBSWAPPER_") || strings.ContainsAny(key, "=\x00") || strings.IndexByte(value, 0) >= 0 {
@@ -145,6 +151,32 @@ func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, m
 		result = append(result, key+"="+overrides[key])
 	}
 	return result, nil
+}
+
+// BuildClaudeProxyLaunchEnvironment routes a process through the local auth
+// proxy. The process carries only the proxy secret; real tokens stay with the
+// proxy, which selects the account for every request. An empty configDir
+// leaves CLAUDE_CONFIG_DIR untouched so Claude uses its native home.
+func BuildClaudeProxyLaunchEnvironment(base []string, configDir, proxySecret, listen string, metadata map[string]string) ([]string, error) {
+	if err := validateLoopbackListen(listen); err != nil {
+		return nil, fmt.Errorf("claude proxy listen address is invalid: %w", err)
+	}
+	filtered := make([]string, 0, len(base))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	environment, err := buildClaudeLaunchEnvironment(filtered, configDir, proxySecret, metadata, configDir == "")
+	if err != nil {
+		return nil, err
+	}
+	return append(environment,
+		"ANTHROPIC_BASE_URL="+ClaudeProxyBaseURL(listen),
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1",
+	), nil
 }
 
 func claudeEnvironmentConflicts(key string) bool {

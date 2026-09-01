@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -958,4 +959,217 @@ func statusResult(reason string) []subswapper.ServiceStatus {
 			Reason:     reason,
 		}},
 	}}
+}
+
+func writeProxyHomeConfig(t *testing.T, dir, listen string) string {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	config := map[string]any{
+		"backup_root": filepath.Join(dir, "accounts"),
+		"state_path":  filepath.Join(dir, "state.json"),
+		"services": []any{map[string]any{
+			"name":         "claude",
+			"kind":         "claude",
+			"account_mode": "home",
+			"proxy_listen": listen,
+		}},
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+const fakeClaudeEnvReport = `
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  printf '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}\n'
+  exit 0
+fi
+printf 'token=%s base=%s firstparty=%s proxy=%s\n' \
+  "$CLAUDE_CODE_OAUTH_TOKEN" "${ANTHROPIC_BASE_URL-unset}" \
+  "${_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL-unset}" "${SUBSWAPPER_PROXY-unset}"
+`
+
+func TestRunHomeClaudeRoutesThroughRunningProxy(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewUnstartedServer(nil)
+	listen := server.Listener.Addr().String()
+	configPath := writeProxyHomeConfig(t, dir, listen)
+	createHomeAccount(t, configPath, "claude", "work")
+	secret := "sk-ant-oat01-real-account-token"
+	storeTestSetupToken(t, configPath, "work", secret)
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := subswapper.NewClaudeProxy(*cfg, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Config.Handler = proxy
+	server.Start()
+	t.Cleanup(server.Close)
+	fakeClaude := writeFakeClaude(t, dir, fakeClaudeEnvReport)
+
+	var stdout, stderr bytes.Buffer
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "--", fakeClaude},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("home run failed: %v; stderr=%s", err, stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got+stderr.String(), secret) {
+		t.Fatalf("proxy launch exposed the real setup token: %s", got)
+	}
+	// The launch secret is redacted from relayed output like a real token.
+	for _, want := range []string{"token=[REDACTED]", "base=http://" + listen, "firstparty=1", "proxy=1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("proxy launch output lacks %q:\n%s%s", want, got, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "fixed account token") {
+		t.Fatalf("unexpected fallback warning: %s", stderr.String())
+	}
+}
+
+func TestRunHomeClaudeFallsBackToFixedTokenWhenProxyIsDown(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewUnstartedServer(nil)
+	listen := server.Listener.Addr().String()
+	_ = server.Listener.Close()
+	configPath := writeProxyHomeConfig(t, dir, listen)
+	createHomeAccount(t, configPath, "claude", "work")
+	secret := "sk-ant-oat01-real-account-token"
+	storeTestSetupToken(t, configPath, "work", secret)
+	fakeClaude := writeFakeClaude(t, dir, `
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  printf '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}\n'
+  exit 0
+fi
+printf 'real=%s base=%s proxy=%s\n' \
+  "$([ "$CLAUDE_CODE_OAUTH_TOKEN" = '`+secret+`' ] && printf yes || printf no)" \
+  "${ANTHROPIC_BASE_URL-unset}" "${SUBSWAPPER_PROXY-unset}"
+`)
+
+	var stdout, stderr bytes.Buffer
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "--", fakeClaude},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("home run failed: %v; stderr=%s", err, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "real=yes base=unset proxy=unset") {
+		t.Fatalf("fallback output = %q", got)
+	}
+	if !strings.Contains(stderr.String(), "not running") {
+		t.Fatalf("missing fallback warning: %q", stderr.String())
+	}
+}
+
+func TestRunProxyRequiresConfiguredListen(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "claude")
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"proxy", "-config", configPath}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "proxy_listen") {
+		t.Fatalf("err = %v", err)
+	}
+	err = run([]string{"proxy", "-config", configPath, "-listen", "0.0.0.0:7878"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("err = %v", err)
+	}
+	err = run([]string{"monitor", "-config", configPath, "-once", "-proxy"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "proxy_listen") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func writeNativeProxyHomeConfig(t *testing.T, dir, listen string) string {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	config := map[string]any{
+		"backup_root": filepath.Join(dir, "accounts"),
+		"state_path":  filepath.Join(dir, "state.json"),
+		"services": []any{map[string]any{
+			"name":                "claude",
+			"kind":                "claude",
+			"account_mode":        "home",
+			"proxy_listen":        listen,
+			"shared_runtime_home": "native",
+		}},
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+const fakeClaudeHomeReport = `
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  printf '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}\n'
+  exit 0
+fi
+printf 'config=%s base=%s\n' "${CLAUDE_CONFIG_DIR-unset}" "${ANTHROPIC_BASE_URL-unset}"
+`
+
+func TestRunHomeClaudeNativeRuntimeHomeInheritsClaudeConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewUnstartedServer(nil)
+	listen := server.Listener.Addr().String()
+	configPath := writeNativeProxyHomeConfig(t, dir, listen)
+	createHomeAccount(t, configPath, "claude", "work")
+	storeTestSetupToken(t, configPath, "work", "sk-ant-oat01-real-account-token")
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := subswapper.NewClaudeProxy(*cfg, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Config.Handler = proxy
+	server.Start()
+	t.Cleanup(server.Close)
+	fakeClaude := writeFakeClaude(t, dir, fakeClaudeHomeReport)
+	t.Setenv("CLAUDE_CONFIG_DIR", "/inherited/claude-home")
+
+	var stdout, stderr bytes.Buffer
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "--", fakeClaude},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("home run failed: %v; stderr=%s", err, stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "config=/inherited/claude-home base=http://"+listen) {
+		t.Fatalf("native launch output = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "native-home", ".claude")); err == nil {
+		t.Fatal("native launch created a Subswapper-managed home")
+	}
+
+	// Without the proxy the fixed token must stay inside the account home.
+	server.Close()
+	stdout.Reset()
+	stderr.Reset()
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "--", fakeClaude},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("fallback run failed: %v; stderr=%s", err, stderr.String())
+	}
+	wantHome := filepath.Join(dir, "accounts", "claude", "work")
+	if got := stdout.String(); !strings.Contains(got, "config="+wantHome+" base=unset") {
+		t.Fatalf("fallback output = %q", got)
+	}
 }

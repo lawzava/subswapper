@@ -45,10 +45,18 @@ type ServiceConfig struct {
 	AccountMode string `json:"account_mode,omitempty"`
 	// SharedRuntimeHome keeps Claude runtime and MCP state stable while setup
 	// tokens remain selected per process. It applies only to Claude home mode.
-	SharedRuntimeHome string        `json:"shared_runtime_home,omitempty"`
-	Files             []ManagedFile `json:"files,omitempty"`
-	UsageCommand      []string      `json:"usage_command,omitempty"`
-	Disabled          bool          `json:"disabled,omitempty"`
+	// The value "native" makes proxy launches use Claude's own default home,
+	// so memory, transcripts, MCP state, and settings are the same everywhere.
+	SharedRuntimeHome string `json:"shared_runtime_home,omitempty"`
+	// ProxyListen enables the local Claude auth proxy on a loopback address.
+	// Launches then point ANTHROPIC_BASE_URL at it so the selected account can
+	// change between requests without restarting the process.
+	ProxyListen string `json:"proxy_listen,omitempty"`
+	// ProxyUpstream overrides the Anthropic API origin the proxy forwards to.
+	ProxyUpstream string        `json:"proxy_upstream,omitempty"`
+	Files         []ManagedFile `json:"files,omitempty"`
+	UsageCommand  []string      `json:"usage_command,omitempty"`
+	Disabled      bool          `json:"disabled,omitempty"`
 }
 
 type ManagedFile struct {
@@ -149,8 +157,27 @@ func (c Config) Validate() error {
 			if !isClaudeService(service) || !service.UsesAccountHomes() {
 				return fmt.Errorf("service %q shared_runtime_home requires Claude account_mode %q", service.Name, AccountModeHome)
 			}
-			if !filepath.IsAbs(ExpandPath(service.SharedRuntimeHome)) {
+			if service.UsesNativeRuntimeHome() && service.ProxyListen == "" {
+				return fmt.Errorf("service %q shared_runtime_home %q requires proxy_listen; a fixed-token launch must not use the native home", service.Name, NativeRuntimeHome)
+			}
+			if !service.UsesNativeRuntimeHome() && !filepath.IsAbs(ExpandPath(service.SharedRuntimeHome)) {
 				return fmt.Errorf("service %q shared_runtime_home must resolve to an absolute path", service.Name)
+			}
+		}
+		if service.ProxyListen != "" || service.ProxyUpstream != "" {
+			if !isClaudeService(service) || !service.UsesAccountHomes() {
+				return fmt.Errorf("service %q proxy_listen requires Claude account_mode %q", service.Name, AccountModeHome)
+			}
+			if service.ProxyListen == "" {
+				return fmt.Errorf("service %q proxy_upstream requires proxy_listen", service.Name)
+			}
+			if err := validateLoopbackListen(service.ProxyListen); err != nil {
+				return fmt.Errorf("service %q proxy_listen: %w", service.Name, err)
+			}
+			if service.ProxyUpstream != "" {
+				if _, err := parseProxyUpstream(service.ProxyUpstream); err != nil {
+					return fmt.Errorf("service %q proxy_upstream: %w", service.Name, err)
+				}
 			}
 		}
 		if len(service.Files) == 0 {
@@ -178,6 +205,22 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// NativeRuntimeHome is the shared_runtime_home value that launches Claude in
+// its own default home instead of a Subswapper-managed directory.
+const NativeRuntimeHome = "native"
+
+// UsesNativeRuntimeHome reports whether proxy launches inherit Claude's
+// default home. Fixed-token launches never do.
+func (s ServiceConfig) UsesNativeRuntimeHome() bool {
+	return s.SharedRuntimeHome == NativeRuntimeHome
+}
+
+// ClaudeProxyEnabled reports whether launches should route through the
+// local auth proxy instead of carrying a real setup token.
+func (s ServiceConfig) ClaudeProxyEnabled() bool {
+	return s.ProxyListen != "" && isClaudeService(s) && s.UsesAccountHomes()
 }
 
 func (c Config) Service(name string) (ServiceConfig, bool) {

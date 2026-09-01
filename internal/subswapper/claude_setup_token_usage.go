@@ -36,10 +36,16 @@ func collectClaudeSetupTokenAccount(ctx context.Context, cfg Config, serviceStat
 		markClaudeSetupTokenSelectable(status)
 		return
 	}
+	if !status.Active && adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision) {
+		return
+	}
 
 	if now.Before(status.Account.FetchBackoffUntil) {
 		if status.Account.CredentialsError != "" {
 			status.Reason = status.Account.CredentialsError
+			return
+		}
+		if adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision) {
 			return
 		}
 		if trustedClaudeStatusLineUsage(status.Account.Usage, now, tokenStatus.Revision) {
@@ -98,6 +104,15 @@ func collectClaudeSetupTokenAccount(ctx context.Context, cfg Config, serviceStat
 		return
 	}
 
+	// The proxy sees every real response, so its sample outranks the status
+	// line. Both are bound to the same random token revision.
+	if trustedClaudeProxyUsage(status.Account.ProxyUsage, tokenStatus.Revision) {
+		status.Account.FetchBackoffUntil = now.Add(transientProbeBackoff(cfg.Monitor.Interval.Duration))
+		status.Account.CredentialsError = ""
+		status.Account.LastProbeError = "setup-token usage unavailable; using Claude proxy data"
+		adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision)
+		return
+	}
 	// A status-line sample is trusted only while it is fresh and bound to the
 	// same random token revision. Provider errors are reduced to a fixed label.
 	if trustedClaudeStatusLineUsage(status.Account.Usage, now, tokenStatus.Revision) {
@@ -128,6 +143,18 @@ func trustedClaudeSetupTokenUsage(usage UsageSnapshot, now time.Time, tokenRevis
 
 func trustedClaudeStatusLineUsage(usage UsageSnapshot, now time.Time, tokenRevision string) bool {
 	return usage.Source == claudeUsageSourceStatusLine && trustedClaudeSetupTokenUsage(usage, now, tokenRevision)
+}
+
+// adoptClaudeProxyUsage routes on the proxy's last observed sample. The copy
+// into Usage is only for display and scoring; ProxyUsage stays authoritative.
+func adoptClaudeProxyUsage(serviceState *ServiceState, status *AccountStatus, tokenRevision string) bool {
+	if !trustedClaudeProxyUsage(status.Account.ProxyUsage, tokenRevision) {
+		return false
+	}
+	status.Account.Usage = status.Account.ProxyUsage
+	serviceState.Accounts[status.Account.Name] = status.Account
+	markClaudeSetupTokenSelectable(status)
+	return true
 }
 
 func markClaudeSetupTokenSelectable(status *AccountStatus) {

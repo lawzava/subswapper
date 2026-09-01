@@ -35,10 +35,26 @@ func (s ServiceConfig) UsesAccountHomes() bool {
 
 // RuntimeHome returns the state directory used by a launched provider.
 func RuntimeHome(cfg Config, service ServiceConfig, accountName string) string {
+	if isClaudeService(service) && service.UsesNativeRuntimeHome() {
+		return NativeClaudeHome()
+	}
 	if isClaudeService(service) && service.SharedRuntimeHome != "" {
 		return ExpandPath(service.SharedRuntimeHome)
 	}
 	return AccountDir(cfg, service.Name, accountName)
+}
+
+// NativeClaudeHome is the directory Claude uses when Subswapper does not
+// override CLAUDE_CONFIG_DIR.
+func NativeClaudeHome() string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return ExpandPath(dir)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("~", ".claude")
+	}
+	return filepath.Join(home, ".claude")
 }
 
 func AccountEnvironment(cfg Config, service ServiceConfig, accountName string) map[string]string {

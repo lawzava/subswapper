@@ -133,3 +133,59 @@ func TestValidateSharedRuntimeHomeRequiresClaudeHomeModeAndAbsolutePath(t *testi
 		})
 	}
 }
+
+func TestConfigValidatesProxyListen(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		service ServiceConfig
+		wantErr string
+	}{
+		{name: "loopback ok", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878"}},
+		{name: "localhost ok", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "localhost:7878"}},
+		{name: "public host", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "0.0.0.0:7878"}, wantErr: "loopback"},
+		{name: "no port", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1"}, wantErr: "host:port"},
+		{name: "ephemeral port", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:0"}, wantErr: "port"},
+		{name: "codex", service: ServiceConfig{Name: "codex", Kind: "codex", ProxyListen: "127.0.0.1:7878"}, wantErr: "requires Claude"},
+		{name: "upstream without listen", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyUpstream: "https://example.com"}, wantErr: "requires proxy_listen"},
+		{name: "upstream with path", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", ProxyUpstream: "https://example.com/v1"}, wantErr: "origin"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{Services: []ServiceConfig{test.service}}
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !cfg.Services[0].ClaudeProxyEnabled() {
+					t.Fatal("proxy not reported enabled")
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("err = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfigNativeRuntimeHomeRequiresProxy(t *testing.T) {
+	cfg := Config{Services: []ServiceConfig{{Name: "claude", Kind: "claude", SharedRuntimeHome: NativeRuntimeHome}}}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "proxy_listen") {
+		t.Fatalf("err = %v", err)
+	}
+	cfg.Services[0].ProxyListen = "127.0.0.1:7878"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("HOME", t.TempDir())
+	if got := RuntimeHome(cfg, cfg.Services[0], "work"); got != NativeClaudeHome() || !strings.HasSuffix(got, ".claude") {
+		t.Fatalf("runtime home = %q", got)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "/custom/home")
+	if got := RuntimeHome(cfg, cfg.Services[0], "work"); got != "/custom/home" {
+		t.Fatalf("runtime home = %q", got)
+	}
+}

@@ -43,6 +43,10 @@ type AccountState struct {
 	// LastProbeStartedAt orders overlapping provider probes so an older result
 	// cannot replace a newer snapshot.
 	LastProbeStartedAt time.Time `json:"last_probe_started_at,omitzero"`
+	// ProxyUsage is the latest rate-limit sample the local auth proxy observed
+	// on a real response. It is kept apart from Usage so monitor probe merges
+	// never overwrite or race it.
+	ProxyUsage UsageSnapshot `json:"proxy_usage,omitzero"`
 }
 
 func LoadState(path string) (*State, error) {
