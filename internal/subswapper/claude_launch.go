@@ -102,10 +102,15 @@ var claudeConflictingEnvironmentPrefixes = []string{
 // account. Metadata keys must use the SUBSWAPPER_ namespace, and their values
 // must not contain secrets.
 func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string) ([]string, error) {
-	return buildClaudeLaunchEnvironment(base, configDir, setupToken, metadata, false)
+	return buildClaudeLaunchEnvironment(base, configDir, setupToken, metadata, false, true)
 }
 
-func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string, inheritConfigDir bool) ([]string, error) {
+// buildClaudeLaunchEnvironment sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB only when
+// envScrub is true. Claude Code treats that variable as a hard sandbox: every
+// Bash command runs confined and dangerouslyDisableSandbox is ignored, which
+// masks ~/.gnupg and ~/.ssh and breaks signed commits. An inherited value is
+// always dropped so the caller's decision is the only one that applies.
+func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string, inheritConfigDir, envScrub bool) ([]string, error) {
 	if !inheritConfigDir && (strings.TrimSpace(configDir) == "" || strings.IndexByte(configDir, 0) >= 0) {
 		return nil, errors.New("claude account config directory is invalid")
 	}
@@ -114,8 +119,10 @@ func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, m
 	}
 
 	overrides := map[string]string{
-		"CLAUDE_CODE_OAUTH_TOKEN":          setupToken,
-		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+		"CLAUDE_CODE_OAUTH_TOKEN": setupToken,
+	}
+	if envScrub {
+		overrides["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
 	}
 	if !inheritConfigDir {
 		overrides["CLAUDE_CONFIG_DIR"] = configDir
@@ -134,7 +141,7 @@ func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, m
 			result = append(result, entry)
 			continue
 		}
-		if claudeEnvironmentConflicts(key) {
+		if claudeEnvironmentConflicts(key) || key == "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" {
 			continue
 		}
 		if _, replaced := overrides[key]; replaced {
@@ -156,8 +163,10 @@ func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, m
 // BuildClaudeProxyLaunchEnvironment routes a process through the local auth
 // proxy. The process carries only the proxy secret; real tokens stay with the
 // proxy, which selects the account for every request. An empty configDir
-// leaves CLAUDE_CONFIG_DIR untouched so Claude uses its native home.
-func BuildClaudeProxyLaunchEnvironment(base []string, configDir, proxySecret, listen string, metadata map[string]string) ([]string, error) {
+// leaves CLAUDE_CONFIG_DIR untouched so Claude uses its native home. The
+// subprocess env scrub is opt-in here: the process holds only the proxy
+// secret, and the scrub would force every Bash command into the sandbox.
+func BuildClaudeProxyLaunchEnvironment(base []string, configDir, proxySecret, listen string, metadata map[string]string, envScrub bool) ([]string, error) {
 	if err := validateLoopbackListen(listen); err != nil {
 		return nil, fmt.Errorf("claude proxy listen address is invalid: %w", err)
 	}
@@ -169,7 +178,7 @@ func BuildClaudeProxyLaunchEnvironment(base []string, configDir, proxySecret, li
 		}
 		filtered = append(filtered, entry)
 	}
-	environment, err := buildClaudeLaunchEnvironment(filtered, configDir, proxySecret, metadata, configDir == "")
+	environment, err := buildClaudeLaunchEnvironment(filtered, configDir, proxySecret, metadata, configDir == "", envScrub)
 	if err != nil {
 		return nil, err
 	}

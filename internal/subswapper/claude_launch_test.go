@@ -141,6 +141,45 @@ func TestBuildClaudeLaunchEnvironmentRemovesConflictingCredentials(t *testing.T)
 	}
 }
 
+// Claude Code sandboxes every Bash command when CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+// is set and ignores dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh
+// and breaks signed commits. Through the proxy the process holds no real
+// token, so the scrub is opt-in there and stays mandatory for fixed tokens.
+func TestBuildClaudeProxyLaunchEnvironmentScrubIsOptIn(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1"}
+	for _, test := range []struct {
+		name  string
+		scrub bool
+		want  string
+	}{
+		{name: "default drops inherited scrub", scrub: false, want: ""},
+		{name: "opt-in sets scrub", scrub: true, want: "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := BuildClaudeProxyLaunchEnvironment(base, "/accounts/claude/a", "proxy-secret", "127.0.0.1:7878", nil, test.scrub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := environmentMap(got)
+			value, present := env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]
+			if present != (test.want != "") || value != test.want {
+				t.Fatalf("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = %q (present %v), want %q", value, present, test.want)
+			}
+			if env["ANTHROPIC_BASE_URL"] == "" || env["CLAUDE_CODE_OAUTH_TOKEN"] != "proxy-secret" {
+				t.Fatalf("proxy routing lost: %#v", env)
+			}
+		})
+	}
+	// A fixed-token launch still scrubs regardless of the inherited value.
+	got, err := BuildClaudeLaunchEnvironment([]string{"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0"}, "/accounts/claude/a", "setup-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if environmentMap(got)["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] != "1" {
+		t.Fatal("fixed-token launch must keep the subprocess env scrub")
+	}
+}
+
 func TestBuildClaudeLaunchEnvironmentNeverIncludesTokenInErrors(t *testing.T) {
 	token := "secret-token-must-not-appear"
 	tests := []struct {

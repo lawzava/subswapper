@@ -432,7 +432,7 @@ func runClaudeWithSetupToken(
 		if nativeHome {
 			launchHome = ""
 		}
-		environment, err = subswapper.BuildClaudeProxyLaunchEnvironment(os.Environ(), launchHome, token, service.ProxyListen, metadata)
+		environment, err = subswapper.BuildClaudeProxyLaunchEnvironment(os.Environ(), launchHome, token, service.ProxyListen, metadata, service.ProxyEnvScrub)
 	} else {
 		environment, err = subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata)
 	}

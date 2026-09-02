@@ -132,8 +132,12 @@ subswapper home run -service claude -- claude
 ```
 
 Subswapper selects the routed account for each new process. It injects the
-account's setup token, a controlled `CLAUDE_CONFIG_DIR`, and
-`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. It removes conflicting Anthropic,
+account's setup token, a controlled `CLAUDE_CONFIG_DIR`, and, for fixed-token
+launches, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. Proxy launches skip the scrub
+unless the service sets `proxy_env_scrub: true`: Claude Code treats the scrub
+as a hard sandbox, runs every Bash command confined, ignores
+`dangerouslyDisableSandbox`, and masks `~/.gnupg` and `~/.ssh`, which breaks
+signed commits. It removes conflicting Anthropic,
 Bedrock, Vertex, and Foundry variables described by Anthropic's
 [environment guide](https://code.claude.com/docs/en/env-vars). Changing the
 route does not change an existing agent.

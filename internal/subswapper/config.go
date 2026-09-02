@@ -53,7 +53,12 @@ type ServiceConfig struct {
 	// change between requests without restarting the process.
 	ProxyListen string `json:"proxy_listen,omitempty"`
 	// ProxyUpstream overrides the Anthropic API origin the proxy forwards to.
-	ProxyUpstream string        `json:"proxy_upstream,omitempty"`
+	ProxyUpstream string `json:"proxy_upstream,omitempty"`
+	// ProxyEnvScrub sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 on proxy launches.
+	// Off by default: Claude Code then sandboxes every Bash command and ignores
+	// dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh and breaks
+	// signed commits. Fixed-token launches always scrub.
+	ProxyEnvScrub bool          `json:"proxy_env_scrub,omitempty"`
 	Files         []ManagedFile `json:"files,omitempty"`
 	UsageCommand  []string      `json:"usage_command,omitempty"`
 	Disabled      bool          `json:"disabled,omitempty"`
