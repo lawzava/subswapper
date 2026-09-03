@@ -308,6 +308,136 @@ func TestClaudeProxyPrefersLeastUsedAlternativeOnFailover(t *testing.T) {
 	}
 }
 
+func TestClaudeProxyKeepsFableWindowAcrossNonFableResponses(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
+	fableReset := time.Now().Add(6 * 24 * time.Hour).Unix()
+	withFable := true
+	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
+		rateLimitHeaders(w, 0.1, 0.2, "allowed")
+		if withFable {
+			w.Header().Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.28")
+			w.Header().Set("anthropic-ratelimit-unified-7d_oi-reset", strconv.FormatInt(fableReset, 10))
+			w.Header().Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{"model":"claude-fable-5-1"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("fable status = %d", recorder.Code)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := state.Service("claude").Accounts["a"].ProxyUsage
+	if usage.FableWeekly.Pct == nil || *usage.FableWeekly.Pct != 28 || usage.FableWeekly.ResetsAt.Unix() != fableReset {
+		t.Fatalf("fable window after fable response = %#v", usage.FableWeekly)
+	}
+	if usage.Score() != 0.28 {
+		t.Fatalf("score = %v, want the fable window", usage.Score())
+	}
+
+	// A Haiku response has no 7d_oi headers and does not consume the window.
+	withFable = false
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{"model":"claude-haiku-4-5"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("haiku status = %d", recorder.Code)
+	}
+	state, err = LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage = state.Service("claude").Accounts["a"].ProxyUsage
+	if usage.FableWeekly.Pct == nil || *usage.FableWeekly.Pct != 28 || *usage.FiveHour.Pct != 10 {
+		t.Fatalf("fable window after haiku response = %#v", usage)
+	}
+
+	// The window is scoped to the token revision that produced it.
+	upstream.respond("setup-token-a-rotated", func(w http.ResponseWriter, r *http.Request) {
+		rateLimitHeaders(w, 0.1, 0.2, "allowed")
+		w.WriteHeader(http.StatusOK)
+	})
+	if _, err := ReplaceClaudeSetupToken(context.Background(), cfg, "claude", "a", "setup-token-a-rotated", nil); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{"model":"claude-haiku-4-5"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("post-rotation status = %d", recorder.Code)
+	}
+	state, err = LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage = state.Service("claude").Accounts["a"].ProxyUsage; usage.FableWeekly.Pct != nil {
+		t.Fatalf("fable window survived a token rotation: %#v", usage.FableWeekly)
+	}
+}
+
+func TestClaudeProxyThrottleWithoutQuotaHeadersDoesNotSwitchRoute(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
+	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))
+	})
+	upstream.respond("setup-token-b", func(w http.ResponseWriter, r *http.Request) {
+		rateLimitHeaders(w, 0.1, 0.2, "allowed")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	})
+
+	recorder := proxyRequest(t, proxy, proxy.secret, `{}`)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"type":"message"}` {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if calls := upstream.recorded(); len(calls) != 2 || calls[1].Authorization != "Bearer setup-token-b" {
+		t.Fatalf("upstream calls = %#v", calls)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := state.Service("claude")
+	if service.ActiveAccount != "a" || !service.LastSwitchedAt.IsZero() {
+		t.Fatalf("a bare 429 changed the route: %#v", service)
+	}
+	if usage := service.Accounts["a"].ProxyUsage; usage.HasLimits() || service.Accounts["a"].CredentialsError != "" {
+		t.Fatalf("a bare 429 recorded usage for a: %#v", service.Accounts["a"])
+	}
+	if usage := service.Accounts["b"].ProxyUsage; usage.FiveHour.Pct == nil || *usage.FiveHour.Pct != 10 {
+		t.Fatalf("account b usage = %#v", usage)
+	}
+}
+
+func TestClaudeProxyRelaysConnectivityCheckWithoutCredentials(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	_, proxy := setupProxyAccounts(t, upstream.server.URL)
+	upstream.mu.Lock()
+	upstream.handlers[""] = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream", "hello")
+		w.WriteHeader(http.StatusOK)
+	}
+	upstream.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodHead, claudeConnectivityPath, nil)
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("X-Upstream") != "hello" {
+		t.Fatalf("status = %d, headers = %v", recorder.Code, recorder.Header())
+	}
+	calls := upstream.recorded()
+	if len(calls) != 1 || calls[0].Authorization != "" || calls[0].Path != claudeConnectivityPath {
+		t.Fatalf("upstream calls = %#v", calls)
+	}
+
+	// Any other unauthenticated path still needs the shared secret.
+	req = httptest.NewRequest(http.MethodPost, claudeConnectivityPath, strings.NewReader("{}"))
+	recorder = httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("POST status = %d", recorder.Code)
+	}
+}
+
 func TestClaudeProxyRejectsOversizedBodiesBeforeForwarding(t *testing.T) {
 	upstream := newProxyUpstream(t)
 	_, proxy := setupProxyAccounts(t, upstream.server.URL)
@@ -422,13 +552,41 @@ func TestParseClaudeRateLimitHeaders(t *testing.T) {
 	header.Set("anthropic-ratelimit-unified-7d-reset", "1788674400")
 	observed := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	observation := parseClaudeRateLimitHeaders(header, observed)
-	if !observation.HasUsage || observation.Rejected {
+	if !observation.HasUsage || !observation.HasHeaders || observation.Rejected {
 		t.Fatalf("observation = %#v", observation)
 	}
 	usage := observation.Usage
 	if *usage.FiveHour.Pct != 46 || *usage.Weekly.Pct != 100 || usage.Source != claudeUsageSourceProxy ||
 		!usage.ObservedAt.Equal(observed) || usage.FiveHour.ResetsAt.Unix() != 1788306600 || usage.Weekly.ResetsAt.Unix() != 1788674400 {
 		t.Fatalf("usage = %#v", usage)
+	}
+	if usage.FableWeekly.Pct != nil {
+		t.Fatalf("fable window reported without its headers: %#v", usage.FableWeekly)
+	}
+
+	// Responses served by a Fable model add the 7d_oi window; the float
+	// product 0.14*100 must not leak into the stored percentage.
+	header.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.14")
+	header.Set("anthropic-ratelimit-unified-7d_oi-reset", "1788674400")
+	header.Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
+	observation = parseClaudeRateLimitHeaders(header, observed)
+	if !observation.HasUsage || observation.Rejected || observation.Usage.FableWeekly.Pct == nil ||
+		*observation.Usage.FableWeekly.Pct != 14 || observation.Usage.FableWeekly.ResetsAt.Unix() != 1788674400 {
+		t.Fatalf("fable usage = %#v", observation.Usage.FableWeekly)
+	}
+	if observation.Usage.Score() != 1 {
+		t.Fatalf("score = %v", observation.Usage.Score())
+	}
+	header.Set("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+	if observation = parseClaudeRateLimitHeaders(header, observed); !observation.Rejected || *observation.Usage.FableWeekly.Pct != 100 {
+		t.Fatalf("rejected fable observation = %#v", observation)
+	}
+	header.Del("anthropic-ratelimit-unified-7d_oi-status")
+	header.Del("anthropic-ratelimit-unified-7d_oi-utilization")
+	header.Del("anthropic-ratelimit-unified-7d_oi-reset")
+
+	if bare := parseClaudeRateLimitHeaders(http.Header{"Content-Type": {"application/json"}}, observed); bare.HasHeaders || bare.HasUsage || bare.Rejected {
+		t.Fatalf("bare observation = %#v", bare)
 	}
 
 	header.Del("anthropic-ratelimit-unified-7d-reset")

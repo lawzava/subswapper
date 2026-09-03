@@ -93,8 +93,8 @@ claude     work                             12% reset Jul02 19:00        8% rese
 codex      personal                 yes     91% reset Jul02 16:30        44% reset Jul06 09:00        -                            91%      ready
 ```
 
-`FABLE5` is the weekly window scoped to Claude's Fable models (`-` for
-accounts without one). `SCORE` is the worst of an account's windows — the
+`FABLE5` is the weekly window scoped to Claude's Fable models (`-` until a
+Fable response has been seen through the proxy). `SCORE` is the worst of an account's windows — the
 value auto-switching compares.
 
 ## Commands
@@ -180,12 +180,21 @@ warns and falls back to a fixed-token launch.
 The proxy reads Anthropic's `anthropic-ratelimit-unified-*` response headers
 and stores them as `proxy_usage` for the account that served the request.
 This is the usage source for setup-token accounts, which the OAuth usage
-endpoint rejects. An unused account keeps its last sample; a window counts as
-0% once its reset time passes, and the proxy corrects the estimate on the
-first real response. When a response is rejected for a rate limit (HTTP 429
-or `anthropic-ratelimit-unified-status: rejected`), the proxy replays the
+endpoint rejects. The `5h` and `7d` windows arrive on every response. The
+`7d_oi` window (Anthropic's "7-day overage-included" claim, shown by Claude
+Code as the Fable limit) arrives only on responses served by a Fable model;
+it fills the `FABLE5` column, counts toward the score, and is kept across
+responses from other models because those do not consume it. An unused
+account keeps its last sample; a window counts as 0% once its reset time
+passes, and the proxy corrects the estimate on the first real response.
+
+When a response is rejected for a quota (`anthropic-ratelimit-unified-*-status:
+rejected`, or HTTP 429 with the unified headers), the proxy replays the
 buffered request against the least-used alternative and makes that account
-the selected route. A 401 marks the token rejected for 30 minutes.
+the selected route. A 429 without the unified headers is a transient throttle
+or a request Anthropic refuses for every account: the alternative still serves
+that one request, but the route does not change. A 401 marks the token
+rejected for 30 minutes.
 
 `shared_runtime_home: "native"` is only valid with `proxy_listen`. Proxy
 launches then leave `CLAUDE_CONFIG_DIR` alone, so Claude uses its own
@@ -357,8 +366,9 @@ status-line command with the original input. Cached data expires after five
 minutes and is bound to the random revision of the current token. Anthropic
 documents the response fields in its [status-line guide](https://code.claude.com/docs/en/statusline).
 
-Anthropic does not document a Fable-specific status-line window. `FABLE5`
-therefore shows `-` for status-line-only setup-token accounts. Subswapper
+Claude's status line exposes only the five-hour and seven-day windows.
+`FABLE5` therefore shows `-` for status-line-only setup-token accounts; the
+proxy fills it from the `7d_oi` response header. Subswapper
 reports usage as unavailable when neither a direct response nor a fresh,
 complete status-line sample exists.
 

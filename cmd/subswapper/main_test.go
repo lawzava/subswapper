@@ -615,6 +615,9 @@ func TestClaudeStatusLineRecordsUsageAndPreservesExistingCommand(t *testing.T) {
 	t.Setenv("SUBSWAPPER_SERVICE", "claude")
 	t.Setenv("SUBSWAPPER_ACCOUNT", "work")
 	t.Setenv("SUBSWAPPER_TOKEN_REVISION", status.Revision)
+	// A test process launched through the proxy inherits SUBSWAPPER_PROXY=1,
+	// which disables status-line recording.
+	t.Setenv("SUBSWAPPER_PROXY", "")
 	var stdout, stderr bytes.Buffer
 	if err := runWithInput([]string{"claude-statusline"}, bytes.NewReader(payload), &stdout, &stderr); err != nil {
 		t.Fatal(err)
@@ -673,6 +676,9 @@ func TestClaudeStatusLineUsesSharedRuntimeSettingsAndSelectedAccountUsage(t *tes
 	t.Setenv("SUBSWAPPER_SERVICE", "claude")
 	t.Setenv("SUBSWAPPER_ACCOUNT", "work")
 	t.Setenv("SUBSWAPPER_TOKEN_REVISION", status.Revision)
+	// A test process launched through the proxy inherits SUBSWAPPER_PROXY=1,
+	// which disables status-line recording.
+	t.Setenv("SUBSWAPPER_PROXY", "")
 	var stdout, stderr bytes.Buffer
 	if err := runWithInput([]string{"claude-statusline"}, bytes.NewReader(payload), &stdout, &stderr); err != nil {
 		t.Fatal(err)

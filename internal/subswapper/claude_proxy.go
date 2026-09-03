@@ -29,10 +29,17 @@ const (
 	claudeProxyRequestBodyLimit = 64 << 20
 	// claudeProxySecretPrefix makes the placeholder look like a setup token so
 	// Claude's auth-source detection treats it as an OAuth token.
-	claudeProxySecretPrefix    = "sk-ant-oat01-"
-	claudeProxyHealthPath      = "/subswapper/health"
+	claudeProxySecretPrefix = "sk-ant-oat01-"
+	claudeProxyHealthPath   = "/subswapper/health"
+	// claudeConnectivityPath is the unauthenticated reachability check Claude
+	// Code sends to its base URL at startup.
+	claudeConnectivityPath     = "/api/hello"
 	defaultClaudeProxyUpstream = "https://api.anthropic.com"
 	claudeRateLimitHeaderBase  = "anthropic-ratelimit-unified-"
+	// claudeRateLimitFableWindow is Anthropic's "7-day overage-included"
+	// claim. Claude Code labels it the Fable limit; it is only reported on
+	// responses served by a Fable model.
+	claudeRateLimitFableWindow = "7d_oi"
 )
 
 var claudeProxyNow = time.Now
@@ -72,7 +79,10 @@ type claudeProxyRoute struct {
 type claudeRateLimitObservation struct {
 	Usage    UsageSnapshot
 	HasUsage bool
-	Rejected bool
+	// HasHeaders reports that Anthropic attached any unified rate-limit
+	// header, which distinguishes a quota rejection from a bare throttle.
+	HasHeaders bool
+	Rejected   bool
 }
 
 func validateLoopbackListen(listen string) error {
@@ -312,6 +322,10 @@ func (p *ClaudeProxy) Serve(ctx context.Context) error {
 }
 
 func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == claudeConnectivityPath && (r.Method == http.MethodHead || r.Method == http.MethodGet) {
+		p.relayConnectivityCheck(w, r)
+		return
+	}
 	if !p.authorized(r) {
 		writeClaudeProxyError(w, http.StatusUnauthorized, "authentication_error", "subswapper proxy secret mismatch")
 		return
@@ -341,6 +355,12 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A failover becomes the selected route only when the active account is
+	// really out of quota or its token is rejected. A 429 without unified
+	// rate-limit headers is a transient throttle (or a request Anthropic
+	// refuses for every account): the alternative still serves this request,
+	// but every session would pay a prompt-cache miss for a sticky switch.
+	stickyFailover := true
 	for index, route := range routes {
 		resp, err := p.forward(r, route, body)
 		if err != nil {
@@ -353,26 +373,60 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		observation := parseClaudeRateLimitHeaders(resp.Header, claudeProxyNow().UTC())
 		unauthorized := resp.StatusCode == http.StatusUnauthorized
-		rejected := resp.StatusCode == http.StatusTooManyRequests || observation.Rejected
+		quotaRejected := observation.Rejected || (resp.StatusCode == http.StatusTooManyRequests && observation.HasHeaders)
+		throttled := resp.StatusCode == http.StatusTooManyRequests && !quotaRejected
+		rejected := quotaRejected || throttled
 		retry := (unauthorized || rejected) && index < len(routes)-1
-		if err := recordClaudeProxyObservation(p.cfg, p.service, route, observation, unauthorized, !retry && !unauthorized && !rejected); err != nil {
+		if route.Active && throttled {
+			stickyFailover = false
+		}
+		switchTo := !retry && !unauthorized && !rejected && stickyFailover
+		if err := recordClaudeProxyObservation(p.cfg, p.service, route, observation, unauthorized, switchTo); err != nil {
 			p.logf("claude proxy: record usage for %s: %v", route.Account, err)
 		}
 		if retry {
 			reason := "rate limit rejected"
-			if unauthorized {
+			switch {
+			case unauthorized:
 				reason = "token rejected"
+			case throttled:
+				reason = "throttled without quota headers"
 			}
 			p.logf("claude proxy: %s for %s; retrying with %s", reason, route.Account, routes[index+1].Account)
 			_ = resp.Body.Close()
 			continue
 		}
-		if !route.Active && !unauthorized && !rejected {
+		if switchTo && !route.Active {
 			p.logf("claude proxy: switched %s to %s", p.service.Name, route.Account)
 		}
 		relayClaudeProxyResponse(w, resp)
 		return
 	}
+}
+
+// relayConnectivityCheck forwards the reachability probe without any
+// credential, so the answer reflects the upstream and never a route.
+func (p *ClaudeProxy) relayConnectivityCheck(w http.ResponseWriter, r *http.Request) {
+	target := *p.upstream
+	target.Path = r.URL.Path
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
+	if err != nil {
+		writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "subswapper proxy could not build the connectivity check")
+		return
+	}
+	req.Header = cloneClaudeProxyHeaders(r.Header)
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Api-Key")
+	req.Host = p.upstream.Host
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "subswapper proxy could not reach the Anthropic API")
+		return
+	}
+	relayClaudeProxyResponse(w, resp)
 }
 
 func (p *ClaudeProxy) authorized(r *http.Request) bool {
@@ -461,10 +515,17 @@ func writeClaudeProxyError(w http.ResponseWriter, status int, kind, message stri
 
 // parseClaudeRateLimitHeaders reads the unified rate-limit headers Anthropic
 // attaches to subscription responses. Utilization is a 0-1 fraction and
-// resets are Unix seconds.
+// resets are Unix seconds. The Fable window is optional: only responses
+// served by a Fable model carry it.
 func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claudeRateLimitObservation {
 	observation := claudeRateLimitObservation{}
-	for _, name := range []string{"status", "5h-status", "7d-status"} {
+	for key := range header {
+		if strings.HasPrefix(strings.ToLower(key), claudeRateLimitHeaderBase) {
+			observation.HasHeaders = true
+			break
+		}
+	}
+	for _, name := range []string{"status", "5h-status", "7d-status", claudeRateLimitFableWindow + "-status"} {
 		if strings.EqualFold(strings.TrimSpace(header.Get(claudeRateLimitHeaderBase+name)), "rejected") {
 			observation.Rejected = true
 		}
@@ -478,6 +539,9 @@ func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claud
 			Weekly:     weekly,
 			ObservedAt: observedAt,
 			Source:     claudeUsageSourceProxy,
+		}
+		if fable, ok := parseClaudeRateLimitWindow(header, claudeRateLimitFableWindow); ok {
+			observation.Usage.FableWeekly = fable
 		}
 	}
 	return observation
@@ -497,7 +561,8 @@ func parseClaudeRateLimitWindow(header http.Header, name string) (LimitWindow, b
 	if err != nil || resetSeconds <= 0 {
 		return LimitWindow{}, false
 	}
-	percent := math.Min(utilization*100, 100)
+	// Round away float noise such as 0.14*100 = 14.000000000000002.
+	percent := math.Round(math.Min(utilization*100, 100)*100) / 100
 	if strings.EqualFold(strings.TrimSpace(header.Get(claudeRateLimitHeaderBase+name+"-status")), "rejected") {
 		percent = 100
 	}
@@ -602,6 +667,13 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 	if observation.HasUsage {
 		usage := observation.Usage
 		usage.TokenRevision = route.Revision
+		if usage.FableWeekly.Pct == nil && account.ProxyUsage.TokenRevision == route.Revision &&
+			account.ProxyUsage.FableWeekly.Pct != nil {
+			// Responses from other models omit the Fable window and do not
+			// consume it; keep the last sample. LimitWindow.Ratio zeroes it
+			// once its reset passes and the next Fable response replaces it.
+			usage.FableWeekly = account.ProxyUsage.FableWeekly
+		}
 		account.ProxyUsage = usage
 		changed = true
 	}
