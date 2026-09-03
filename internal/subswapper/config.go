@@ -159,8 +159,8 @@ func (c Config) Validate() error {
 			if strings.TrimSpace(service.SharedRuntimeHome) == "" {
 				return fmt.Errorf("service %q shared_runtime_home must not be blank", service.Name)
 			}
-			if !isClaudeService(service) || !service.UsesAccountHomes() {
-				return fmt.Errorf("service %q shared_runtime_home requires Claude account_mode %q", service.Name, AccountModeHome)
+			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {
+				return fmt.Errorf("service %q shared_runtime_home requires Claude or Codex account_mode %q", service.Name, AccountModeHome)
 			}
 			if service.UsesNativeRuntimeHome() && service.ProxyListen == "" {
 				return fmt.Errorf("service %q shared_runtime_home %q requires proxy_listen; a fixed-token launch must not use the native home", service.Name, NativeRuntimeHome)
@@ -170,8 +170,8 @@ func (c Config) Validate() error {
 			}
 		}
 		if service.ProxyListen != "" || service.ProxyUpstream != "" {
-			if !isClaudeService(service) || !service.UsesAccountHomes() {
-				return fmt.Errorf("service %q proxy_listen requires Claude account_mode %q", service.Name, AccountModeHome)
+			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {
+				return fmt.Errorf("service %q proxy_listen requires Claude or Codex account_mode %q", service.Name, AccountModeHome)
 			}
 			if service.ProxyListen == "" {
 				return fmt.Errorf("service %q proxy_upstream requires proxy_listen", service.Name)
@@ -226,6 +226,17 @@ func (s ServiceConfig) UsesNativeRuntimeHome() bool {
 // local auth proxy instead of carrying a real setup token.
 func (s ServiceConfig) ClaudeProxyEnabled() bool {
 	return s.ProxyListen != "" && isClaudeService(s) && s.UsesAccountHomes()
+}
+
+// CodexProxyEnabled reports whether Codex launches should route through the
+// local ChatGPT auth proxy instead of carrying a real login.
+func (s ServiceConfig) CodexProxyEnabled() bool {
+	return s.ProxyListen != "" && isCodexService(s) && s.UsesAccountHomes()
+}
+
+// ProxyEnabled reports whether any local auth proxy serves this service.
+func (s ServiceConfig) ProxyEnabled() bool {
+	return s.ClaudeProxyEnabled() || s.CodexProxyEnabled()
 }
 
 func (c Config) Service(name string) (ServiceConfig, bool) {

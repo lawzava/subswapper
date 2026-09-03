@@ -543,8 +543,38 @@ func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claud
 		if fable, ok := parseClaudeRateLimitWindow(header, claudeRateLimitFableWindow); ok {
 			observation.Usage.FableWeekly = fable
 		}
+		if observation.Rejected {
+			markClaudeRejectedWindow(&observation.Usage, header.Get(claudeRateLimitHeaderBase+"representative-claim"))
+		}
 	}
 	return observation
+}
+
+// markClaudeRejectedWindow records a rejection in the window Anthropic names
+// as the binding claim. The utilization headers can still read below 100%
+// on a rejected response, and an account that stays "ready" at 91% would be
+// retried and rejected on every request.
+func markClaudeRejectedWindow(usage *UsageSnapshot, claim string) {
+	full := PtrFloat64(100)
+	switch strings.ToLower(strings.TrimSpace(claim)) {
+	case "seven_day":
+		usage.Weekly.Pct = full
+	case "seven_day_overage_included", "seven_day_oi":
+		if usage.FableWeekly.Pct != nil {
+			usage.FableWeekly.Pct = full
+		} else {
+			usage.Weekly.Pct = full
+		}
+	case "five_hour":
+		usage.FiveHour.Pct = full
+	default:
+		if usage.Exhausted() {
+			return
+		}
+		// Unknown claim: the five-hour window resets soonest, so a wrong
+		// guess costs the least.
+		usage.FiveHour.Pct = full
+	}
 }
 
 func parseClaudeRateLimitWindow(header http.Header, name string) (LimitWindow, bool) {

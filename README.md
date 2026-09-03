@@ -21,9 +21,9 @@ existing process.
   the selected one crosses a configurable threshold, without mutating a
   running provider's credentials.
 - **Live swapping through a local proxy** — an optional loopback auth proxy
-  holds the setup tokens, picks the account per request, fails over on a
-  rejected rate limit, and records the real rate-limit headers. Running
-  Claude sessions keep going across a switch.
+  holds the credentials, picks the account per request, fails over on a
+  rejected rate limit, and records real usage. Running Claude and Codex
+  sessions keep going across a switch.
 - **Safe by design** — cross-process locking, private `0700` homes, atomic
   credential persistence, and non-destructive migration from old snapshots.
 - **Extensible** — any other service can be managed by listing its credential
@@ -107,14 +107,15 @@ value auto-switching compares.
 | `home token set\|status\|remove -service claude [-account <name>]` | Manage a Claude setup token without printing its value. `set` accepts the token only through stdin or a hidden prompt. |
 | `home login -service <name> [-account <name>]` | Run the provider's legacy login command in that account home. Do not use this for setup-token routing. |
 | `home path\|env -service <name> [-account <name>]` | Print a home path or shell export for configuring other tools. |
-| `home run -service <name> [-account <name>] [-- command...]` | Run a command with the selected account's home environment. |
+| `home run -service <name> [-account <name>] [-- command...]` | Run a command with the selected account's home environment, or through the service's proxy when one is configured. |
+| `home proxy-auth -service codex` | Move a real ChatGPT login out of the Codex runtime home and install the proxy placeholder login (backup kept). |
 | `home migrate` | Copy legacy snapshots into native home filenames without deleting or overwriting files. |
 | `capture -service <name> -account <name> [-email <label>]` | Import the current login into a home; retained for migration and bundle-mode services. |
 | `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the least-used healthy account. |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
-| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves the Claude auth proxy. |
-| `proxy [-service claude] [-listen 127.0.0.1:7878]` | Serve only the Claude auth proxy configured by `proxy_listen`. |
+| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
+| `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
 | `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
@@ -191,7 +192,9 @@ passes, and the proxy corrects the estimate on the first real response.
 When a response is rejected for a quota (`anthropic-ratelimit-unified-*-status:
 rejected`, or HTTP 429 with the unified headers), the proxy replays the
 buffered request against the least-used alternative and makes that account
-the selected route. A 429 without the unified headers is a transient throttle
+the selected route. The window named by `representative-claim` is recorded
+as 100% even when its utilization header still reads lower, so a rejected
+account is not retried on every request until its reset. A 429 without the unified headers is a transient throttle
 or a request Anthropic refuses for every account: the alternative still serves
 that one request, but the route does not change. A 401 marks the token
 rejected for 30 minutes.
@@ -208,6 +211,57 @@ The listen address must be a loopback address; the port is fixed so launched
 processes can find it. Requests without the placeholder secret get 401.
 Request bodies are buffered up to 64 MiB for replay. Each switch costs one
 prompt-cache miss.
+
+### Live Codex account swapping through the local proxy
+
+The same proxy exists for Codex ChatGPT logins:
+
+```json
+{
+  "name": "codex",
+  "kind": "codex",
+  "account_mode": "home",
+  "proxy_listen": "127.0.0.1:7879",
+  "shared_runtime_home": "native"
+}
+```
+
+```sh
+subswapper capture -service codex -account main2      # register the current ~/.codex login
+subswapper home proxy-auth -service codex             # replace ~/.codex/auth.json with the placeholder
+subswapper monitor -interval 5m -proxy
+subswapper home run -service codex -- codex
+```
+
+Codex cannot be pointed at a proxy by environment alone. `home run` therefore
+inserts global `-c` overrides before the Codex subcommand: `chatgpt_base_url`
+and a custom model provider named `subswapper` with `requires_openai_auth`,
+because Codex refuses overrides of its built-in `openai` provider. The
+provider keeps `supports_websockets=false`, so every turn is a replayable
+HTTP request; WebSocket upgrades get 501. Codex 0.153 was verified to send
+its identity as `Authorization: Bearer` plus `chatgpt-account-id`; the proxy
+replaces both with the selected account's login read from that account's
+home. Requests Codex sends without credentials (plugin catalogs, MCP) are
+relayed unchanged.
+
+The runtime home holds a placeholder login: an unsigned JWT that Codex
+parses as a logged-in `pro` account. It never reaches upstream and its
+refresh token is a marker, so the process cannot refresh a real session and
+invalidate the registered copy. `home run` installs it when `auth.json` is
+missing or already a placeholder and refuses to overwrite a real login; run
+`home proxy-auth` once after `capture` to move the real login aside. A plain
+`codex` outside `home run` then fails to authenticate, so launch Codex
+through `home run` (or add the same `-c` values to `config.toml`).
+
+A 429 whose body names `usage_limit_reached` or `rate_limit_reached` is a
+quota rejection: the proxy asks `wham/usage` for that account so it ranks
+last with a real reset time, replays on the least-used alternative, and
+makes it the selected route. Any other 429 is retried without changing the
+route. A 401 marks the login rejected for 30 minutes. After successful
+responses the proxy refreshes an account's usage from `wham/usage` at most
+every five minutes; the monitor's app-server probe keeps refreshing the
+stored tokens. Without the proxy, `home run` falls back to the selected
+account home and its real login.
 
 ### Shared Claude user configuration
 
@@ -333,8 +387,9 @@ Account-home files use these native names:
 
 Claude home-mode services may set `shared_runtime_home`. This changes only the
 runtime home used by setup-token launches and status-line settings. Registered
-account homes and setup-token storage remain separate. `proxy_listen` enables
-the local auth proxy; `proxy_upstream` overrides the API origin for testing.
+account homes and setup-token storage remain separate. Codex home-mode services accept the same
+keys. `proxy_listen` enables the local auth proxy; `proxy_upstream` overrides
+the API origin for testing.
 
 An explicit `files` list defaults a service to `account_mode: "bundle"`. This
 keeps custom-service support and legacy transactional switching available.

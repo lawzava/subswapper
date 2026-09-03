@@ -589,6 +589,35 @@ func TestParseClaudeRateLimitHeaders(t *testing.T) {
 		t.Fatalf("bare observation = %#v", bare)
 	}
 
+	// A rejection can arrive while the utilization still reads below 100%;
+	// the representative claim names the window that is really exhausted.
+	header.Set("anthropic-ratelimit-unified-status", "rejected")
+	header.Set("anthropic-ratelimit-unified-5h-utilization", "0.91")
+	header.Set("anthropic-ratelimit-unified-7d-reset", "1788674400")
+	header.Set("anthropic-ratelimit-unified-7d-utilization", "0.3")
+	header.Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+	observation = parseClaudeRateLimitHeaders(header, observed)
+	if !observation.Rejected || *observation.Usage.FiveHour.Pct != 100 || *observation.Usage.Weekly.Pct != 30 {
+		t.Fatalf("five_hour rejection = %#v", observation.Usage)
+	}
+	header.Set("anthropic-ratelimit-unified-representative-claim", "seven_day_overage_included")
+	header.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.99")
+	header.Set("anthropic-ratelimit-unified-7d_oi-reset", "1788674400")
+	observation = parseClaudeRateLimitHeaders(header, observed)
+	if *observation.Usage.FiveHour.Pct != 91 || *observation.Usage.Weekly.Pct != 30 || *observation.Usage.FableWeekly.Pct != 100 {
+		t.Fatalf("fable rejection = %#v", observation.Usage)
+	}
+	header.Del("anthropic-ratelimit-unified-representative-claim")
+	observation = parseClaudeRateLimitHeaders(header, observed)
+	if *observation.Usage.FiveHour.Pct != 100 || *observation.Usage.FableWeekly.Pct != 99 {
+		t.Fatalf("unattributed rejection = %#v", observation.Usage)
+	}
+	header.Del("anthropic-ratelimit-unified-7d_oi-utilization")
+	header.Del("anthropic-ratelimit-unified-7d_oi-reset")
+	header.Set("anthropic-ratelimit-unified-status", "allowed")
+	header.Set("anthropic-ratelimit-unified-5h-utilization", "0.46")
+	header.Set("anthropic-ratelimit-unified-7d-utilization", "1.2")
+
 	header.Del("anthropic-ratelimit-unified-7d-reset")
 	header.Set("anthropic-ratelimit-unified-7d-status", "rejected")
 	observation = parseClaudeRateLimitHeaders(header, observed)

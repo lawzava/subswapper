@@ -89,7 +89,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 
 func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("missing home command: create, repair, path, env, login, run, token, or migrate")
+		return errors.New("missing home command: create, repair, path, env, login, run, proxy-auth, token, or migrate")
 	}
 	action := args[0]
 	if action == "token" {
@@ -179,7 +179,30 @@ func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			runtimeHome := subswapper.RuntimeHome(*cfg, service, account)
 			return runClaudeWithSetupToken(*cfg, *configPath, service, account, runtimeHome, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
 		}
+		if service.CodexProxyEnabled() {
+			return runCodexThroughProxy(*cfg, *configPath, service, account, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
+		}
 		return runWithAccountHome(*cfg, service, account, commandArgs[0], commandArgs[1:], stdin, stdout, stderr)
+	case "proxy-auth":
+		if !service.CodexProxyEnabled() {
+			return fmt.Errorf("service %q is not a Codex service with proxy_listen", service.Name)
+		}
+		placeholder, err := subswapper.LoadOrCreateCodexProxyPlaceholder(*cfg, service.Name)
+		if err != nil {
+			return err
+		}
+		runtimeHome := subswapper.RuntimeHome(*cfg, service, account)
+		backup, err := subswapper.ReplaceCodexRuntimeAuth(runtimeHome, placeholder)
+		if err != nil {
+			return err
+		}
+		if backup != "" {
+			if _, err := fmt.Fprintf(stdout, "moved the previous login to %s\n", backup); err != nil {
+				return err
+			}
+		}
+		_, err = fmt.Fprintf(stdout, "installed the Codex proxy placeholder in %s\n", runtimeHome)
+		return err
 	default:
 		return fmt.Errorf("unknown home command %q", action)
 	}
@@ -365,6 +388,69 @@ func runWithAccountHome(cfg subswapper.Config, service subswapper.ServiceConfig,
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()
+}
+
+// runCodexThroughProxy launches Codex against the local ChatGPT auth proxy.
+// The process holds only a placeholder login; the proxy swaps real tokens per
+// request. A proxy that is configured but not running degrades to a
+// fixed-login launch in the selected account home so work is never blocked.
+func runCodexThroughProxy(
+	cfg subswapper.Config,
+	configPath string,
+	service subswapper.ServiceConfig,
+	account string,
+	command string,
+	args []string,
+	stdin io.Reader,
+	stdout io.Writer,
+	stderr io.Writer,
+) error {
+	placeholder, err := subswapper.LoadOrCreateCodexProxyPlaceholder(cfg, service.Name)
+	switch {
+	case err != nil:
+		_, _ = fmt.Fprintf(stderr, "subswapper: Codex proxy placeholder unavailable (%v); launching with the account login\n", err)
+		return runWithAccountHome(cfg, service, account, command, args, stdin, stdout, stderr)
+	case !subswapper.CodexProxyReachable(service, placeholder):
+		_, _ = fmt.Fprintf(stderr, "subswapper: Codex proxy at %s is not running; launching with the account login\n", service.ProxyListen)
+		return runWithAccountHome(cfg, service, account, command, args, stdin, stdout, stderr)
+	}
+	// A shared or native runtime home must hold the placeholder: a real login
+	// there would refresh itself and invalidate the registered copy. The
+	// account home keeps its own login, which the proxy overrides anyway.
+	runtimeHome := subswapper.RuntimeHome(cfg, service, account)
+	launchHome := runtimeHome
+	if service.SharedRuntimeHome != "" {
+		if err := subswapper.EnsureCodexProxyAuth(runtimeHome, placeholder); err != nil {
+			if errors.Is(err, subswapper.ErrCodexRuntimeAuthIsReal) {
+				return fmt.Errorf("%s/auth.json holds a real ChatGPT login; capture it with `subswapper capture -service %s -account <name>` and then run `subswapper home proxy-auth -service %s`", runtimeHome, service.Name, service.Name)
+			}
+			return err
+		}
+		if service.UsesNativeRuntimeHome() {
+			launchHome = ""
+		}
+	}
+	metadata := map[string]string{
+		"SUBSWAPPER_CONFIG_PATH": configPath,
+		"SUBSWAPPER_SERVICE":     service.Name,
+		"SUBSWAPPER_ACCOUNT":     account,
+		"SUBSWAPPER_PROXY":       "1",
+	}
+	commandArgs := append([]string(nil), args...)
+	if isCodexExecutable(command) {
+		commandArgs = append(subswapper.CodexProxyLaunchArgs(service.ProxyListen), commandArgs...)
+	}
+	cmd := exec.Command(command, commandArgs...)
+	cmd.Env = subswapper.BuildCodexProxyLaunchEnvironment(os.Environ(), launchHome, metadata)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
+func isCodexExecutable(command string) bool {
+	base := strings.TrimSuffix(filepath.Base(command), filepath.Ext(command))
+	return strings.EqualFold(base, "codex")
 }
 
 func isClaudeServiceConfig(service subswapper.ServiceConfig) bool {
@@ -678,10 +764,16 @@ func runClaudeStatusLine(stdin io.Reader, stdout io.Writer) error {
 	return subswapper.RunClaudeStatusLineCommand(ctx, command, input, stdout)
 }
 
+// accountProcessEnvironment applies the home overrides and drops routing
+// metadata inherited from an enclosing proxied session, plus CODEX_API_KEY,
+// which would switch Codex away from the account's ChatGPT login.
 func accountProcessEnvironment(base []string, overrides map[string]string) []string {
 	result := make([]string, 0, len(base)+len(overrides))
 	for _, entry := range base {
 		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "SUBSWAPPER_") || key == "CODEX_API_KEY" {
+			continue
+		}
 		if _, replaced := overrides[key]; !replaced {
 			result = append(result, entry)
 		}
@@ -889,7 +981,7 @@ func runMonitor(args []string, stdout io.Writer) error {
 	once := fs.Bool("once", false, "run one monitor cycle")
 	noAuto := fs.Bool("no-auto", false, "observe without switching")
 	verbose := fs.Bool("verbose", false, "print the full status table every cycle")
-	withProxy := fs.Bool("proxy", false, "also serve the Claude auth proxy configured by proxy_listen")
+	withProxy := fs.Bool("proxy", false, "also serve every auth proxy configured by proxy_listen")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -899,27 +991,29 @@ func runMonitor(args []string, stdout io.Writer) error {
 		return err
 	}
 	if *withProxy {
-		proxyService, ok := configuredProxyService(*cfg, "")
-		if !ok {
-			return errors.New("monitor -proxy requires a Claude service with proxy_listen")
-		}
-		proxy, err := subswapper.NewClaudeProxy(*cfg, proxyService.Name, proxyLogger(stdout))
-		if err != nil {
-			return err
+		proxyServices := configuredProxyServices(*cfg, "")
+		if len(proxyServices) == 0 {
+			return errors.New("monitor -proxy requires a Claude or Codex service with proxy_listen")
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		ctx, cancel := context.WithCancelCause(ctx)
 		defer cancel(nil)
-		go func() {
-			if serveErr := proxy.Serve(ctx); serveErr != nil {
-				cancel(serveErr)
-				return
+		for _, proxyService := range proxyServices {
+			proxy, err := newServiceProxy(*cfg, proxyService, proxyLogger(stdout))
+			if err != nil {
+				return err
 			}
-			cancel(nil)
-		}()
-		if _, err := fmt.Fprintf(stdout, "subswapper proxy listening on %s\n", proxyService.ProxyListen); err != nil {
-			return err
+			go func() {
+				if serveErr := proxy.Serve(ctx); serveErr != nil {
+					cancel(serveErr)
+					return
+				}
+				cancel(nil)
+			}()
+			if _, err := fmt.Fprintf(stdout, "subswapper %s proxy listening on %s\n", proxyService.Name, proxyService.ProxyListen); err != nil {
+				return err
+			}
 		}
 		monitorErr := runMonitorWithConfig(ctx, *cfg, *interval, *once, *noAuto, *verbose, stdout)
 		cancel(nil)
@@ -945,16 +1039,31 @@ func runMonitorWithConfig(ctx context.Context, cfg subswapper.Config, interval t
 	return runMonitorLoop(ctx, cfg, monitorInterval, once, autoSwitch, verbose, stdout, subswapper.MonitorOnce)
 }
 
-func configuredProxyService(cfg subswapper.Config, name string) (subswapper.ServiceConfig, bool) {
+type serviceProxy interface {
+	Serve(context.Context) error
+}
+
+func newServiceProxy(cfg subswapper.Config, service subswapper.ServiceConfig, logf func(string, ...any)) (serviceProxy, error) {
+	switch {
+	case service.ClaudeProxyEnabled():
+		return subswapper.NewClaudeProxy(cfg, service.Name, logf)
+	case service.CodexProxyEnabled():
+		return subswapper.NewCodexProxy(cfg, service.Name, logf)
+	}
+	return nil, fmt.Errorf("service %q has no proxy_listen configured", service.Name)
+}
+
+func configuredProxyServices(cfg subswapper.Config, name string) []subswapper.ServiceConfig {
+	var services []subswapper.ServiceConfig
 	for _, service := range cfg.Services {
 		if name != "" && service.Name != name {
 			continue
 		}
-		if service.ClaudeProxyEnabled() && !service.Disabled {
-			return service, true
+		if service.ProxyEnabled() && !service.Disabled {
+			services = append(services, service)
 		}
 	}
-	return subswapper.ServiceConfig{}, false
+	return services
 }
 
 func proxyLogger(stdout io.Writer) func(string, ...any) {
@@ -966,8 +1075,8 @@ func proxyLogger(stdout io.Writer) func(string, ...any) {
 func runProxy(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath, "config file")
-	serviceName := fs.String("service", "claude", "Claude service name")
-	listen := fs.String("listen", "", "override the configured proxy_listen address")
+	serviceName := fs.String("service", "", "serve only this service's proxy; default every configured proxy")
+	listen := fs.String("listen", "", "override the configured proxy_listen address; requires -service")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -976,6 +1085,9 @@ func runProxy(args []string, stdout io.Writer) error {
 		return err
 	}
 	if *listen != "" {
+		if *serviceName == "" {
+			return errors.New("-listen requires -service")
+		}
 		if err := subswapper.ValidateClaudeProxyListen(*listen); err != nil {
 			return fmt.Errorf("-listen: %w", err)
 		}
@@ -985,20 +1097,38 @@ func runProxy(args []string, stdout io.Writer) error {
 			}
 		}
 	}
-	service, ok := configuredProxyService(*cfg, *serviceName)
-	if !ok {
-		return fmt.Errorf("service %q has no proxy_listen configured; set it in the config or pass -listen", *serviceName)
-	}
-	proxy, err := subswapper.NewClaudeProxy(*cfg, service.Name, proxyLogger(stdout))
-	if err != nil {
-		return err
+	services := configuredProxyServices(*cfg, *serviceName)
+	if len(services) == 0 {
+		if *serviceName != "" {
+			return fmt.Errorf("service %q has no proxy_listen configured; set it in the config or pass -listen", *serviceName)
+		}
+		return errors.New("no service has proxy_listen configured")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if _, err := fmt.Fprintf(stdout, "subswapper proxy listening on %s\n", service.ProxyListen); err != nil {
-		return err
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	for _, service := range services {
+		proxy, err := newServiceProxy(*cfg, service, proxyLogger(stdout))
+		if err != nil {
+			return err
+		}
+		go func() {
+			if serveErr := proxy.Serve(ctx); serveErr != nil {
+				cancel(serveErr)
+				return
+			}
+			cancel(nil)
+		}()
+		if _, err := fmt.Fprintf(stdout, "subswapper %s proxy listening on %s\n", service.Name, service.ProxyListen); err != nil {
+			return err
+		}
 	}
-	return proxy.Serve(ctx)
+	<-ctx.Done()
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return nil
 }
 
 type monitorCycleRunner func(context.Context, subswapper.Config, bool) subswapper.CycleResult

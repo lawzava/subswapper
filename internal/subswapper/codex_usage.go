@@ -25,6 +25,7 @@ type codexAuthFile struct {
 
 type codexTokens struct {
 	AccessToken string `json:"access_token"`
+	AccountID   string `json:"account_id"`
 }
 
 type codexRateLimitsResponse struct {

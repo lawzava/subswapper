@@ -1086,7 +1086,11 @@ func TestRunProxyRequiresConfiguredListen(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "proxy_listen") {
 		t.Fatalf("err = %v", err)
 	}
-	err = run([]string{"proxy", "-config", configPath, "-listen", "0.0.0.0:7878"}, &stdout, &stderr)
+	err = run([]string{"proxy", "-config", configPath, "-listen", "127.0.0.1:7878"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "requires -service") {
+		t.Fatalf("err = %v", err)
+	}
+	err = run([]string{"proxy", "-config", configPath, "-service", "claude", "-listen", "0.0.0.0:7878"}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("err = %v", err)
 	}
@@ -1177,5 +1181,136 @@ func TestRunHomeClaudeNativeRuntimeHomeInheritsClaudeConfigDir(t *testing.T) {
 	wantHome := filepath.Join(dir, "accounts", "claude", "work")
 	if got := stdout.String(); !strings.Contains(got, "config="+wantHome+" base=unset") {
 		t.Fatalf("fallback output = %q", got)
+	}
+}
+
+func writeCodexProxyHomeConfig(t *testing.T, dir, listen string) string {
+	t.Helper()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	t.Setenv("CODEX_HOME", "")
+	config := map[string]any{
+		"backup_root": filepath.Join(dir, "accounts"),
+		"state_path":  filepath.Join(dir, "state.json"),
+		"services": []any{map[string]any{
+			"name":                "codex",
+			"kind":                "codex",
+			"account_mode":        "home",
+			"proxy_listen":        listen,
+			"shared_runtime_home": "native",
+		}},
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// writeFakeCodex reports its arguments and environment; the file is named
+// codex so the launcher treats it as the real binary.
+func writeFakeCodex(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nprintf 'args=%s\\nhome=%s proxy=%s apikey=%s\\n' \"$*\" \"${CODEX_HOME-unset}\" \"${SUBSWAPPER_PROXY-unset}\" \"${CODEX_API_KEY-unset}\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestRunHomeCodexLaunchesThroughProxyWithPlaceholderLogin(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewUnstartedServer(nil)
+	listen := server.Listener.Addr().String()
+	configPath := writeCodexProxyHomeConfig(t, dir, listen)
+	createHomeAccount(t, configPath, "codex", "main2")
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subswapper.AccountDir(*cfg, "codex", "main2"), "auth.json"),
+		[]byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"real","refresh_token":"real","account_id":"acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := subswapper.NewCodexProxy(*cfg, "codex", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Config.Handler = proxy
+	server.Start()
+	t.Cleanup(server.Close)
+	fakeCodex := writeFakeCodex(t, dir)
+	t.Setenv("CODEX_API_KEY", "sk-should-be-dropped")
+
+	var stdout, stderr bytes.Buffer
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "codex", "--", fakeCodex, "app-server", "--stdio"},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("home run failed: %v; stderr=%s", err, stderr.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"args=-c chatgpt_base_url=http://" + listen + "/backend-api/ -c model_provider=subswapper",
+		"supports_websockets=false",
+		" app-server --stdio\n",
+		"home=unset proxy=1 apikey=unset",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("proxy launch output lacks %q:\n%s%s", want, got, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "not running") {
+		t.Fatalf("unexpected fallback warning: %s", stderr.String())
+	}
+	nativeAuth, err := os.ReadFile(filepath.Join(dir, "native-home", ".codex", "auth.json"))
+	if err != nil || !subswapper.IsCodexProxyAuthFile(nativeAuth) {
+		t.Fatalf("native auth.json = %s, err = %v", nativeAuth, err)
+	}
+
+	// A real login in the native home is never replaced silently.
+	if err := os.WriteFile(filepath.Join(dir, "native-home", ".codex", "auth.json"),
+		[]byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"native","refresh_token":"native"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	err = runWithInput([]string{"home", "run", "-config", configPath, "-service", "codex", "--", fakeCodex}, strings.NewReader(""), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "proxy-auth") {
+		t.Fatalf("launch over a real native login: err = %v", err)
+	}
+	if err := run([]string{"home", "proxy-auth", "-config", configPath, "-service", "codex"}, &stdout, &stderr); err != nil {
+		t.Fatalf("proxy-auth failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "moved the previous login to") {
+		t.Fatalf("proxy-auth output = %q", stdout.String())
+	}
+	stdout.Reset()
+	if err := runWithInput([]string{"home", "run", "-config", configPath, "-service", "codex", "--", fakeCodex}, strings.NewReader(""), &stdout, &stderr); err != nil {
+		t.Fatalf("home run after proxy-auth failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "proxy=1") {
+		t.Fatalf("launch after proxy-auth = %q", stdout.String())
+	}
+
+	// Without the proxy the account home and its real login are used.
+	server.Close()
+	stdout.Reset()
+	stderr.Reset()
+	if err := runWithInput([]string{"home", "run", "-config", configPath, "-service", "codex", "--", fakeCodex}, strings.NewReader(""), &stdout, &stderr); err != nil {
+		t.Fatalf("fallback launch failed: %v", err)
+	}
+	if got := stdout.String(); !strings.Contains(got, "args=\nhome="+subswapper.AccountDir(*cfg, "codex", "main2")+" proxy=unset") {
+		t.Fatalf("fallback output = %q", got)
+	}
+	if !strings.Contains(stderr.String(), "not running") {
+		t.Fatalf("missing fallback warning: %q", stderr.String())
 	}
 }

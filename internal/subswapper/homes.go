@@ -35,10 +35,12 @@ func (s ServiceConfig) UsesAccountHomes() bool {
 
 // RuntimeHome returns the state directory used by a launched provider.
 func RuntimeHome(cfg Config, service ServiceConfig, accountName string) string {
-	if isClaudeService(service) && service.UsesNativeRuntimeHome() {
+	switch {
+	case isClaudeService(service) && service.UsesNativeRuntimeHome():
 		return NativeClaudeHome()
-	}
-	if isClaudeService(service) && service.SharedRuntimeHome != "" {
+	case isCodexService(service) && service.UsesNativeRuntimeHome():
+		return NativeCodexHome()
+	case (isClaudeService(service) || isCodexService(service)) && service.SharedRuntimeHome != "":
 		return ExpandPath(service.SharedRuntimeHome)
 	}
 	return AccountDir(cfg, service.Name, accountName)
