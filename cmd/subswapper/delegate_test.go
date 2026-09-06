@@ -25,7 +25,12 @@ func TestDelegateProcess(t *testing.T) {
 	}
 	for _, provider := range []string{"claude", "codex"} {
 		t.Run(provider, func(t *testing.T) {
-			dir := t.TempDir()
+			// Exercise equivalent path spellings, including macOS /var aliases.
+			realDir := t.TempDir()
+			dir := filepath.Join(t.TempDir(), "workspace-link")
+			if err := os.Symlink(realDir, dir); err != nil {
+				t.Fatal(err)
+			}
 			server := httptest.NewUnstartedServer(nil)
 			listen := server.Listener.Addr().String()
 			var config string
@@ -86,7 +91,19 @@ exit 23
 			if !errors.As(err, &exit) || exit.ExitCode() != 23 {
 				t.Fatalf("want exit 23, got %v; %s", err, stderr.String())
 			}
-			for _, want := range []string{"cwd=" + dir, "proxy=1", "marker=1", "arg=<synthetic-model>", "task=" + task} {
+			cwdLine, _, _ := strings.Cut(out.String(), "\n")
+			actualDir, err := os.Stat(strings.TrimPrefix(cwdLine, "cwd="))
+			if err != nil {
+				t.Fatalf("reported working directory: %v", err)
+			}
+			expectedDir, err := os.Stat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(actualDir, expectedDir) {
+				t.Fatalf("wrong working directory: %s", cwdLine)
+			}
+			for _, want := range []string{"proxy=1", "marker=1", "arg=<synthetic-model>", "task=" + task} {
 				if !strings.Contains(out.String(), want) {
 					t.Errorf("missing %q in %s", want, out.String())
 				}
