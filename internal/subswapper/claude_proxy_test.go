@@ -574,8 +574,14 @@ func TestParseClaudeRateLimitHeaders(t *testing.T) {
 		*observation.Usage.FableWeekly.Pct != 14 || observation.Usage.FableWeekly.ResetsAt.Unix() != 1788674400 {
 		t.Fatalf("fable usage = %#v", observation.Usage.FableWeekly)
 	}
-	if observation.Usage.Score() != 1 {
-		t.Fatalf("score = %v", observation.Usage.Score())
+	// Reset timestamps are checked above. Score the parsed percentages without
+	// making this fixed-date fixture depend on the wall clock.
+	scored := observation.Usage
+	scored.FiveHour.ResetsAt = time.Time{}
+	scored.Weekly.ResetsAt = time.Time{}
+	scored.FableWeekly.ResetsAt = time.Time{}
+	if scored.Score() != 1 {
+		t.Fatalf("score = %v", scored.Score())
 	}
 	header.Set("anthropic-ratelimit-unified-7d_oi-status", "rejected")
 	if observation = parseClaudeRateLimitHeaders(header, observed); !observation.Rejected || *observation.Usage.FableWeekly.Pct != 100 {

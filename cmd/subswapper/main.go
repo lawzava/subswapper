@@ -37,8 +37,12 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		if os.Getenv(delegateMarker) != "" && len(os.Args) > 1 && os.Args[1] == "home" {
+			_, _ = fmt.Fprintln(os.Stderr, "delegated provider launch failed")
+		} else {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+		}
+		os.Exit(processExitCode(err))
 	}
 }
 
@@ -55,6 +59,8 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 	}
 
 	switch args[0] {
+	case "delegate":
+		return runDelegate(args[1:], stdout, stderr)
 	case "init":
 		return runInit(args[1:], stdout)
 	case "import-cswap", "import-claude-swap":
@@ -1231,6 +1237,7 @@ Usage:
   subswapper home login -service claude|codex [-account <name>]
   subswapper home token set|status|remove -service claude [-account <name>]
   subswapper home run -service claude|codex [-account <name>] [-- command args...]
+  subswapper delegate -service claude|codex -cwd /path -model MODEL -effort LEVEL -intent read-only|workspace-write -task TEXT [-timeout 10m]
   subswapper home migrate [-config ~/.config/subswapper/config.json]
   subswapper capture -service claude|codex -account <name> [-email user@example.com]
   subswapper remove -service claude|codex -account <name> [-force] [-delete-home]

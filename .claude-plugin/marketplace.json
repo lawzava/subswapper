@@ -1,0 +1,22 @@
+{
+  "name": "subswapper",
+  "owner": {
+    "name": "Subswapper contributors"
+  },
+  "plugins": [
+    {
+      "name": "subswapper",
+      "source": "./plugins/subswapper",
+      "description": "Execute bounded Claude Code or Codex tasks through Subswapper.",
+      "version": "0.1.0",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ],
+  "metadata": {
+    "description": "Optional cross-provider execution through Subswapper."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "subswapper",
+  "version": "0.1.0",
+  "description": "Execute bounded Claude Code or Codex tasks through Subswapper.",
+  "author": {
+    "name": "Subswapper contributors"
+  },
+  "skills": "./skills/",
+  "repository": "https://github.com/lawzava/subswapper",
+  "homepage": "https://github.com/lawzava/subswapper/blob/main/docs/plugin.md"
+}

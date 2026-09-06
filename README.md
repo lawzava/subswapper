@@ -568,3 +568,8 @@ development workflow. Please report security issues privately (see
 ## License
 
 [MIT](LICENSE)
+
+## Optional harness plugin
+
+Claude Code and Codex can delegate bounded cross-provider tasks through
+`subswapper delegate`. See [installation, usage, and permission boundaries](docs/plugin.md).

@@ -1,0 +1,20 @@
+{
+  "name": "subswapper",
+  "version": "0.1.0",
+  "description": "Execute bounded Claude Code or Codex tasks through Subswapper.",
+  "author": {
+    "name": "Subswapper contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Subswapper",
+    "shortDescription": "Cross-provider execution through Subswapper.",
+    "longDescription": "Run explicitly scoped tasks through existing Subswapper account and proxy launch paths.",
+    "developerName": "Subswapper contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use Subswapper to execute an authorized task with the other provider."
+  },
+  "repository": "https://github.com/lawzava/subswapper",
+  "homepage": "https://github.com/lawzava/subswapper/blob/main/docs/plugin.md"
+}
