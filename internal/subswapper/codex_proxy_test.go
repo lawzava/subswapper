@@ -2,6 +2,7 @@ package subswapper
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,6 +72,23 @@ func setupCodexProxyAccounts(t *testing.T, upstreamURL string) (Config, *CodexPr
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Background usage writes must finish before TempDir removes their state.
+	t.Cleanup(func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			proxy.usageMu.Lock()
+			pending := len(proxy.usageInFlight)
+			proxy.usageMu.Unlock()
+			if pending == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("proxy usage refresh did not finish before cleanup")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
 	return cfg, proxy
 }
 
@@ -298,19 +316,21 @@ func readAllString(r *http.Request) (string, error) {
 
 func TestCodexProxyFailsOverOnUsageLimitAndSwitchesRoute(t *testing.T) {
 	log := &codexCallLog{}
+	// Exhaustion is meaningful only before the window resets.
+	resetAt := time.Now().Add(24 * time.Hour).Unix()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.record(r)
 		switch r.Header.Get("Authorization") {
 		case "Bearer chatgpt-token-a":
 			if r.URL.Path == codexProxyUsagePath {
-				_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1788780407}}}`))
+				_, _ = fmt.Fprintf(w, `{"rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":%d}}}`, resetAt)
 				return
 			}
 			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_at":1788780407}}`))
+			_, _ = fmt.Fprintf(w, `{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_at":%d}}`, resetAt)
 		case "Bearer chatgpt-token-b":
 			if r.URL.Path == codexProxyUsagePath {
-				_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1788780407}}}`))
+				_, _ = fmt.Fprintf(w, `{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":%d}}}`, resetAt)
 				return
 			}
 			_, _ = w.Write([]byte(`{"type":"message"}`))
@@ -338,7 +358,7 @@ func TestCodexProxyFailsOverOnUsageLimitAndSwitchesRoute(t *testing.T) {
 	if service.ActiveAccount != "b" || service.LastSwitchedAt.IsZero() {
 		t.Fatalf("service state = %#v", service)
 	}
-	if usage := service.Accounts["a"].ProxyUsage; !usage.Exhausted() || usage.Weekly.ResetsAt.Unix() != 1788780407 {
+	if usage := service.Accounts["a"].ProxyUsage; !usage.Exhausted() || usage.Weekly.ResetsAt.Unix() != resetAt {
 		t.Fatalf("account a usage = %#v", usage)
 	}
 

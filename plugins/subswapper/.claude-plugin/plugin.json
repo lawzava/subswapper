@@ -1,7 +1,7 @@
 {
   "name": "subswapper",
-  "version": "0.1.0",
-  "description": "Execute bounded Claude Code or Codex tasks through Subswapper.",
+  "version": "0.1.1",
+  "description": "Route Claude Code and Codex CLI tasks, model probes, and harness checks through Subswapper.",
   "author": {
     "name": "Subswapper contributors"
   },

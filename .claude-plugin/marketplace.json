@@ -7,8 +7,8 @@
     {
       "name": "subswapper",
       "source": "./plugins/subswapper",
-      "description": "Execute bounded Claude Code or Codex tasks through Subswapper.",
-      "version": "0.1.0",
+      "description": "Route Claude Code and Codex CLI tasks, model probes, and harness checks through Subswapper.",
+      "version": "0.1.1",
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
@@ -17,6 +17,6 @@
     }
   ],
   "metadata": {
-    "description": "Optional cross-provider execution through Subswapper."
+    "description": "Claude Code and Codex CLI routing through Subswapper."
   }
 }

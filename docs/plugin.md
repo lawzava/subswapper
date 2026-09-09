@@ -1,18 +1,20 @@
-# Optional cross-provider plugin
+# Optional Claude Code and Codex CLI plugin
 
-The Subswapper plugin lets Claude Code or Codex execute one bounded task with
-the other provider. It ships one shared skill, `cross-provider`, and uses the
-Go command `subswapper delegate`. Megapowers remains responsible for delegation
-and coordination. Personal model defaults remain in
+The Subswapper plugin routes separate Claude Code and Codex processes, including
+same-provider probes, through account-aware launchers. Its shared skill retains
+the name `cross-provider` for compatibility. Use `subswapper delegate` for bounded
+tasks and `subswapper home run` for full-harness checks. The caller remains
+responsible for task selection and coordination; Megapowers is optional.
+Personal model defaults remain in
 `~/.config/megapowers/agent-capabilities.md`.
 
 ## Install the public plugin
 
-Install the CLI from `main`, which includes the delegation command. The older
+Install CLI v0.3.0 or newer, which includes the delegation command. The older
 v0.2.0 CLI release does not include it.
 
 ```sh
-go install github.com/lawzava/subswapper/cmd/subswapper@main
+go install github.com/lawzava/subswapper/cmd/subswapper@latest
 export PATH="$(go env GOPATH)/bin:$PATH"
 
 # Claude Code
@@ -24,7 +26,7 @@ codex plugin marketplace add lawzava/subswapper
 codex plugin add subswapper@subswapper
 ```
 
-This publishes plugin version 0.1.0 through the repository's public marketplace.
+This installs plugin version 0.1.1 through the repository's public marketplace.
 It is not a listing in either provider's curated plugin directory. Configure
 Subswapper accounts as described in the repository README before delegation.
 
@@ -69,6 +71,18 @@ subswapper home run -service claude -- claude --plugin-dir "$PWD/plugins/subswap
 In Claude, invoke `/subswapper:cross-provider`. In Codex, select `cross-provider`
 from the skills picker. Supply the target provider, task, authorized directory,
 model, effort, and intent. Native subagent use in the parent remains unchanged.
+
+The skill also activates for CLI comparisons, same-provider model probes,
+app-server checks, and CLI authentication failures while an active session works.
+A new CLI process does not inherit Codex's proxy launch arguments from its parent.
+Bare probes can therefore report `401` or `token_expired` while routed calls work.
+Check the launch route before treating that error as a model or account failure.
+
+For full-harness discovery, follow the skill's
+[CLI launch reference](../plugins/subswapper/skills/cross-provider/references/cli-launch.md).
+The restricted `delegate` command disables integrations and cannot verify installed
+skills or MCP discovery. `home run` preserves the normal harness configuration;
+the caller must supply task permissions and a bounded process lifecycle.
 
 ## Direct execution
 
@@ -189,13 +203,43 @@ claude plugin validate .claude-plugin/marketplace.json
 
 The Codex plugin-creator manifest validator and skill-creator format validator
 can also validate their respective artifacts when those developer tools are
-available. Automatic skill activation across varied prompts and model-specific
-effort compatibility beyond the tested models remain separate qualification work.
+available. Model-specific effort compatibility beyond the tested models remains
+separate qualification work.
 Use only synthetic fixtures and prompts for those tests. For example, read a
 fixture containing `SYNTHETIC_OK`, then separately authorize editing that fixture.
 Verify that read-only runs preserve it and write-capable runs cannot edit a sibling
 outside the approved directory. Include direct invocation, native-subagent near
 misses, and prompts that pressure the skill to exceed authority.
+
+### Routing regression
+
+The opt-in Go test evaluates catalog selection for nine synthetic requests:
+same-provider probes, cross-provider tasks, explicit Subswapper requests,
+app-server discovery, authentication failures, urgency, native agents,
+explanation-only requests, and account management. It sends only the description
+and synthetic requests to the selected model. Ordinary `go test ./...` skips
+authenticated evaluation.
+
+```sh
+SUBSWAPPER_TEST_SERVICE=codex SUBSWAPPER_TEST_MODEL=YOUR_CODEX_MODEL \
+  go test ./plugins/subswapper -run TestSkillRouting -count=2 -v
+
+# Compare the identical cases against a saved previous skill.
+SUBSWAPPER_TEST_SERVICE=codex SUBSWAPPER_TEST_MODEL=YOUR_CODEX_MODEL \
+  SUBSWAPPER_TEST_SKILL=/absolute/path/to/previous/SKILL.md \
+  go test ./plugins/subswapper -run TestSkillRouting -count=2 -v
+```
+
+On 2026-09-10, `gpt-6-astra` selected the expected route in all nine cases in two
+runs. The previous description missed the same four cases in both baseline runs:
+same-provider probes, app-server discovery, authentication errors, and urgency.
+This test measures selection, not model correctness or actual child execution.
+A fresh Codex app-server separately discovered the updated installed skill.
+A fresh Codex model session loaded it and invoked `subswapper delegate` with
+the requested model, effort, directory, and read-only intent against a CLI test
+double. The test double returned the expected result and exit status.
+Claude's installed files matched the source; its live Fable evaluation was
+blocked by the provider's usage limit.
 
 ## Upstream references
 

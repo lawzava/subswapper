@@ -571,5 +571,7 @@ development workflow. Please report security issues privately (see
 
 ## Optional harness plugin
 
-Claude Code and Codex can delegate bounded cross-provider tasks through
-`subswapper delegate`. See [installation, usage, and permission boundaries](docs/plugin.md).
+Claude Code and Codex can run bounded tasks and model probes through
+`subswapper delegate`, including same-provider CLI processes. The plugin also
+routes full-harness checks through `subswapper home run`.
+See [installation, usage, and permission boundaries](docs/plugin.md).
