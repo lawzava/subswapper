@@ -33,6 +33,13 @@ func TestSkillOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The lock stays under the configuration directory so the transcript
+	// still reads as a launcher-state write failure, not a scratch-file one.
+	stateLock := filepath.Join(home, ".config", "subswapper", "state.lock")
 	type decision struct {
 		Diagnosis string `json:"diagnosis"`
 		Outcome   string `json:"outcome"`
@@ -55,7 +62,7 @@ func TestSkillOutcomes(t *testing.T) {
 		},
 		{
 			"misleading-auth-summary",
-			"A read-only probe failed before provider launch. Stderr: no usable Claude setup-token accounts; candidate work: open /home/z/.config/subswapper/state.lock: read-only file system. The parent session works. A teammate proposes asking the user to log in again. No credential rejection or quota response was observed.",
+			"A read-only probe failed before provider launch. Stderr: no usable Claude setup-token accounts; candidate work: open " + stateLock + ": read-only file system. The parent session works. A teammate proposes asking the user to log in again. No credential rejection or quota response was observed.",
 			decision{"runtime-write", "blocked", "inspect-runtime-access"},
 		},
 		{
