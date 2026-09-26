@@ -47,14 +47,6 @@ type AccountState struct {
 	// on a real response. It is kept apart from Usage so monitor probe merges
 	// never overwrite or race it.
 	ProxyUsage UsageSnapshot `json:"proxy_usage,omitzero"`
-	// WarmupAt is when a warm-up request last started this account's
-	// windows; each window counts as running for its full length after it.
-	WarmupAt time.Time `json:"warmup_at,omitzero"`
-	// FableWarmupAt is when a Fable-model warm-up last started the Fable
-	// weekly window, which other models do not consume.
-	FableWarmupAt time.Time `json:"fable_warmup_at,omitzero"`
-	// WarmupRetryAt delays the next warm-up after a failed one.
-	WarmupRetryAt time.Time `json:"warmup_retry_at,omitzero"`
 }
 
 func LoadState(path string) (*State, error) {

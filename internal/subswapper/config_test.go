@@ -64,6 +64,23 @@ func TestDefaultMonitorIntervalIsFiveMinutes(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsRemovedWarmupKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{
+  "monitor": {"interval": "5m", "warmup": true},
+  "services": [
+    {"name": "claude", "kind": "claude", "account_mode": "home", "warmup_model": "claude-haiku-4-5", "warmup_fable_model": "claude-fable-5-1"},
+    {"name": "codex", "kind": "codex", "account_mode": "home", "warmup_model": "gpt-6-luna"}
+  ]
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err != nil {
+		t.Fatalf("a config written for the removed warm-up feature no longer loads: %v", err)
+	}
+}
+
 func TestSampleConfigUsesFiveMinuteInterval(t *testing.T) {
 	if !strings.Contains(sampleConfig, `"interval": "5m"`) {
 		t.Fatalf("sample config does not use five minutes:\n%s", sampleConfig)

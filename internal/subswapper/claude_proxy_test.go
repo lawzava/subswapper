@@ -176,7 +176,7 @@ func TestClaudeProxyForwardsWithSelectedTokenAndRecordsUsage(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyFailsOverOnRejectedRateLimitAndSwitchesRoute(t *testing.T) {
+func TestClaudeProxyRelaysRejectedRateLimitWithoutRetrying(t *testing.T) {
 	upstream := newProxyUpstream(t)
 	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
 	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
@@ -192,12 +192,10 @@ func TestClaudeProxyFailsOverOnRejectedRateLimitAndSwitchesRoute(t *testing.T) {
 	})
 
 	recorder := proxyRequest(t, proxy, proxy.secret, `{"model":"claude"}`)
-	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"type":"message"}` {
+	if recorder.Code != http.StatusTooManyRequests || recorder.Body.String() != `{"type":"error"}` {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	calls := upstream.recorded()
-	if len(calls) != 2 || calls[0].Authorization != "Bearer setup-token-a" || calls[1].Authorization != "Bearer setup-token-b" ||
-		calls[1].Body != `{"model":"claude"}` {
+	if calls := upstream.recorded(); len(calls) != 1 || calls[0].Authorization != "Bearer setup-token-a" {
 		t.Fatalf("upstream calls = %#v", calls)
 	}
 
@@ -206,23 +204,11 @@ func TestClaudeProxyFailsOverOnRejectedRateLimitAndSwitchesRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := state.Service("claude")
-	if service.ActiveAccount != "b" || service.LastSwitchedAt.IsZero() {
-		t.Fatalf("service state = %#v", service)
+	if service.ActiveAccount != "a" || !service.LastSwitchedAt.IsZero() {
+		t.Fatalf("a rate limit changed the route: %#v", service)
 	}
 	if usage := service.Accounts["a"].ProxyUsage; !usage.Exhausted() {
 		t.Fatalf("account a usage = %#v", usage)
-	}
-	if usage := service.Accounts["b"].ProxyUsage; usage.FiveHour.Pct == nil || *usage.FiveHour.Pct != 10 {
-		t.Fatalf("account b usage = %#v", usage)
-	}
-
-	// The next request goes straight to b without touching a.
-	recorder = proxyRequest(t, proxy, proxy.secret, `{"model":"claude"}`)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("second status = %d", recorder.Code)
-	}
-	if calls := upstream.recorded(); len(calls) != 3 || calls[2].Authorization != "Bearer setup-token-b" {
-		t.Fatalf("upstream calls = %#v", calls)
 	}
 }
 
@@ -265,7 +251,7 @@ func TestClaudeProxyMarksRejectedTokenAndRelaysLastFailure(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyPrefersLeastUsedAlternativeOnFailover(t *testing.T) {
+func TestClaudeProxyPrefersLeastUsedAlternativeOnRejectedToken(t *testing.T) {
 	upstream := newProxyUpstream(t)
 	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
 	registerSetupTokenTestAccount(t, cfg, "c")
@@ -291,7 +277,7 @@ func TestClaudeProxyPrefersLeastUsedAlternativeOnFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
+		w.WriteHeader(http.StatusUnauthorized)
 	})
 	upstream.respond("setup-token-c", func(w http.ResponseWriter, r *http.Request) {
 		rateLimitHeaders(w, 0.2, 0.2, "allowed")
@@ -372,7 +358,7 @@ func TestClaudeProxyKeepsFableWindowAcrossNonFableResponses(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyThrottleWithoutQuotaHeadersDoesNotSwitchRoute(t *testing.T) {
+func TestClaudeProxyRelaysThrottleWithoutQuotaHeaders(t *testing.T) {
 	upstream := newProxyUpstream(t)
 	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
 	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
@@ -386,10 +372,10 @@ func TestClaudeProxyThrottleWithoutQuotaHeadersDoesNotSwitchRoute(t *testing.T) 
 	})
 
 	recorder := proxyRequest(t, proxy, proxy.secret, `{}`)
-	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"type":"message"}` {
+	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "rate_limit_error") {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if calls := upstream.recorded(); len(calls) != 2 || calls[1].Authorization != "Bearer setup-token-b" {
+	if calls := upstream.recorded(); len(calls) != 1 || calls[0].Authorization != "Bearer setup-token-a" {
 		t.Fatalf("upstream calls = %#v", calls)
 	}
 	state, err := LoadState(cfg.StatePath)
@@ -402,9 +388,6 @@ func TestClaudeProxyThrottleWithoutQuotaHeadersDoesNotSwitchRoute(t *testing.T) 
 	}
 	if usage := service.Accounts["a"].ProxyUsage; usage.HasLimits() || service.Accounts["a"].CredentialsError != "" {
 		t.Fatalf("a bare 429 recorded usage for a: %#v", service.Accounts["a"])
-	}
-	if usage := service.Accounts["b"].ProxyUsage; usage.FiveHour.Pct == nil || *usage.FiveHour.Pct != 10 {
-		t.Fatalf("account b usage = %#v", usage)
 	}
 }
 

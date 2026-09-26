@@ -48,7 +48,7 @@ var codexProxyNow = time.Now
 
 // codexQuotaMarkers are the error codes the ChatGPT backend attaches to a
 // 429 that means a subscription window is used up. Any other 429 is a
-// transient throttle that another account may not share.
+// transient throttle and records no usage.
 var codexQuotaMarkers = []string{"usage_limit_reached", "rate_limit_reached", "usage_not_included"}
 
 // ErrCodexRuntimeAuthIsReal reports that the runtime home's auth.json holds a
@@ -449,9 +449,8 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same policy as the Claude proxy: only a quota rejection or a dead
-	// token on the active account makes the fallback the selected route.
-	stickyFailover := true
+	// Same policy as the Claude proxy: only a rejected token moves the
+	// request to the next account, and a rate limit is relayed unchanged.
 	for index, route := range routes {
 		resp, err := p.forward(r, route, body)
 		if err != nil {
@@ -463,20 +462,16 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		unauthorized := resp.StatusCode == http.StatusUnauthorized
-		quotaRejected, throttled := false, false
-		if resp.StatusCode == http.StatusTooManyRequests {
+		rejected := resp.StatusCode == http.StatusTooManyRequests
+		quotaRejected := false
+		if rejected {
 			errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, codexProxyErrorBodyLimit))
 			_ = resp.Body.Close()
 			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
 			quotaRejected = codexQuotaRejected(errorBody)
-			throttled = !quotaRejected
 		}
-		rejected := quotaRejected || throttled
-		retry := (unauthorized || rejected) && index < len(routes)-1
-		if route.Active && throttled {
-			stickyFailover = false
-		}
-		switchTo := !retry && !unauthorized && !rejected && stickyFailover
+		retry := unauthorized && index < len(routes)-1
+		switchTo := !unauthorized && !rejected
 		var usage *UsageSnapshot
 		if quotaRejected {
 			// The rejection carries no numbers; ask the usage endpoint so the
@@ -489,14 +484,7 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.logf("codex proxy: record state for %s: %v", route.Account, err)
 		}
 		if retry {
-			reason := "usage limit reached"
-			switch {
-			case unauthorized:
-				reason = "token rejected"
-			case throttled:
-				reason = "throttled without a usage-limit error"
-			}
-			p.logf("codex proxy: %s for %s; retrying with %s", reason, route.Account, routes[index+1].Account)
+			p.logf("codex proxy: token rejected for %s; retrying with %s", route.Account, routes[index+1].Account)
 			_ = resp.Body.Close()
 			continue
 		}
@@ -763,7 +751,7 @@ func (p *CodexProxy) refreshUsageIfStale(route codexProxyRoute) {
 }
 
 // recordCodexProxyObservation stores what one real response revealed about an
-// account. switchTo makes the account the selected route after a failover.
+// account. switchTo makes the account the selected route after a rejected token.
 func recordCodexProxyObservation(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo bool) error {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {

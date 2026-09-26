@@ -11,22 +11,22 @@ existing process.
 
 ## Features
 
-- **Permanent account homes** — creates private per-account directories for
+- **Permanent account homes**: creates private per-account directories for
   `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, with commands to log in, print the
   environment, and launch a client in the selected home.
-- **Live usage tracking** — uses fresh provider usage data. Claude setup-token
+- **Live usage tracking**: uses fresh provider usage data. Claude setup-token
   accounts fall back to Claude's normal status-line response data when the
   OAuth usage endpoint rejects inference-only tokens.
-- **Quota-aware routing** — a monitor loop changes the preferred account when
-  the selected one crosses a configurable threshold, without mutating a
-  running provider's credentials.
-- **Live swapping through a local proxy** — an optional loopback auth proxy
-  holds the credentials, picks the account per request, fails over on a
-  rejected rate limit, and records real usage. Running Claude and Codex
-  sessions keep going across a switch.
-- **Safe by design** — cross-process locking, private `0700` homes, atomic
+- **Automatic account selection**: a monitor loop can change the preferred
+  account when the selected one crosses a configurable usage threshold. It
+  never changes a running provider's credentials.
+- **Switching without a restart**: an optional loopback auth proxy keeps real
+  credentials out of launched processes and sends each request with the
+  selected account's token. Running Claude and Codex sessions pick up a switch
+  on their next request. Rate-limit responses reach the client unchanged.
+- **Safe by design**: cross-process locking, private `0700` homes, atomic
   credential persistence, and non-destructive migration from old snapshots.
-- **Extensible** — any other service can be managed by listing its credential
+- **Extensible**: any other service can be managed by listing its credential
   files in the config; plug in a custom `usage_command` for usage probing.
 
 ## Installation
@@ -114,8 +114,7 @@ value auto-switching compares.
 | `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the least-used healthy account. |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
-| `monitor [-interval 5m] [-once] [-no-auto] [-no-warmup] [-verbose] [-proxy]` | Poll usage on a loop, auto-switch when thresholds are hit, and warm idle windows (`-no-warmup` skips warm-ups). Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
-| `warmup [-dry-run]` | Start every idle account's unstarted 5-hour or weekly window now; `-dry-run` only lists them. See [Warming idle windows](#warming-idle-windows). |
+| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
 | `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
 | `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
@@ -190,15 +189,16 @@ responses from other models because those do not consume it. An unused
 account keeps its last sample; a window counts as 0% once its reset time
 passes, and the proxy corrects the estimate on the first real response.
 
-When a response is rejected for a quota (`anthropic-ratelimit-unified-*-status:
-rejected`, or HTTP 429 with the unified headers), the proxy replays the
-buffered request against the least-used alternative and makes that account
-the selected route. The window named by `representative-claim` is recorded
-as 100% even when its utilization header still reads lower, so a rejected
-account is not retried on every request until its reset. A 429 without the unified headers is a transient throttle
-or a request Anthropic refuses for every account: the alternative still serves
-that one request, but the route does not change. A 401 marks the token
-rejected for 30 minutes.
+When Anthropic rejects a request for a usage limit
+(`anthropic-ratelimit-unified-*-status: rejected`, or HTTP 429 with the
+unified headers), the proxy returns that response to the client unchanged. It
+does not resend the request with another account. The window named by
+`representative-claim` is recorded as 100% even when its utilization header
+still reads lower. Until that window resets, the proxy ranks the account
+after accounts that have not reached a limit. A 429 without the unified
+headers is also returned unchanged and records no usage. A 401 marks the
+token rejected for 30 minutes, and the proxy sends that request with the next
+usable account.
 
 `shared_runtime_home: "native"` is only valid with `proxy_listen`. Proxy
 launches then leave `CLAUDE_CONFIG_DIR` alone, so Claude uses its own
@@ -254,11 +254,11 @@ missing or already a placeholder and refuses to overwrite a real login; run
 `codex` outside `home run` then fails to authenticate, so launch Codex
 through `home run` (or add the same `-c` values to `config.toml`).
 
-A 429 whose body names `usage_limit_reached` or `rate_limit_reached` is a
-quota rejection: the proxy asks `wham/usage` for that account so it ranks
-last with a real reset time, replays on the least-used alternative, and
-makes it the selected route. Any other 429 is retried without changing the
-route. A 401 marks the login rejected for 30 minutes. After successful
+Every 429 is returned to the client unchanged. When its body names
+`usage_limit_reached` or `rate_limit_reached`, the proxy also asks
+`wham/usage` for that account's reset time and ranks the account last until
+then. A 401 marks the login rejected for 30 minutes, and the proxy sends that
+request with the next usable account. After successful
 responses the proxy refreshes an account's usage from `wham/usage` at most
 every five minutes; the monitor's app-server probe keeps refreshing the
 stored tokens. Without the proxy, `home run` falls back to the selected
@@ -338,8 +338,8 @@ usage only when all of these hold:
 
 Proxy samples are trusted without an age limit, since an unused account's
 windows only fall until their reset. Both pacing rules are skipped when the
-active account is exhausted or its stored credentials stop working. The monitor escapes to the best healthy
-account on the next cycle. Claude accounts with missing, expired, rejected, or
+active account is exhausted or its stored credentials stop working. The
+monitor then moves to the best healthy account on the next cycle. Claude accounts with missing, expired, rejected, or
 unsafe setup tokens are never selected. Accounts without fresh trusted usage
 are also excluded. A manual
 `switch -account auto` always forces the best account immediately.
@@ -348,40 +348,6 @@ In account-home mode, switching updates routing state only. Existing launcher
 or CLI processes are not silently rebound; start the next command through
 `home run`. Explicit custom file-bundle services retain the legacy
 transactional switching behavior.
-
-## Warming idle windows
-
-Claude and Codex start an account's 5-hour and weekly windows on the first
-request after they reset, not on a fixed schedule. An account that sits idle
-past a reset has no clock running. When you do use it, you get the full
-window from that moment, and the reset lands later than it would have if the
-window had kept rolling.
-
-By default, each monitor cycle looks for account-home accounts whose windows
-have not started and sends each one the smallest request that counts:
-
-- **Claude**: a one-token Haiku message sent straight to Anthropic with the
-  account's setup token. The response's rate-limit headers are stored like a
-  proxy sample. A setup-token account the proxy has never served has no known
-  usage, so it is warmed once per five hours until a sample exists. The Fable
-  weekly window counts only Fable requests, so when that window has reset
-  unused the warm-up uses a Fable model instead, which starts all three.
-- **Codex**: one `codex exec --ephemeral --ignore-user-config` turn in the
-  account home with low reasoning effort. Codex reports an unstarted window as
-  0% used with a reset one full window away.
-
-A window counts as unstarted when its reset time is missing or has passed, or,
-for Codex, when it is floating at 0%. After a warm-up, the account is skipped
-for the length of each window it started. After a failure, it is skipped for
-15 minutes. Exhausted accounts and accounts with rejected credentials are
-never warmed; an exhausted Fable window only stops the Fable warm-up. A
-service's `warmup_model` overrides the model (Claude default
-`claude-haiku-4-5`, Codex default is the CLI's default model), and a Claude
-service's `warmup_fable_model` overrides the Fable one (default
-`claude-fable-5-1`).
-`subswapper warmup -dry-run` shows what the next cycle would warm. To turn
-warm-ups off, set `"warmup": false` in the `monitor` block or pass
-`monitor -no-warmup`.
 
 ## Configuration
 
@@ -408,10 +374,12 @@ The `monitor` block accepts these knobs (defaults shown):
   "auto_switch": true,
   "switch_threshold": 0.90,
   "min_improvement": 0.10,
-  "cooldown": "30m",
-  "warmup": true
+  "cooldown": "30m"
 }
 ```
+
+Configs written by older versions may still contain `warmup`,
+`warmup_model`, or `warmup_fable_model`. These keys are ignored.
 
 Top-level `backup_root` and `state_path` override where account homes and state
 are stored. (`backup_root` keeps its historical name for compatibility.)
@@ -577,7 +545,7 @@ To keep the monitor running, a systemd user unit works well:
 ```ini
 # ~/.config/systemd/user/subswapper.service
 [Unit]
-Description=subswapper account-home quota monitor
+Description=subswapper account-home usage monitor
 
 [Service]
 ExecStart=%h/go/bin/subswapper monitor

@@ -101,17 +101,3 @@ func withReset(window LimitWindow, value string) string {
 	}
 	return value + " reset " + window.ResetsAt.Local().Format("Jan02 15:04")
 }
-
-// RenderWarmupEvents prints one line per warm-up request.
-func RenderWarmupEvents(events []WarmupEvent) string {
-	var b strings.Builder
-	for _, event := range events {
-		key := event.Service + "/" + event.Account
-		if event.Err != nil {
-			fmt.Fprintf(&b, "error warm-up %s: %v\n", key, event.Err)
-			continue
-		}
-		fmt.Fprintf(&b, "warmed %s (%s)\n", key, strings.Join(event.Windows, ", "))
-	}
-	return b.String()
-}

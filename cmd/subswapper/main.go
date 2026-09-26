@@ -86,8 +86,6 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return runMonitor(args[1:], stdout)
 	case "proxy":
 		return runProxy(args[1:], stdout)
-	case "warmup":
-		return runWarmup(args[1:], stdout)
 	case "version", "-version", "--version":
 		return printVersion(stdout)
 	case "help", "-h", "--help":
@@ -854,62 +852,6 @@ func runStatus(args []string, stdout io.Writer) error {
 	return err
 }
 
-func runWarmup(args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("warmup", flag.ContinueOnError)
-	configPath := fs.String("config", defaultConfigPath, "config file")
-	dryRun := fs.Bool("dry-run", false, "list the accounts a warm-up would start without sending anything")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := subswapper.LoadConfig(*configPath)
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-
-	// Plan on fresh usage so a window started elsewhere is not warmed again.
-	if _, err := subswapper.StatusOnce(ctx, *cfg); err != nil {
-		return err
-	}
-	if *dryRun {
-		candidates, err := subswapper.PlanWarmups(ctx, *cfg)
-		if err != nil {
-			return err
-		}
-		if len(candidates) == 0 {
-			_, err = fmt.Fprintln(stdout, "every window is running; nothing to warm")
-			return err
-		}
-		for _, candidate := range candidates {
-			if _, err := fmt.Fprintf(stdout, "would warm %s/%s (%s)\n", candidate.Service, candidate.Account, strings.Join(candidate.Windows, ", ")); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	events, err := subswapper.WarmupOnce(ctx, *cfg)
-	if err != nil {
-		return err
-	}
-	if len(events) == 0 {
-		_, err = fmt.Fprintln(stdout, "every window is running; nothing to warm")
-		return err
-	}
-	if _, err := io.WriteString(stdout, subswapper.RenderWarmupEvents(events)); err != nil {
-		return err
-	}
-	var failed []error
-	for _, event := range events {
-		if event.Err != nil {
-			failed = append(failed, fmt.Errorf("%s/%s: %w", event.Service, event.Account, event.Err))
-		}
-	}
-	return errors.Join(failed...)
-}
-
 func runImportClaudeSwap(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("import-cswap", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath, "config file")
@@ -1065,7 +1007,8 @@ func runMonitor(args []string, stdout io.Writer) error {
 	interval := fs.Duration("interval", 0, "override monitor interval")
 	once := fs.Bool("once", false, "run one monitor cycle")
 	noAuto := fs.Bool("no-auto", false, "observe without switching")
-	noWarmup := fs.Bool("no-warmup", false, "never send warm-up requests to idle accounts")
+	// Accepted so existing service units keep starting; warm-up was removed.
+	_ = fs.Bool("no-warmup", false, "ignored")
 	verbose := fs.Bool("verbose", false, "print the full status table every cycle")
 	withProxy := fs.Bool("proxy", false, "also serve every auth proxy configured by proxy_listen")
 	if err := fs.Parse(args); err != nil {
@@ -1075,10 +1018,6 @@ func runMonitor(args []string, stdout io.Writer) error {
 	cfg, err := subswapper.LoadConfig(*configPath)
 	if err != nil {
 		return err
-	}
-	if *noWarmup {
-		disabled := false
-		cfg.Monitor.Warmup = &disabled
 	}
 	if *withProxy {
 		proxyServices := configuredProxyServices(*cfg, "")
@@ -1256,9 +1195,6 @@ func runMonitorLoop(
 				}
 			}
 		}
-		if _, err := io.WriteString(stdout, subswapper.RenderWarmupEvents(cycle.Warmups)); err != nil {
-			return err
-		}
 		if !once {
 			cycleError := summarizeCycleErrors(cycle.Errors)
 			switch {
@@ -1330,9 +1266,8 @@ Usage:
   subswapper remove -service claude|codex -account <name> [-force] [-delete-home]
   subswapper status [-config ~/.config/subswapper/config.json]
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
-  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-no-warmup] [-verbose] [-proxy]
+  subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]
   subswapper proxy [-config ~/.config/subswapper/config.json] [-service claude] [-listen 127.0.0.1:7878]
-  subswapper warmup [-config ~/.config/subswapper/config.json] [-dry-run]
   subswapper version`)
 	return err
 }

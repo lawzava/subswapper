@@ -355,12 +355,9 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A failover becomes the selected route only when the active account is
-	// really out of quota or its token is rejected. A 429 without unified
-	// rate-limit headers is a transient throttle (or a request Anthropic
-	// refuses for every account): the alternative still serves this request,
-	// but every session would pay a prompt-cache miss for a sticky switch.
-	stickyFailover := true
+	// Only a rejected token moves the request to the next account. A rate
+	// limit is relayed to the client unchanged; the proxy never replays a
+	// request on another account to get past one.
 	for index, route := range routes {
 		resp, err := p.forward(r, route, body)
 		if err != nil {
@@ -373,26 +370,14 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		observation := parseClaudeRateLimitHeaders(resp.Header, claudeProxyNow().UTC())
 		unauthorized := resp.StatusCode == http.StatusUnauthorized
-		quotaRejected := observation.Rejected || (resp.StatusCode == http.StatusTooManyRequests && observation.HasHeaders)
-		throttled := resp.StatusCode == http.StatusTooManyRequests && !quotaRejected
-		rejected := quotaRejected || throttled
-		retry := (unauthorized || rejected) && index < len(routes)-1
-		if route.Active && throttled {
-			stickyFailover = false
-		}
-		switchTo := !retry && !unauthorized && !rejected && stickyFailover
+		rejected := observation.Rejected || resp.StatusCode == http.StatusTooManyRequests
+		retry := unauthorized && index < len(routes)-1
+		switchTo := !unauthorized && !rejected
 		if err := recordClaudeProxyObservation(p.cfg, p.service, route, observation, unauthorized, switchTo); err != nil {
 			p.logf("claude proxy: record usage for %s: %v", route.Account, err)
 		}
 		if retry {
-			reason := "rate limit rejected"
-			switch {
-			case unauthorized:
-				reason = "token rejected"
-			case throttled:
-				reason = "throttled without quota headers"
-			}
-			p.logf("claude proxy: %s for %s; retrying with %s", reason, route.Account, routes[index+1].Account)
+			p.logf("claude proxy: token rejected for %s; retrying with %s", route.Account, routes[index+1].Account)
 			_ = resp.Body.Close()
 			continue
 		}
@@ -676,7 +661,7 @@ func trustedClaudeProxyUsage(usage UsageSnapshot, revision string) bool {
 }
 
 // recordClaudeProxyObservation stores what one real response revealed about
-// an account. switchTo makes the account the selected route after a failover.
+// an account. switchTo makes the account the selected route after a rejected token.
 func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claudeProxyRoute, observation claudeRateLimitObservation, unauthorized, switchTo bool) error {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {

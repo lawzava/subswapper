@@ -10,7 +10,6 @@ import (
 type CycleResult struct {
 	Results  []ServiceStatus
 	Switches []SwitchEvent
-	Warmups  []WarmupEvent
 	Errors   []error
 }
 
@@ -47,18 +46,6 @@ func StatusOnce(ctx context.Context, cfg Config) (CycleResult, error) {
 }
 
 func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
-	cycle := monitorUsageOnce(ctx, cfg, autoSwitch)
-	if cfg.Monitor.WarmupEnabled() {
-		warmups, err := WarmupOnce(ctx, cfg)
-		cycle.Warmups = warmups
-		if err != nil {
-			cycle.Errors = append(cycle.Errors, fmt.Errorf("warm-up: %w", err))
-		}
-	}
-	return cycle
-}
-
-func monitorUsageOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 	probed, results, err := collectUsageSnapshot(ctx, cfg)
 	if err != nil {
 		return CycleResult{Errors: []error{err}}

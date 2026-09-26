@@ -32,10 +32,8 @@ type MonitorConfig struct {
 	// It does not delay escaping an exhausted or broken active account.
 	// Default 30m.
 	Cooldown *Duration `json:"cooldown,omitempty"`
-	// Warmup sends a minimal request to every Claude or Codex account-home
-	// account whose five-hour or weekly window has not started, so an idle
-	// account's reset clock is already running when it is needed. On by
-	// default; each warm-up spends a sliver of quota.
+	// Warmup is ignored. The warm-up feature was removed; the key is still
+	// accepted so configs written by older versions keep loading.
 	Warmup *bool `json:"warmup,omitempty"`
 }
 
@@ -67,11 +65,8 @@ type ServiceConfig struct {
 	Files         []ManagedFile `json:"files,omitempty"`
 	UsageCommand  []string      `json:"usage_command,omitempty"`
 	Disabled      bool          `json:"disabled,omitempty"`
-	// WarmupModel is the model a warm-up request uses. Claude defaults to
-	// Haiku; Codex defaults to the CLI's own default model.
-	WarmupModel string `json:"warmup_model,omitempty"`
-	// WarmupFableModel is the Claude model that starts an idle Fable weekly
-	// window. Defaults to claude-fable-5-1.
+	// WarmupModel and WarmupFableModel are ignored, like MonitorConfig.Warmup.
+	WarmupModel      string `json:"warmup_model,omitempty"`
 	WarmupFableModel string `json:"warmup_fable_model,omitempty"`
 }
 
@@ -216,22 +211,6 @@ func (c Config) Validate() error {
 			}
 			fileNames[backupName] = struct{}{}
 		}
-		if service.WarmupModel != "" {
-			if !validWarmupModel(service.WarmupModel) {
-				return fmt.Errorf("service %q warmup_model %q is not a model name", service.Name, service.WarmupModel)
-			}
-			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {
-				return fmt.Errorf("service %q warmup_model requires Claude or Codex account_mode %q", service.Name, AccountModeHome)
-			}
-		}
-		if service.WarmupFableModel != "" {
-			if !validWarmupModel(service.WarmupFableModel) {
-				return fmt.Errorf("service %q warmup_fable_model %q is not a model name", service.Name, service.WarmupFableModel)
-			}
-			if !isClaudeService(service) || !service.UsesAccountHomes() {
-				return fmt.Errorf("service %q warmup_fable_model requires Claude account_mode %q", service.Name, AccountModeHome)
-			}
-		}
 		if len(service.UsageCommand) == 1 && service.UsageCommand[0] == "" {
 			return fmt.Errorf("service %q has an empty usage_command", service.Name)
 		}
@@ -277,14 +256,6 @@ func (c Config) Service(name string) (ServiceConfig, bool) {
 
 func (m MonitorConfig) AutoSwitchEnabled() bool {
 	return m.AutoSwitch == nil || *m.AutoSwitch
-}
-
-func validWarmupModel(model string) bool {
-	return strings.TrimSpace(model) == model && !strings.HasPrefix(model, "-")
-}
-
-func (m MonitorConfig) WarmupEnabled() bool {
-	return m.Warmup == nil || *m.Warmup
 }
 
 func (m MonitorConfig) SwitchThresholdRatio() float64 {

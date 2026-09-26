@@ -314,7 +314,7 @@ func readAllString(r *http.Request) (string, error) {
 	}
 }
 
-func TestCodexProxyFailsOverOnUsageLimitAndSwitchesRoute(t *testing.T) {
+func TestCodexProxyRelaysUsageLimitWithoutRetrying(t *testing.T) {
 	log := &codexCallLog{}
 	// Exhaustion is meaningful only before the window resets.
 	resetAt := time.Now().Add(24 * time.Hour).Unix()
@@ -342,12 +342,10 @@ func TestCodexProxyFailsOverOnUsageLimitAndSwitchesRoute(t *testing.T) {
 	cfg, proxy := setupCodexProxyAccounts(t, upstream.URL)
 
 	recorder := codexProxyRequest(t, proxy, proxy.placeholder.Token, `{"model":"gpt"}`)
-	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"type":"message"}` {
+	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "usage_limit_reached") {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	responses := log.responses()
-	if len(responses) != 2 || responses[0].Authorization != "Bearer chatgpt-token-a" || responses[1].Authorization != "Bearer chatgpt-token-b" ||
-		responses[1].AccountID != "acct-b" || responses[1].Body != `{"model":"gpt"}` {
+	if responses := log.responses(); len(responses) != 1 || responses[0].Authorization != "Bearer chatgpt-token-a" {
 		t.Fatalf("upstream responses calls = %#v", responses)
 	}
 	state, err := LoadState(cfg.StatePath)
@@ -355,25 +353,15 @@ func TestCodexProxyFailsOverOnUsageLimitAndSwitchesRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := state.Service("codex")
-	if service.ActiveAccount != "b" || service.LastSwitchedAt.IsZero() {
-		t.Fatalf("service state = %#v", service)
+	if service.ActiveAccount != "a" || !service.LastSwitchedAt.IsZero() {
+		t.Fatalf("a usage limit changed the route: %#v", service)
 	}
 	if usage := service.Accounts["a"].ProxyUsage; !usage.Exhausted() || usage.Weekly.ResetsAt.Unix() != resetAt {
 		t.Fatalf("account a usage = %#v", usage)
 	}
-
-	// The exhausted account ranks last, so the next request goes to b first.
-	recorder = codexProxyRequest(t, proxy, proxy.placeholder.Token, `{}`)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("second status = %d", recorder.Code)
-	}
-	responses = log.responses()
-	if len(responses) != 3 || responses[2].Authorization != "Bearer chatgpt-token-b" {
-		t.Fatalf("upstream responses calls = %#v", responses)
-	}
 }
 
-func TestCodexProxyThrottleDoesNotSwitchAndRejectedTokenIsMarked(t *testing.T) {
+func TestCodexProxyRelaysThrottleAndFailsOverOnRejectedToken(t *testing.T) {
 	// tokenARevoked flips the active account from throttled to dead without
 	// swapping the handler under running server goroutines.
 	var tokenARevoked atomic.Bool
@@ -401,7 +389,7 @@ func TestCodexProxyThrottleDoesNotSwitchAndRejectedTokenIsMarked(t *testing.T) {
 	cfg, proxy := setupCodexProxyAccounts(t, upstream.URL)
 
 	recorder := codexProxyRequest(t, proxy, proxy.placeholder.Token, `{}`)
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "slow down") {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 	state, err := LoadState(cfg.StatePath)
