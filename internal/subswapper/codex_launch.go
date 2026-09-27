@@ -1,6 +1,7 @@
 package subswapper
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +29,7 @@ func CodexProxyLaunchArgs(listen string) []string {
 	base := ClaudeProxyBaseURL(listen)
 	provider := "model_providers." + CodexProxyProviderID + "."
 	return []string{
-		"-c", "chatgpt_base_url=" + base + "/backend-api/",
+		"-c", "chatgpt_base_url=" + codexProxyBackendBaseURL(listen) + "/backend-api/",
 		"-c", "model_provider=" + CodexProxyProviderID,
 		"-c", provider + "name=OpenAI",
 		"-c", provider + "base_url=" + base + "/backend-api/codex",
@@ -37,6 +38,21 @@ func CodexProxyLaunchArgs(listen string) []string {
 		"-c", provider + "supports_websockets=false",
 		"-c", provider + "supports_standalone_web_search=true",
 	}
+}
+
+// codexProxyBackendBaseURL names the proxy by a second loopback host. Codex
+// 0.156+ moves a model provider that shares the chatgpt_base_url origin onto
+// the discovered workspace origin, which would send turns around the proxy.
+func codexProxyBackendBaseURL(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return ClaudeProxyBaseURL(listen)
+	}
+	alias := "localhost"
+	if host == "localhost" {
+		alias = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(alias, port)
 }
 
 // BuildCodexProxyLaunchEnvironment sets the runtime home and the routing

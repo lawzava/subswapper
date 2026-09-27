@@ -33,15 +33,18 @@ const (
 	// CodexProxyProviderID is the model provider a proxied launch selects.
 	// The built-in "openai" provider cannot be overridden, so a custom one
 	// with requires_openai_auth carries the ChatGPT identity to the proxy.
-	CodexProxyProviderID       = "subswapper"
-	defaultCodexProxyUpstream  = "https://chatgpt.com"
-	codexProxyAccountHeader    = "Chatgpt-Account-Id"
-	codexProxyUsagePath        = "/backend-api/wham/usage"
-	codexProxyErrorBodyLimit   = 1 << 20
-	codexProxyUsageTTL         = 5 * time.Minute
-	codexProxyPlaceholderFile  = "proxy-placeholder.json"
-	codexProxyUsageFetchLimit  = 1 << 20
-	codexProxyUsageFetchWindow = 10 * time.Second
+	CodexProxyProviderID      = "subswapper"
+	defaultCodexProxyUpstream = "https://chatgpt.com"
+	codexProxyAccountHeader   = "Chatgpt-Account-Id"
+	codexProxyUsagePath       = "/backend-api/wham/usage"
+	// codexProxyAccountsCheckPath is Codex's workspace routing discovery.
+	codexProxyAccountsCheckPath = "/backend-api/wham/accounts/check"
+	codexProxyAccountsBodyLimit = 1 << 20
+	codexProxyErrorBodyLimit    = 1 << 20
+	codexProxyUsageTTL          = 5 * time.Minute
+	codexProxyPlaceholderFile   = "proxy-placeholder.json"
+	codexProxyUsageFetchLimit   = 1 << 20
+	codexProxyUsageFetchWindow  = 10 * time.Second
 )
 
 var codexProxyNow = time.Now
@@ -494,6 +497,10 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !unauthorized && !rejected {
 			p.refreshUsageIfStale(route)
 		}
+		if r.URL.Path == codexProxyAccountsCheckPath && resp.StatusCode == http.StatusOK {
+			p.relayWorkspaceDiscovery(w, resp, route)
+			return
+		}
 		relayClaudeProxyResponse(w, resp)
 		return
 	}
@@ -529,8 +536,82 @@ func (p *CodexProxy) forward(r *http.Request, route codexProxyRoute, body []byte
 	if route.AccountID != "" {
 		req.Header.Set(codexProxyAccountHeader, route.AccountID)
 	}
+	if r.URL.Path == codexProxyAccountsCheckPath {
+		// relayWorkspaceDiscovery edits this body, so it must arrive plain.
+		req.Header.Del("Accept-Encoding")
+	}
 	req.Host = p.upstream.Host
 	return p.client.Do(req)
+}
+
+// relayWorkspaceDiscovery presents the routed account's workspace as the
+// placeholder's. Codex 0.156+ looks up its auth.json account ID in this list
+// before any turn and fails the whole session when it is missing.
+func (p *CodexProxy) relayWorkspaceDiscovery(w http.ResponseWriter, resp *http.Response, route codexProxyRoute) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, codexProxyAccountsBodyLimit))
+	_ = resp.Body.Close()
+	if err == nil {
+		origin := defaultCodexProxyUpstream
+		if p.upstream.Scheme == "https" {
+			origin = p.upstream.Scheme + "://" + p.upstream.Host
+		}
+		body, err = rewriteCodexWorkspaceDiscovery(body, route.AccountID, p.placeholder.AccountID, origin)
+	}
+	if err != nil {
+		p.logf("codex proxy: workspace discovery for %s: %v", route.Account, err)
+		writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "subswapper proxy could not read the accounts response")
+		return
+	}
+	resp.Header.Del("Content-Length")
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	relayClaudeProxyResponse(w, resp)
+}
+
+// rewriteCodexWorkspaceDiscovery renames the realID workspace to placeholderID
+// and keeps every other field. A NO_CONSTRAINT origin makes Codex fall back to
+// the chatgpt_base_url origin, which is the proxy's http address and fails
+// Codex's HTTPS check, so that entry gets the explicit upstream origin.
+func rewriteCodexWorkspaceDiscovery(body []byte, realID, placeholderID, origin string) ([]byte, error) {
+	var response map[string]json.RawMessage
+	if json.Unmarshal(body, &response) != nil {
+		return nil, errors.New("accounts response is malformed")
+	}
+	var accounts []map[string]json.RawMessage
+	if json.Unmarshal(response["accounts"], &accounts) != nil || accounts == nil {
+		return nil, errors.New("accounts response has no account list")
+	}
+	placeholder, _ := json.Marshal(placeholderID)
+	found := false
+	for _, account := range accounts {
+		var id string
+		if json.Unmarshal(account["id"], &id) != nil || id != realID {
+			continue
+		}
+		found = true
+		account["id"] = placeholder
+		var backend string
+		if raw, ok := account["workspace_backend_origin"]; !ok || (json.Unmarshal(raw, &backend) == nil && backend == "NO_CONSTRAINT") {
+			account["workspace_backend_origin"], _ = json.Marshal(origin)
+		}
+	}
+	if !found {
+		return nil, errors.New("accounts response does not list the routed account")
+	}
+	response["accounts"], _ = json.Marshal(accounts)
+	var defaultID string
+	if json.Unmarshal(response["default_account_id"], &defaultID) == nil && defaultID == realID {
+		response["default_account_id"] = placeholder
+	}
+	var ordering []string
+	if json.Unmarshal(response["account_ordering"], &ordering) == nil && ordering != nil {
+		for index, id := range ordering {
+			if id == realID {
+				ordering[index] = placeholderID
+			}
+		}
+		response["account_ordering"], _ = json.Marshal(ordering)
+	}
+	return json.Marshal(response)
 }
 
 // passThrough relays a request that carries no credentials. Nothing is

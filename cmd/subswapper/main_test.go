@@ -1258,7 +1258,8 @@ func TestRunHomeCodexLaunchesThroughProxyWithPlaceholderLogin(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, want := range []string{
-		"args=-c chatgpt_base_url=http://" + listen + "/backend-api/ -c model_provider=subswapper",
+		"args=-c chatgpt_base_url=http://localhost:" + listen[strings.LastIndex(listen, ":")+1:] + "/backend-api/ -c model_provider=subswapper",
+		"model_providers.subswapper.base_url=http://" + listen + "/backend-api/codex",
 		"supports_websockets=false",
 		" app-server --stdio\n",
 		"home=unset proxy=1 apikey=unset",

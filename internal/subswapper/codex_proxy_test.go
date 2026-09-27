@@ -302,6 +302,69 @@ func TestCodexProxySwapsIdentityAndPassesAnonymousCallsThrough(t *testing.T) {
 	}
 }
 
+func TestCodexProxyRewritesWorkspaceDiscoveryToPlaceholder(t *testing.T) {
+	var acceptEncoding atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != codexProxyAccountsCheckPath {
+			http.NotFound(w, r)
+			return
+		}
+		acceptEncoding.Store(r.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"accounts":[
+			{"id":"acct-team","plan_type":"team","workspace_backend_origin":"https://team.chatgpt.com","account_routing_override":"NO_CONSTRAINT"},
+			{"id":%q,"plan_type":"pro","is_zdr":false,"workspace_backend_origin":"NO_CONSTRAINT","account_routing_override":"NO_CONSTRAINT"}
+		],"default_account_id":%q,"account_ordering":["acct-team",%q]}`, codexAccountHeader(r), codexAccountHeader(r), codexAccountHeader(r))
+	}))
+	t.Cleanup(upstream.Close)
+	_, proxy := setupCodexProxyAccounts(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodGet, codexProxyAccountsCheckPath, nil)
+	req.Header.Set("Authorization", "Bearer "+proxy.placeholder.Token)
+	req.Header.Set(codexProxyAccountHeader, codexProxyPlaceholderAccountID)
+	req.Header.Set("Accept-Encoding", "gzip")
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	// The proxy must read the body, so upstream may not compress it.
+	if got, _ := acceptEncoding.Load().(string); got != "" {
+		t.Fatalf("upstream Accept-Encoding = %q", got)
+	}
+	var response struct {
+		Accounts []struct {
+			ID                     string `json:"id"`
+			PlanType               string `json:"plan_type"`
+			IsZDR                  *bool  `json:"is_zdr"`
+			WorkspaceBackendOrigin string `json:"workspace_backend_origin"`
+			AccountRoutingOverride string `json:"account_routing_override"`
+		} `json:"accounts"`
+		DefaultAccountID string   `json:"default_account_id"`
+		AccountOrdering  []string `json:"account_ordering"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("body = %s: %v", recorder.Body.String(), err)
+	}
+	if len(response.Accounts) != 2 {
+		t.Fatalf("accounts = %#v", response.Accounts)
+	}
+	other, selected := response.Accounts[0], response.Accounts[1]
+	if other.ID != "acct-team" || other.WorkspaceBackendOrigin != "https://team.chatgpt.com" {
+		t.Fatalf("unrelated workspace changed: %#v", other)
+	}
+	// Codex matches the placeholder account ID and needs an HTTPS origin; the
+	// proxy's own http address would fail its origin check.
+	if selected.ID != codexProxyPlaceholderAccountID || selected.PlanType != "pro" || selected.IsZDR == nil ||
+		selected.WorkspaceBackendOrigin != defaultCodexProxyUpstream || selected.AccountRoutingOverride != "NO_CONSTRAINT" {
+		t.Fatalf("selected workspace = %#v", selected)
+	}
+	if response.DefaultAccountID != codexProxyPlaceholderAccountID ||
+		strings.Join(response.AccountOrdering, ",") != "acct-team,"+codexProxyPlaceholderAccountID {
+		t.Fatalf("default = %q, ordering = %q", response.DefaultAccountID, response.AccountOrdering)
+	}
+}
+
 func readAllString(r *http.Request) (string, error) {
 	var b strings.Builder
 	buf := make([]byte, 4096)
@@ -472,8 +535,10 @@ func TestParseCodexWhamUsage(t *testing.T) {
 func TestCodexProxyLaunchArgsAndEnvironment(t *testing.T) {
 	args := CodexProxyLaunchArgs("127.0.0.1:7879")
 	joined := strings.Join(args, " ")
+	// Codex moves a provider that shares the chatgpt_base_url origin onto the
+	// discovered workspace origin, so the two must name the proxy differently.
 	for _, want := range []string{
-		"-c chatgpt_base_url=http://127.0.0.1:7879/backend-api/",
+		"-c chatgpt_base_url=http://localhost:7879/backend-api/",
 		"-c model_provider=subswapper",
 		"-c model_providers.subswapper.base_url=http://127.0.0.1:7879/backend-api/codex",
 		"-c model_providers.subswapper.requires_openai_auth=true",
@@ -481,6 +546,15 @@ func TestCodexProxyLaunchArgsAndEnvironment(t *testing.T) {
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("launch args %q lack %q", joined, want)
+		}
+	}
+	joined = strings.Join(CodexProxyLaunchArgs("localhost:7879"), " ")
+	for _, want := range []string{
+		"-c chatgpt_base_url=http://127.0.0.1:7879/backend-api/",
+		"-c model_providers.subswapper.base_url=http://localhost:7879/backend-api/codex",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("localhost launch args %q lack %q", joined, want)
 		}
 	}
 	env := BuildCodexProxyLaunchEnvironment([]string{"PATH=/bin", "CODEX_API_KEY=sk-x", "CODEX_HOME=/old", "SUBSWAPPER_PROXY=stale"}, "", map[string]string{"SUBSWAPPER_PROXY": "1"})
