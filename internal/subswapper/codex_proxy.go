@@ -85,7 +85,7 @@ type codexProxyRoute struct {
 	Token     string
 	AccountID string
 	Active    bool
-	Score     float64
+	Usage     UsageSnapshot
 	Exhausted bool
 }
 
@@ -652,7 +652,7 @@ func codexQuotaRejected(body []byte) bool {
 }
 
 // codexProxyRoutes lists accounts whose home holds a ChatGPT login: the
-// selected account first, then the least-used alternatives, exhausted last.
+// selected account first, then the alternatives in drain order, exhausted last.
 func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, error) {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
@@ -679,14 +679,14 @@ func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, err
 			Token:     token,
 			AccountID: accountID,
 			Active:    serviceState.ActiveAccount == name,
-			Score:     math.Inf(1),
 		}
 		if usage, ok := codexProxyKnownUsage(account); ok {
-			route.Score = usage.Score()
+			route.Usage = usage
 			route.Exhausted = usage.Exhausted()
 		}
 		routes = append(routes, route)
 	}
+	threshold := cfg.Monitor.SwitchThresholdRatio()
 	sort.SliceStable(routes, func(i, j int) bool {
 		left, right := routes[i], routes[j]
 		if left.Exhausted != right.Exhausted {
@@ -695,8 +695,8 @@ func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, err
 		if left.Active != right.Active {
 			return left.Active
 		}
-		if left.Score != right.Score {
-			return left.Score < right.Score
+		if order := compareDrainOrder(left.Usage, right.Usage, threshold, now); order != 0 {
+			return order < 0
 		}
 		return left.Account < right.Account
 	})

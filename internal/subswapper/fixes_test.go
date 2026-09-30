@@ -1925,3 +1925,24 @@ func TestSwitchRestoresFilesWithOwnerOnlyPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestShouldAutoSwitchLeavesHealthyActiveForEarlierWeeklyReset(t *testing.T) {
+	now := time.Now().UTC()
+	active := weeklyResetStatusForTest("a", 14, 36, now.Add(72*time.Hour))
+	active.Active = true
+	soon := weeklyResetStatusForTest("b", 0, 49, now.Add(9*time.Hour))
+	idle := weeklyResetStatusForTest("c", 0, 0, time.Time{})
+	aged := now.Add(-defaultAutoSwitchCooldown - time.Minute)
+
+	result := ServiceStatus{Accounts: []AccountStatus{active, soon}}
+	if !shouldAutoSwitch(MonitorConfig{}, result, soon, aged, now) {
+		t.Fatal("expected a switch to the account whose weekly window resets first")
+	}
+	if shouldAutoSwitch(MonitorConfig{}, result, soon, now.Add(-time.Minute), now) {
+		t.Fatal("expected the cooldown to pace an optimization switch")
+	}
+	result = ServiceStatus{Accounts: []AccountStatus{active, idle}}
+	if shouldAutoSwitch(MonitorConfig{}, result, idle, aged, now) {
+		t.Fatal("expected no switch from a running weekly window to an idle account")
+	}
+}

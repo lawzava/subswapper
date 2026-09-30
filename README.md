@@ -67,7 +67,7 @@ subswapper home token set -service claude -account work
 # See every account's usage windows
 subswapper status
 
-# Select a preferred account, or let subswapper pick the least-used one
+# Select a preferred account, or let subswapper pick the best one
 subswapper switch -service claude -account work
 subswapper switch -service all -account auto
 
@@ -94,8 +94,8 @@ codex      personal                 yes     91% reset Jul02 16:30        44% res
 ```
 
 `FABLE5` is the weekly window scoped to Claude's Fable models (`-` until a
-Fable response has been seen through the proxy). `SCORE` is the worst of an account's windows — the
-value auto-switching compares.
+Fable response has been seen through the proxy). `SCORE` is the worst of an account's windows; it breaks
+ranking ties and paces switches away from an account at the threshold.
 
 ## Commands
 
@@ -111,7 +111,7 @@ value auto-switching compares.
 | `home proxy-auth -service codex` | Move a real ChatGPT login out of the Codex runtime home and install the proxy placeholder login (backup kept). |
 | `home migrate` | Copy legacy snapshots into native home filenames without deleting or overwriting files. |
 | `capture -service <name> -account <name> [-email <label>]` | Import the current login into a home; retained for migration and bundle-mode services. |
-| `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the least-used healthy account. |
+| `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the best healthy account (see [How auto-switching works](#how-auto-switching-works)). |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
@@ -325,16 +325,28 @@ the original per-account behavior.
 
 ## How auto-switching works
 
-`monitor` evaluates every service each cycle. With automatic switching
-enabled, a service moves to the captured account with the lowest worst-window
-usage only when all of these hold:
+Weekly quota left unused at a reset is lost, so subswapper drains the account
+whose weekly window resets first. It ranks healthy accounts in this order:
 
-- the active account has reached the switch threshold (default **90%**) in its
-  5-hour, weekly, or Fable weekly window;
-- the best alternative improves the worst-window score by at least the minimum
-  improvement (default **10 percentage points**);
-- the cooldown since the service last switched accounts — manually or
-  automatically — has passed (default **30 minutes**).
+1. accounts below the switch threshold (default **90%**) in every window,
+   earliest running weekly reset first;
+2. accounts below the threshold with no running weekly window (the reset time
+   has passed or is unknown), since waiting costs them nothing;
+3. accounts at or above the threshold, lowest worst-window score first.
+
+Ties go to the lower worst-window score, then the lower average, then the name.
+The proxies use the same order for fallback routes after the selected account.
+
+`monitor` evaluates every service each cycle. With automatic switching
+enabled, a service moves to the best-ranked account only when the cooldown
+since the service last switched accounts, manually or automatically, has
+passed (default **30 minutes**), and one of these holds:
+
+- the active account is below the switch threshold, and the best account is
+  also below it and has an earlier running weekly reset;
+- the active account has reached the switch threshold in its 5-hour, weekly,
+  or Fable weekly window, and the best account improves the worst-window score
+  by at least the minimum improvement (default **10 percentage points**).
 
 Proxy samples are trusted without an age limit, since an unused account's
 windows only fall until their reset. Both pacing rules are skipped when the

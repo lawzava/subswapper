@@ -595,3 +595,36 @@ func TestCodexProxyConfigValidation(t *testing.T) {
 		t.Fatal("placeholder created for a Claude service")
 	}
 }
+
+func TestCodexProxyRoutesOrderFallbacksByWeeklyReset(t *testing.T) {
+	cfg, _ := setupCodexProxyAccounts(t, "https://chatgpt.com")
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	service := state.Service("codex")
+	writeCodexTestLogin(t, cfg, "c", "chatgpt-token-c", "acct-c")
+	b := service.Accounts["b"]
+	b.Usage = weeklyResetStatusForTest("b", 0, 10, now.Add(120*time.Hour)).Account.Usage
+	service.Accounts["b"] = b
+	service.Accounts["c"] = AccountState{
+		Name:    "c",
+		AddedAt: now,
+		Usage:   weeklyResetStatusForTest("c", 0, 50, now.Add(20*time.Hour)).Account.Usage,
+	}
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := codexProxyRoutes(cfg, cfg.Services[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, route := range routes {
+		order = append(order, route.Account)
+	}
+	if strings.Join(order, ",") != "a,c,b" {
+		t.Fatalf("route order = %v, want the active route, then the earliest weekly reset", order)
+	}
+}

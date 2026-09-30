@@ -72,7 +72,7 @@ type claudeProxyRoute struct {
 	Token     string
 	Revision  string
 	Active    bool
-	Score     float64
+	Usage     UsageSnapshot
 	Exhausted bool
 }
 
@@ -585,7 +585,7 @@ func parseClaudeRateLimitWindow(header http.Header, name string) (LimitWindow, b
 }
 
 // claudeProxyRoutes lists accounts with usable setup tokens: the selected
-// account first, then the least-used alternatives, exhausted accounts last.
+// account first, then the alternatives in drain order, exhausted accounts last.
 func claudeProxyRoutes(cfg Config, service ServiceConfig) ([]claudeProxyRoute, error) {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
@@ -615,14 +615,14 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig) ([]claudeProxyRoute, e
 			Token:    token,
 			Revision: status.Revision,
 			Active:   serviceState.ActiveAccount == name,
-			Score:    math.Inf(1),
 		}
 		if usage, ok := claudeProxyKnownUsage(account, status.Revision); ok {
-			route.Score = usage.Score()
+			route.Usage = usage
 			route.Exhausted = usage.Exhausted()
 		}
 		routes = append(routes, route)
 	}
+	threshold := cfg.Monitor.SwitchThresholdRatio()
 	sort.SliceStable(routes, func(i, j int) bool {
 		left, right := routes[i], routes[j]
 		if left.Exhausted != right.Exhausted {
@@ -631,8 +631,8 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig) ([]claudeProxyRoute, e
 		if left.Active != right.Active {
 			return left.Active
 		}
-		if left.Score != right.Score {
-			return left.Score < right.Score
+		if order := compareDrainOrder(left.Usage, right.Usage, threshold, now); order != 0 {
+			return order < 0
 		}
 		return left.Account < right.Account
 	})

@@ -73,7 +73,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 			if result.Service.Disabled || len(serviceState.Accounts) == 0 {
 				continue
 			}
-			best, ok := BestAccount(result.Accounts)
+			best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio())
 			if !ok {
 				cycle.Errors = append(cycle.Errors, fmt.Errorf("service %q has no selectable accounts", result.Service.Name))
 				continue
@@ -146,7 +146,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 			continue
 		}
 		result := results[index]
-		best, ok := BestAccount(result.Accounts)
+		best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio())
 		if !ok {
 			err := fmt.Errorf("service %q has no selectable accounts", service.Name)
 			if !all {
@@ -258,13 +258,17 @@ func shouldAutoSwitch(monitor MonitorConfig, result ServiceStatus, best AccountS
 		// optimization switches between healthy accounts.
 		return true
 	}
-	if !active.Account.Usage.AtOrAbove(monitor.SwitchThresholdRatio()) {
+	if !lastSwitchedAt.IsZero() && now.Before(lastSwitchedAt.Add(monitor.CooldownDuration())) {
 		return false
 	}
-	if active.Score-best.Score < monitor.MinImprovementRatio() {
-		return false
+	threshold := monitor.SwitchThresholdRatio()
+	if active.Account.Usage.AtOrAbove(threshold) {
+		return active.Score-best.Score >= monitor.MinImprovementRatio()
 	}
-	return lastSwitchedAt.IsZero() || !now.Before(lastSwitchedAt.Add(monitor.CooldownDuration()))
+	// A healthy active account yields only to one whose unused weekly quota
+	// expires sooner. Reset times do not move with use, so this cannot flap.
+	return !best.Account.Usage.AtOrAbove(threshold) &&
+		compareWeeklyExpiry(best.Account.Usage, active.Account.Usage, now) < 0
 }
 
 func activeAccountStatus(result ServiceStatus) (AccountStatus, bool) {

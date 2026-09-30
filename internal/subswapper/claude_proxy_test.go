@@ -262,11 +262,13 @@ func TestClaudeProxyPrefersLeastUsedAlternativeOnRejectedToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Equal resets leave the choice to usage.
+	fiveHourReset, weeklyReset := time.Now().Add(time.Hour), time.Now().Add(24*time.Hour)
 	for name, pct := range map[string]float64{"b": 70, "c": 20} {
 		account := state.Service("claude").Accounts[name]
 		account.ProxyUsage = UsageSnapshot{
-			FiveHour:      LimitWindow{Pct: PtrFloat64(pct), ResetsAt: time.Now().Add(time.Hour)},
-			Weekly:        LimitWindow{Pct: PtrFloat64(pct), ResetsAt: time.Now().Add(24 * time.Hour)},
+			FiveHour:      LimitWindow{Pct: PtrFloat64(pct), ResetsAt: fiveHourReset},
+			Weekly:        LimitWindow{Pct: PtrFloat64(pct), ResetsAt: weeklyReset},
 			ObservedAt:    time.Now().UTC().Add(-48 * time.Hour),
 			Source:        claudeUsageSourceProxy,
 			TokenRevision: account.SetupTokenRevision,
