@@ -728,3 +728,25 @@ func TestMonitorMergeKeepsProxyUsageAndSwitchesOnIt(t *testing.T) {
 		t.Fatalf("proxy usage for a was lost: %#v", usage)
 	}
 }
+
+func TestClaudeProxyKeepsMonitorSwitchMadeDuringRequest(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
+	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
+		// The monitor moves the route while a's response is still streaming.
+		selectProxyTestAccount(t, cfg, "b")
+		rateLimitHeaders(w, 0.1, 0.1, "allowed")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{}`); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service := state.Service("claude"); service.ActiveAccount != "b" {
+		t.Fatalf("a finished request reverted the monitor's switch: active = %q", service.ActiveAccount)
+	}
+}

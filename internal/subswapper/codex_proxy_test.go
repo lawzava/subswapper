@@ -628,3 +628,38 @@ func TestCodexProxyRoutesOrderFallbacksByWeeklyReset(t *testing.T) {
 		t.Fatalf("route order = %v, want the active route, then the earliest weekly reset", order)
 	}
 }
+
+func TestCodexProxyKeepsMonitorSwitchMadeDuringRequest(t *testing.T) {
+	var cfg Config
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == codexProxyUsagePath {
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1788780407}}}`))
+			return
+		}
+		// The monitor moves the route while a's response is still streaming.
+		state, err := LoadState(cfg.StatePath)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		state.Service("codex").ActiveAccount = "b"
+		if err := SaveState(cfg.StatePath, state); err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	cfg, proxy := setupCodexProxyAccounts(t, upstream.URL)
+
+	if recorder := codexProxyRequest(t, proxy, proxy.placeholder.Token, `{}`); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service := state.Service("codex"); service.ActiveAccount != "b" {
+		t.Fatalf("a finished request reverted the monitor's switch: active = %q", service.ActiveAccount)
+	}
+}

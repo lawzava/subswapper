@@ -474,7 +474,10 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			quotaRejected = codexQuotaRejected(errorBody)
 		}
 		retry := unauthorized && index < len(routes)-1
-		switchTo := !unauthorized && !rejected
+		// Only a fallback that served the request takes over the route. The
+		// route that was selected at dispatch must not reclaim it, or a long
+		// response would undo a switch made while it streamed.
+		switchTo := !unauthorized && !rejected && !route.Active
 		var usage *UsageSnapshot
 		if quotaRejected {
 			// The rejection carries no numbers; ask the usage endpoint so the
@@ -491,7 +494,7 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = resp.Body.Close()
 			continue
 		}
-		if switchTo && !route.Active {
+		if switchTo {
 			p.logf("codex proxy: switched %s to %s", p.service.Name, route.Account)
 		}
 		if !unauthorized && !rejected {

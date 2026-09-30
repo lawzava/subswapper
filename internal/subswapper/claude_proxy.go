@@ -372,7 +372,10 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		unauthorized := resp.StatusCode == http.StatusUnauthorized
 		rejected := observation.Rejected || resp.StatusCode == http.StatusTooManyRequests
 		retry := unauthorized && index < len(routes)-1
-		switchTo := !unauthorized && !rejected
+		// Only a fallback that served the request takes over the route. The
+		// route that was selected at dispatch must not reclaim it, or a long
+		// response would undo a switch made while it streamed.
+		switchTo := !unauthorized && !rejected && !route.Active
 		if err := recordClaudeProxyObservation(p.cfg, p.service, route, observation, unauthorized, switchTo); err != nil {
 			p.logf("claude proxy: record usage for %s: %v", route.Account, err)
 		}
@@ -381,7 +384,7 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = resp.Body.Close()
 			continue
 		}
-		if switchTo && !route.Active {
+		if switchTo {
 			p.logf("claude proxy: switched %s to %s", p.service.Name, route.Account)
 		}
 		relayClaudeProxyResponse(w, resp)
