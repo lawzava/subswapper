@@ -3,31 +3,28 @@
 [![CI](https://github.com/lawzava/subswapper/actions/workflows/ci.yml/badge.svg)](https://github.com/lawzava/subswapper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`subswapper` is a small Go CLI that manages isolated [Claude Code](https://claude.com/claude-code)
-and [Codex](https://openai.com/codex/) account homes on one machine. Claude
-launches use a separate long-lived setup token for each account. Subswapper
-tracks trusted usage and chooses a home without changing credentials in an
-existing process.
+`subswapper` lets [Claude Code](https://claude.com/claude-code) and
+[Codex](https://openai.com/codex/) share several Claude and ChatGPT
+subscriptions. A local proxy sends each request with the selected account's
+token, so running sessions move to another account on their next request.
+One machine can hold every account and serve them to your other machines over
+Tailscale.
 
 ## Features
 
-- **Permanent account homes**: creates private per-account directories for
-  `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, with commands to log in, print the
-  environment, and launch a client in the selected home.
-- **Live usage tracking**: uses fresh provider usage data. Claude setup-token
-  accounts fall back to Claude's normal status-line response data when the
-  OAuth usage endpoint rejects inference-only tokens.
-- **Automatic account selection**: a monitor loop can change the preferred
-  account when the selected one crosses a configurable usage threshold. It
-  never changes a running provider's credentials.
-- **Switching without a restart**: an optional loopback auth proxy keeps real
-  credentials out of launched processes and sends each request with the
-  selected account's token. Running Claude and Codex sessions pick up a switch
-  on their next request. Rate-limit responses reach the client unchanged.
-- **Safe by design**: cross-process locking, private `0700` homes, atomic
-  credential persistence, and non-destructive migration from old snapshots.
-- **Extensible**: any other service can be managed by listing its credential
-  files in the config; plug in a custom `usage_command` for usage probing.
+- **One-command setup**: `setup local` for one machine, `setup hub` and
+  `setup client` for several, `doctor` to check everything and print fixes.
+- **One-command accounts**: `add claude <name>` and `add codex <name>` run the
+  provider's sign-in and register the account, from any machine.
+- **Switching without a restart**: running sessions pick up a switch on their
+  next request. Real tokens never enter the provider process.
+- **Automatic selection**: a monitor drains the account whose weekly quota
+  resets first and moves away from an account near its limit.
+- **Hub across machines**: accounts live on one machine, only that machine
+  refreshes tokens, and every client's API traffic leaves from its network.
+- **Paseo plugin**: usage in every workspace header and one-click switching.
+- **Safe by design**: cross-process locking, `0600` credentials under `0700`
+  directories, atomic writes, and launches that fail closed when a hub is down.
 
 ## Installation
 
@@ -37,365 +34,190 @@ Requires Go 1.26.6 or newer.
 go install github.com/lawzava/subswapper/cmd/subswapper@latest
 ```
 
-Or build from source:
-
-```sh
-git clone https://github.com/lawzava/subswapper.git
-cd subswapper
-go build ./cmd/subswapper
-```
-
-For Codex usage probing, the `codex` CLI must be on `PATH` (see
-[Usage probes](#usage-probes)).
+Codex accounts need the `codex` CLI on `PATH` of the machine that holds them;
+the monitor uses it to read usage and refresh logins.
 
 ## Quick start
 
+### One machine
+
 ```sh
-# Create the default config (Claude Code + Codex)
-subswapper init
-
-# Create permanent homes
-subswapper home create -service claude -account personal
-subswapper home create -service codex  -account personal
-subswapper home login  -service codex  -account personal
-
-# Store each pre-created Claude setup token through a hidden prompt
-subswapper home token set -service claude -account personal
-subswapper home create -service claude -account work
-subswapper home token set -service claude -account work
-
-# See every account's usage windows
+subswapper setup local          # config, auth proxies, systemd user services
+subswapper add claude work      # runs `claude setup-token`, then asks for the token
+subswapper add codex personal   # runs `codex login` in a throwaway home
+subswapper claude               # Claude Code through subswapper
+subswapper codex                # Codex through subswapper
 subswapper status
-
-# Select a preferred account, or let subswapper pick the best one
-subswapper switch -service claude -account work
-subswapper switch -service all -account auto
-
-# Run a client with the selected account home
-subswapper home run -service claude -- claude
-
-# Add missing shared user-configuration links to an existing Claude home
-subswapper home repair -service claude -account work
-
-# Keep the preferred route current in the background
-subswapper monitor
 ```
 
-`status` prints one row per registered account:
+### Several machines
 
-```
-subswapper status 2026-07-02T14:07:31Z
-
-SERVICE    ACCOUNT                  SELECTED  5H                           WEEKLY                       FABLE5                       SCORE    STATE
--------    -------                  --------  --                           ------                       ------                       -----    -----
-claude     personal                 yes     62% reset Jul02 15:00        31% reset Jul05 23:00        18% reset Jul05 23:00        62%      ready
-claude     work                             12% reset Jul02 19:00        8% reset Jul07 11:00         4% reset Jul07 11:00         12%      ready
-codex      personal                 yes     91% reset Jul02 16:30        44% reset Jul06 09:00        -                            91%      ready
-```
-
-`FABLE5` is the weekly window scoped to Claude's Fable models (`-` until a
-Fable response has been seen through the proxy). `SCORE` is the worst of an account's windows; it breaks
-ranking ties and paces switches away from an account at the threshold.
-
-## Commands
-
-| Command | Description |
-| --- | --- |
-| `init` | Write a starter config file. |
-| `home create -service <name> -account <name> [-email <label>]` | Create and register a private account home. New Claude homes inherit allowlisted user configuration. |
-| `home repair -service claude [-account <name>]` | Add missing allowlisted user-configuration links without replacing existing entries. |
-| `home token set\|status\|remove -service claude [-account <name>]` | Manage a Claude setup token without printing its value. `set` accepts the token only through stdin or a hidden prompt. |
-| `home login -service <name> [-account <name>]` | Run the provider's legacy login command in that account home. Do not use this for setup-token routing. |
-| `home path\|env -service <name> [-account <name>]` | Print a home path or shell export for configuring other tools. |
-| `home run -service <name> [-account <name>] [-- command...]` | Run a command with the selected account's home environment, or through the service's proxy when one is configured. |
-| `home proxy-auth -service codex` | Move a real ChatGPT login out of the Codex runtime home and install the proxy placeholder login (backup kept). |
-| `home migrate` | Copy legacy snapshots into native home filenames without deleting or overwriting files. |
-| `capture -service <name> -account <name> [-email <label>]` | Import the current login into a home; retained for migration and bundle-mode services. |
-| `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the best healthy account (see [How auto-switching works](#how-auto-switching-works)). |
-| `switch -service all -account auto` | Auto-pick the best account for every service at once. |
-| `status` (alias `list`) | Show every captured account with usage windows, score, and state. On a hub client, show the hub's accounts. |
-| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
-| `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
-| `hub export [-service <name>] [-host <name>] -out <file\|->` | Write a bundle that lets another machine use this machine's proxies over Tailscale (see [Hub mode](#hub-mode-across-machines)). |
-| `hub import -in <file\|->` | Make this machine a hub client from a bundle. |
-| `hub connect <hub address>` | Fetch the bundle from a hub with `hub_enroll` and make this machine its client. |
-| `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
-| `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
-| `version` | Print the subswapper version. |
-
-All commands accept `-config <path>` (default
-`~/.config/subswapper/config.json` on Linux).
-
-## Using homes with external launchers
-
-Configure any process supervisor or agent launcher to start Claude through
-Subswapper:
-
-```sh
-subswapper home run -service claude -- claude
-```
-
-Subswapper selects the routed account for each new process. It injects the
-account's setup token, a controlled `CLAUDE_CONFIG_DIR`, and, for fixed-token
-launches, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. Proxy launches skip the scrub
-unless the service sets `proxy_env_scrub: true`: Claude Code treats the scrub
-as a hard sandbox, runs every Bash command confined, ignores
-`dangerouslyDisableSandbox`, and masks `~/.gnupg` and `~/.ssh`, which breaks
-signed commits. It removes conflicting Anthropic,
-Bedrock, Vertex, and Foundry variables described by Anthropic's
-[environment guide](https://code.claude.com/docs/en/env-vars). Changing the
-route does not change an existing agent.
-
-For Codex launchers that support shadow homes, use a shared `CODEX_HOME`
-(normally `~/.codex`) and each Subswapper Codex account path as its shadow
-home. This keeps every `auth.json` private while the launcher shares sessions.
-
-Without the proxy below, a process keeps the token it was launched with.
-Start a new process through `home run` to use a newly selected account.
-
-### Live account swapping through the local proxy
-
-Set `proxy_listen` on the Claude service and run the proxy next to the
-monitor:
-
-```json
-{
-  "name": "claude",
-  "kind": "claude",
-  "account_mode": "home",
-  "proxy_listen": "127.0.0.1:7878",
-  "shared_runtime_home": "native"
-}
-```
-
-```sh
-subswapper monitor -interval 5m -proxy   # or: subswapper proxy
-subswapper home run -service claude -- claude
-```
-
-While the proxy is reachable, `home run` launches Claude with
-`ANTHROPIC_BASE_URL` pointing at the proxy and a per-install placeholder
-secret in `CLAUDE_CODE_OAUTH_TOKEN`. Real setup tokens never enter the
-process environment. For every request the proxy replaces the bearer token
-with the selected account's token, so `switch` and the monitor take effect on
-the next request of every running session. If the proxy is down, `home run`
-warns and falls back to a fixed-token launch.
-
-The proxy reads Anthropic's `anthropic-ratelimit-unified-*` response headers
-and stores them as `proxy_usage` for the account that served the request.
-This is the usage source for setup-token accounts, which the OAuth usage
-endpoint rejects. The `5h` and `7d` windows arrive on every response. The
-`7d_oi` window (Anthropic's "7-day overage-included" claim, shown by Claude
-Code as the Fable limit) arrives only on responses served by a Fable model;
-it fills the `FABLE5` column, counts toward the score, and is kept across
-responses from other models because those do not consume it. An unused
-account keeps its last sample; a window counts as 0% once its reset time
-passes, and the proxy corrects the estimate on the first real response.
-
-When Anthropic rejects a request for a usage limit
-(`anthropic-ratelimit-unified-*-status: rejected`, or HTTP 429 with the
-unified headers), the proxy returns that response to the client unchanged. It
-does not resend the request with another account. The window named by
-`representative-claim` is recorded as 100% even when its utilization header
-still reads lower. Until that window resets, the proxy ranks the account
-after accounts that have not reached a limit. A 429 without the unified
-headers is also returned unchanged and records no usage. A 401 marks the
-token rejected for 30 minutes, and the proxy sends that request with the next
-usable account.
-
-`shared_runtime_home: "native"` is only valid with `proxy_listen`. Proxy
-launches then leave `CLAUDE_CONFIG_DIR` alone, so Claude uses its own
-`~/.claude`: settings, hooks, plugins, skills, MCP servers and their OAuth
-state, transcripts, `--resume`, and auto-memory are the same for every
-account and for plain `claude`. The account homes are still used when the
-proxy is down, because a fixed-token launch must not touch the native home.
-Any other absolute `shared_runtime_home` keeps a separate managed directory.
-
-The listen address must be a loopback address; the port is fixed so launched
-processes can find it. Requests without the placeholder secret get 401.
-Request bodies are buffered up to 64 MiB for replay. Each switch costs one
-prompt-cache miss.
-
-### Live Codex account swapping through the local proxy
-
-The same proxy exists for Codex ChatGPT logins:
-
-```json
-{
-  "name": "codex",
-  "kind": "codex",
-  "account_mode": "home",
-  "proxy_listen": "127.0.0.1:7879",
-  "shared_runtime_home": "native"
-}
-```
-
-```sh
-subswapper capture -service codex -account main2      # register the current ~/.codex login
-subswapper home proxy-auth -service codex             # replace ~/.codex/auth.json with the placeholder
-subswapper monitor -interval 5m -proxy
-subswapper home run -service codex -- codex
-```
-
-Codex cannot be pointed at a proxy by environment alone. `home run` therefore
-inserts global `-c` overrides before the Codex subcommand: `chatgpt_base_url`
-and a custom model provider named `subswapper` with `requires_openai_auth`,
-because Codex refuses overrides of its built-in `openai` provider. The
-provider keeps `supports_websockets=false`, so every turn is a replayable
-HTTP request; WebSocket upgrades get 501. Codex 0.153 was verified to send
-its identity as `Authorization: Bearer` plus `chatgpt-account-id`; the proxy
-replaces both with the selected account's login read from that account's
-home. Requests Codex sends without credentials (plugin catalogs, MCP) are
-relayed unchanged.
-
-The runtime home holds a placeholder login: an unsigned JWT that Codex
-parses as a logged-in `pro` account. It never reaches upstream and its
-refresh token is a marker, so the process cannot refresh a real session and
-invalidate the registered copy. `home run` installs it when `auth.json` is
-missing or already a placeholder and refuses to overwrite a real login; run
-`home proxy-auth` once after `capture` to move the real login aside. A plain
-`codex` outside `home run` then fails to authenticate, so launch Codex
-through `home run` (or add the same `-c` values to `config.toml`).
-
-Every 429 is returned to the client unchanged. When its body names
-`usage_limit_reached` or `rate_limit_reached`, the proxy also asks
-`wham/usage` for that account's reset time and ranks the account last until
-then. A 401 marks the login rejected for 30 minutes, and the proxy sends that
-request with the next usable account. After successful
-responses the proxy refreshes an account's usage from `wham/usage` at most
-every five minutes; the monitor's app-server probe keeps refreshing the
-stored tokens. Without the proxy, `home run` falls back to the selected
-account home and its real login.
-
-### Hub mode across machines
-
-One machine, the hub, keeps every account and runs the proxies. Other
-machines, the clients, launch Claude Code and Codex through the hub over
-Tailscale. Real tokens never leave the hub, and only the hub refreshes them,
-so a rotating ChatGPT refresh token is never used from two machines. Proxied
-API traffic leaves from the hub's network, so a residential hub gives every
-client the same egress.
-
-On the hub, add `hub_listen` with the hub's Tailscale IP next to
-`proxy_listen`:
-
-```json
-{
-  "name": "claude",
-  "kind": "claude",
-  "proxy_listen": "127.0.0.1:7878",
-  "hub_listen": "100.67.68.117:7878",
-  "shared_runtime_home": "native"
-}
-```
-
-`hub_listen` accepts only a Tailscale address (`100.64.0.0/10` or
-`fd7a:115c:a1e0::/48`) or loopback, because the hub speaks plain HTTP and
-relies on WireGuard for encryption. Clients authenticate with the same proxy
-secret or Codex placeholder that local launches use. Start the proxies after
-`tailscaled`, or binding the Tailscale IP fails.
+Pick the machine that should hold the accounts, the hub. Its network becomes
+the egress for every client, so a residential machine gives all of them a
+residential IP.
 
 ```sh
 # on the hub
-subswapper monitor -interval 5m -proxy
-subswapper hub export -host box-box -out hub.json   # 0600, never overwrites
-# on each client, after copying hub.json there
-subswapper hub import -in hub.json && rm hub.json
-subswapper home run -service claude -- claude
-subswapper home run -service codex -- codex
+subswapper setup hub -enroll    # -enroll lets tailnet members join with one command
+subswapper add claude work
+subswapper add codex personal
+
+# on every other machine
+subswapper setup client 100.67.68.117   # the hub's Tailscale IP
+subswapper claude
 ```
 
-When every member of the tailnet may use these accounts, set
-`"hub_enroll": true` next to `hub_listen`. The hub then hands its bundle to
-any caller at `GET /subswapper/hub/bundle`, and a client needs one command
-with no file to copy:
+`setup client` connects to the hub, installs the Codex placeholder login
+(moving a real `~/.codex/auth.json` aside with a backup), and runs `doctor`.
+Accounts can be added, switched, and removed from any client; the commands run
+on the hub.
+
+`status` prints one row per account:
+
+```
+subswapper status 2026-10-03T13:36:58+03:00
+
+SERVICE    ACCOUNT    SELECTED 5H                     WEEKLY                  FABLE5                  SCORE    UPDATED  STATE
+-------    -------    -------- --                     ------                  ------                  -----    -------  -----
+claude     foxy2               38% reset Oct03 17:30  90% reset Oct04 07:00   3% reset Oct04 07:00    90%      2m       ready
+claude     h2         yes      41% reset Oct03 17:50  12% reset Oct08 15:00   0% reset Oct08 15:00    41%      <1m      ready
+codex      f2         yes      -                      1% reset Oct10 00:21    -                       1%       4m       ready
+claude: accounts on the hub at http://100.67.68.117:7878
+codex: accounts on the hub at http://100.67.68.117:7879
+```
+
+`FABLE5` is the weekly window for Claude's Fable models. `SCORE` is an
+account's worst window. `UPDATED` is the age of the usage sample.
+
+## Commands
+
+All commands accept `-config <path>` (default `~/.config/subswapper/config.json`
+on Linux). Flags may follow positional arguments.
+
+| Command | Description |
+| --- | --- |
+| `setup local` | Configure the Claude and Codex proxies and install the systemd user services for one machine. `-no-service` writes the config only. |
+| `setup hub [-enroll] [-tailscale-ip IP]` | Like `setup local`, and also serve the proxies on this machine's Tailscale IP. `-enroll` lets any tailnet member join with `setup client`. |
+| `setup client <hub>` | Use a hub's accounts from this machine. Needs `-enroll` on the hub; otherwise use `hub export` and `hub import`. |
+| `doctor` | Check the config, proxies, hub connection, Codex placeholder, accounts, monitor, and Paseo providers. Prints a fix for each problem. |
+| `add claude\|codex <name> [-email label] [-device] [-paste]` | Sign in and register an account, or replace an existing account's login. `-device` uses Codex device-code sign-in for machines without a browser. `-paste` skips `claude setup-token` and asks for a token you already have. |
+| `remove claude\|codex <name> [-force] [-delete-home]` | Unregister an account and delete its Claude setup token. `-force` removes the selected account. |
+| `switch claude\|codex\|all [name\|auto]` | Select an account; `auto` (the default) picks the best one. |
+| `status [-json]` (alias `list`) | Show every account with usage windows, score, and state. `-json` prints the report the Paseo plugin reads. |
+| `claude [args...]`, `codex [args...]` | Launch the provider through subswapper. Same as `home run -service <name> -- <name> [args...]`. |
+| `home run -service <name> [-account <name>] [-- command...]` | Launch any command the way `claude` and `codex` are launched. |
+| `home path -service <name> [-account <name>]` | Print an account's home directory. |
+| `home proxy-auth -service codex` | Move a real login out of the Codex runtime home and install the proxy placeholder (backup kept). |
+| `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Probe usage on a loop and switch automatically. `-proxy` also serves the proxies. |
+| `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the proxies, or a client's fixed relays to its hub. |
+| `hub connect <hub>`, `hub export -out <file\|->`, `hub import -in <file\|->` | Lower-level hub enrollment that `setup client` builds on. |
+| `delegate ...` | Run a bounded task through a provider; see [the harness plugin](docs/plugin.md). |
+| `init` | Write a minimal config without proxies. |
+| `version` | Print the subswapper version. |
+
+## Adding accounts
+
+`subswapper add claude <name>` runs `claude setup-token`. Sign in to the
+subscription you want in the browser, then paste the printed token into the
+hidden prompt. Setup tokens last a year and are only used for inference, so
+one token can serve every machine. A token can also be piped in:
+`subswapper add claude work < token.txt`.
+
+`subswapper add codex <name>` runs `codex login` in a throwaway Codex home
+and registers the resulting login. The throwaway home is deleted afterwards,
+so the registered copy is the only one and only subswapper's monitor
+refreshes it. Your own `~/.codex` is never touched. Add `-device` on a machine
+without a browser.
+
+On a hub client, both commands sign in locally and upload the credential to
+the hub over Tailscale. Adding an account that exists replaces its login, which
+is how you renew an expired one.
+
+## Paseo
+
+The [Paseo plugin](paseo-plugin/README.md) shows every account's usage in the
+workspace header and on a **Subscriptions** screen, and switches accounts from
+the header menu or the Command Center. Turn on **Settings → Plugins → Enable
+plugins** on the daemon, then:
 
 ```sh
-subswapper hub connect 100.67.68.117   # port defaults to 7878
+paseo plugin install lawzava/subswapper:paseo-plugin
 ```
 
-Leave `hub_enroll` off on a tailnet shared with people who should not use
-the accounts; with it on, reaching the hub is the only check.
+Point Paseo's providers at `subswapper claude` and `subswapper codex` (or
+`subswapper home run -service <name> -- <cli>`). `doctor` checks that every
+Paseo provider runs an existing subswapper binary of the current version.
 
-`hub import` and `hub connect` store the credential, sets `hub_url` on each service, and sets
-`shared_runtime_home: "native"` when the service had none. It refuses a
-service that has its own `proxy_listen` and no `hub_url`. A client has no
-accounts. `home run` opens a loopback relay to the hub for the lifetime of the
-process, so the CLI still sees a local base URL.
+## How it works
 
-A client service may also keep a loopback `proxy_listen`. `subswapper proxy`
-then serves a fixed relay to the hub there, and `home run` uses it while it
-answers. This lets a former hub become a client without restarting its
-sessions: they keep their base URL and secret, and the relay now carries
-their requests to the new hub. If the hub is unreachable or rejects the
-credential, `home run` fails instead of launching directly. On a client,
-`home proxy-auth -service codex` also moves a real `~/.codex/auth.json` aside.
-Account commands such as `login`, `token`, and `switch` run on the hub.
-`status` on a client asks each hub once, using the stored credential, and
-prints the hub's rows with a line saying where the accounts live.
+### Claude
+
+`claude` and `home run` launch Claude Code with `ANTHROPIC_BASE_URL` pointing
+at the local proxy and a per-install placeholder secret in
+`CLAUDE_CODE_OAUTH_TOKEN`. For every request the proxy swaps in the selected
+account's setup token, so `switch` and the monitor take effect on the next
+request of every running session. If the proxy is down on a machine that
+holds accounts, `home run` warns and launches with a fixed token instead.
+
+The proxy reads Anthropic's `anthropic-ratelimit-unified-*` response headers
+and records them as the account's usage. The `5h` and `7d` windows arrive on
+every response. The `7d_oi` window, which Claude Code shows as the Fable
+limit, arrives only on responses served by a Fable model and is kept across
+other responses because they do not consume it. A window counts as 0% once
+its reset time passes.
+
+A rate-limit response reaches the client unchanged; the proxy never resends a
+request with another account to get past a limit. The rejected window is
+recorded as full until it resets, so the account ranks last. A 401 marks the
+token rejected for 30 minutes, and that one request is sent with the next
+usable account.
+
+With `shared_runtime_home: "native"` (what `setup` writes) Claude keeps its
+own `~/.claude`: settings, plugins, MCP servers, transcripts, `--resume`, and
+memory are the same for every account and for plain `claude`.
+
+Proxy launches skip `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` unless the service sets
+`proxy_env_scrub: true`, because the scrub sandboxes every Bash command and
+masks `~/.gnupg` and `~/.ssh`.
+
+### Codex
+
+Codex cannot be pointed at a proxy by environment alone, so launches add `-c`
+overrides before the subcommand: `chatgpt_base_url` and a model provider named
+`subswapper` with `requires_openai_auth` and `supports_websockets=false`, which
+keeps every turn a replayable HTTP request. The proxy replaces the
+`Authorization` and `chatgpt-account-id` headers with the selected account's
+login and passes Codex's workspace-routing discovery through for the
+placeholder account.
+
+The runtime home holds a placeholder login: an unsigned JWT that never
+reaches upstream and has no usable refresh token, so a Codex process cannot
+refresh, and invalidate, a real login. A plain `codex login` in `~/.codex`
+replaces the placeholder and breaks proxied launches; `doctor` detects that
+and `home proxy-auth -service codex` repairs it.
+
+When a 429 names `usage_limit_reached` or `rate_limit_reached`, the proxy reads
+that account's reset time from `wham/usage` and ranks it last until then.
+
+### Hub
+
+The hub serves its proxies on loopback for its own launches and on its
+Tailscale address (`hub_listen`) for clients. `hub_listen` accepts only a
+Tailscale or loopback address, because the hub speaks plain HTTP and relies on
+WireGuard for encryption. Clients authenticate with the same proxy secret or
+Codex placeholder that local launches use; `hub_enroll` hands that credential
+to any caller who asks, so turn it on only when every tailnet member may use
+the accounts.
+
+A client has no accounts. `claude`, `codex`, and `home run` open a loopback
+relay to the hub for the lifetime of the process, so the CLI still sees a local
+base URL. When the hub is unreachable or rejects the credential, the launch
+fails instead of going around it. A client service may keep a loopback
+`proxy_listen`; `subswapper proxy` then serves a fixed relay there, which lets
+a former hub become a client without restarting its running sessions.
 
 Only traffic sent to the proxy goes through the hub. Telemetry, MCP
-connectors, and tool web fetches from a client CLI still use the client's own
-network.
-
-### Shared Claude user configuration
-
-Claude treats `CLAUDE_CONFIG_DIR` as the location for every documented
-`~/.claude` path. Subswapper keeps runtime state in each account home and links
-only this explicit user-configuration allowlist from the native `~/.claude`:
-
-| Shared from native `~/.claude` | Kept inside each account home |
-| --- | --- |
-| `CLAUDE.md`, `settings.json`, `keybindings.json` | `.credentials.json`, `.config.json`, `mcp-needs-auth-cache.json` |
-| `plugins/`, `skills/`, `agents/`, `output-styles/` | `projects/`, including transcripts and auto-memory |
-| `rules/`, `commands/`, `workflows/`, `themes/` | `sessions/`, `history.jsonl`, `agent-memory/`, and all other generated state |
-
-This allowlist follows Claude's documented
-[user directory layout](https://code.claude.com/docs/en/claude-directory).
-Missing native sources are skipped and reported. Existing files, directories,
-and links to other targets are conflicts and are never replaced. Run
-`subswapper home repair -service claude -account <name>` after an upgrade to
-repair an existing home. The command is idempotent and reports names only; it
-does not read or print file contents.
-
-Subswapper uses symbolic links so later user-configuration changes apply to
-every account. On Windows, enable Developer Mode or grant symbolic-link
-privilege. Creation or repair stops with an explicit error if Windows cannot
-create a link.
-
-### Optional shared Claude runtime
-
-By default, each Claude account has a separate runtime home. User-scoped MCP
-configuration and MCP OAuth state therefore follow the selected account home.
-To keep one MCP state across setup-token account switches, configure a shared
-runtime home:
-
-```json
-{
-  "name": "claude",
-  "kind": "claude",
-  "account_mode": "home",
-  "shared_runtime_home": "~/.local/share/subswapper/shared/claude"
-}
-```
-
-Every setup-token launch then uses that path as `CLAUDE_CONFIG_DIR`.
-Subswapper still selects and injects one account token per new process. Usage
-captured through Claude's status line remains bound to that token and account.
-Existing processes keep their launch token.
-
-The shared directory keeps MCP configuration, MCP OAuth, settings, plugins,
-credentials, history, sessions, and auto-memory together. This option disables
-the account-state isolation described above. Subswapper removes only stale
-top-level `oauthAccount` metadata before launch. It preserves `.credentials.json`
-contents and secures the file to `0600`. The native user home and native
-`~/.claude` directory remain prohibited as shared runtime paths.
-
-An empty shared directory starts without user-scoped MCP registrations. Seed
-it from one trusted Subswapper account home while no Claude process uses that
-home, or configure MCP servers again in the shared runtime. The
-`shared_runtime_home` path must resolve to an absolute path. Omitting it keeps
-the original per-account behavior.
+connectors, and web fetches from a client CLI use the client's own network.
 
 ## How auto-switching works
 
@@ -409,50 +231,41 @@ whose weekly window resets first. It ranks healthy accounts in this order:
 3. accounts at or above the threshold, lowest worst-window score first.
 
 Ties go to the lower worst-window score, then the lower average, then the name.
-The proxies use the same order for fallback routes after the selected account.
+The proxies use the same order for fallback routes.
 
-`monitor` evaluates every service each cycle. With automatic switching
-enabled, a service moves to the best-ranked account only when the cooldown
-since the service last switched accounts, manually or automatically, has
-passed (default **30 minutes**), and one of these holds:
+With automatic switching on, `monitor` moves a service to the best-ranked
+account when the cooldown since its last switch has passed (default
+**30 minutes**) and one of these holds:
 
-- the active account is below the switch threshold, and the best account is
-  also below it and has an earlier running weekly reset;
-- the active account has reached the switch threshold in its 5-hour, weekly,
-  or Fable weekly window, and the best account improves the worst-window score
-  by at least the minimum improvement (default **10 percentage points**).
+- the active account is below the threshold, and the best account is too and
+  has an earlier running weekly reset;
+- the active account has reached the threshold in any window, and the best
+  account improves the worst-window score by at least the minimum improvement
+  (default **10 percentage points**).
 
-Proxy samples are trusted without an age limit, since an unused account's
-windows only fall until their reset. Both pacing rules are skipped when the
-active account is exhausted or its stored credentials stop working. The
-monitor then moves to the best healthy account on the next cycle. Claude accounts with missing, expired, rejected, or
-unsafe setup tokens are never selected. Accounts without fresh trusted usage
-are also excluded. A manual
-`switch -account auto` always forces the best account immediately.
-
-In account-home mode, switching updates routing state only. Existing launcher
-or CLI processes are not silently rebound; start the next command through
-`home run`. Explicit custom file-bundle services retain the legacy
-transactional switching behavior.
+An exhausted active account, or one whose credentials stop working, is left on
+the next cycle regardless of cooldown. Accounts with missing, expired, or
+rejected credentials, or without trusted usage, are never selected.
+`switch <service> auto` picks the best account immediately.
 
 ## Configuration
 
-`subswapper init` writes a config like this:
+`setup local` writes a config like this; `setup hub` adds `hub_listen` and
+`hub_enroll`. `setup client` writes `hub_url` instead of `proxy_listen`, and
+refuses a service that already serves its own proxy, so a machine with local
+accounts does not silently stop using them:
 
 ```json
 {
-  "monitor": {
-    "interval": "5m",
-    "auto_switch": true
-  },
+  "monitor": { "interval": "5m0s" },
   "services": [
-    { "name": "claude", "kind": "claude", "display_name": "Claude Code", "account_mode": "home" },
-    { "name": "codex", "kind": "codex", "display_name": "Codex", "account_mode": "home" }
+    { "name": "claude", "kind": "claude", "proxy_listen": "127.0.0.1:7878", "shared_runtime_home": "native" },
+    { "name": "codex", "kind": "codex", "proxy_listen": "127.0.0.1:7879", "shared_runtime_home": "native" }
   ]
 }
 ```
 
-The `monitor` block accepts these knobs (defaults shown):
+Monitor settings and their defaults:
 
 ```json
 "monitor": {
@@ -464,79 +277,33 @@ The `monitor` block accepts these knobs (defaults shown):
 }
 ```
 
-Configs written by older versions may still contain `warmup`,
-`warmup_model`, or `warmup_fable_model`. These keys are ignored.
+Service keys: `proxy_listen` (loopback address of the auth proxy),
+`proxy_upstream` (API origin, for testing), `shared_runtime_home` (`native`,
+or an absolute path for a separate Claude or Codex home), `proxy_env_scrub`,
+`hub_listen`, `hub_enroll`, `hub_url`, `usage_command`, and `disabled`.
+Top-level `backup_root` and `state_path` move the account homes and state.
+Keys from older versions (`warmup`, `warmup_model`, `warmup_fable_model`)
+are ignored.
 
-Top-level `backup_root` and `state_path` override where account homes and state
-are stored. (`backup_root` keeps its historical name for compatibility.)
-Built-in services without explicit `files` default to `account_mode: "home"`.
-Account-home files use these native names:
-
-- Claude: `<account-home>/.credentials.json` and optional `.config.json`
-- Codex: `<account-home>/auth.json`
-
-Claude home-mode services may set `shared_runtime_home`. This changes only the
-runtime home used by setup-token launches and status-line settings. Registered
-account homes and setup-token storage remain separate. Codex home-mode services accept the same
-keys. `proxy_listen` enables the local auth proxy; `proxy_upstream` overrides
-the API origin for testing. `hub_listen`, `hub_enroll`, and `hub_url` configure
-[hub mode](#hub-mode-across-machines).
-
-An explicit `files` list defaults a service to `account_mode: "bundle"`. This
-keeps custom-service support and legacy transactional switching available.
-
-Codex can also store credentials in an OS keyring. `subswapper` manages
-file-backed credentials only, so configure Codex with:
-
-```toml
-cli_auth_credentials_store = "file"
-```
-
-Claude setup tokens are not stored in account homes. Token files use `0600`
-mode under separate `0700` directories. Token values never enter config or
-state. Identity remains `unknown` when Anthropic does not expose a trusted
-`accountUuid` for an inference-only token. Anthropic documents setup-token
-creation and lifetime in its [authentication guide](https://code.claude.com/docs/en/authentication).
-The isolation design was also compared with the MIT-licensed
-[claude-code-account-switcher](https://github.com/claude-code-tools/claude-code-account-switcher);
-Subswapper uses an independent implementation.
+Codex can store logins in an OS keyring; subswapper manages file logins only.
+`add codex` forces file storage for its login; if you run Codex yourself, set
+`cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.
 
 ## Usage probes
 
-**Claude** home-mode usage first probes Subswapper's existing OAuth usage
-endpoint with the setup token. Subswapper never refreshes, exchanges, or
-rotates a setup token. If the endpoint does not support that token, a launch
-wrapper captures the documented five-hour and seven-day limits from Claude's
-normal status-line response data. It runs any existing user or workspace
-status-line command with the original input. Cached data expires after five
-minutes and is bound to the random revision of the current token. Anthropic
-documents the response fields in its [status-line guide](https://code.claude.com/docs/en/statusline).
+**Claude** setup-token accounts get their usage from the proxy's rate-limit
+headers. Without the proxy, subswapper probes the OAuth usage endpoint and
+falls back to Claude's status-line data captured at launch; neither refreshes
+or exchanges a setup token.
 
-Claude's status line exposes only the five-hour and seven-day windows.
-`FABLE5` therefore shows `-` for status-line-only setup-token accounts; the
-proxy fills it from the `7d_oi` response header. Subswapper
-reports usage as unavailable when neither a direct response nor a fresh,
-complete status-line sample exists.
+**Codex** usage is read through `codex app-server` in the account's own home,
+so the official credential refresh stays in that home. Plans that expose only
+a weekly window show `-` for five hours.
 
-**Codex** usage is read through the local `codex app-server` JSON-RPC
-interface using the permanent account `CODEX_HOME`, so an official credential
-refresh stays in that home. Subswapper does not create a disposable copy of
-the refresh token. Current plans may expose only a weekly
-window; any available provider window is displayed and included in scoring.
-This requires ChatGPT auth in file storage; API-key mode has no subscription
-limits to read.
-
-**Custom services** (or overrides) can set `usage_command`. The command runs
-once per captured account with these environment variables:
-
-- `SUBSWAPPER_SERVICE`
-- `SUBSWAPPER_ACCOUNT`
-- `SUBSWAPPER_EMAIL`
-- `SUBSWAPPER_ACCOUNT_DIR`
-- `SUBSWAPPER_BACKUP_ROOT`
-
-It must print JSON with both `five_hour` and `weekly` windows (output missing
-either is rejected):
+A Claude service may set `usage_command`. It runs once per account with
+`SUBSWAPPER_SERVICE`, `SUBSWAPPER_ACCOUNT`, `SUBSWAPPER_EMAIL`,
+`SUBSWAPPER_ACCOUNT_DIR`, and `SUBSWAPPER_BACKUP_ROOT` set, and must print JSON
+with `five_hour` and `weekly` windows (`fable_weekly` is optional):
 
 ```json
 {
@@ -545,114 +312,62 @@ either is rejected):
 }
 ```
 
-Windows may alternatively be given as `{ "used": 25, "limit": 100 }`. An
-optional third window, `fable_weekly`, is also accepted and counts toward
-exhaustion and autoswitch scoring.
+## Troubleshooting
 
-## Importing from claude-swap
+Run `subswapper doctor`. It covers the common failures:
 
-To replace an existing `cswap` install, import its stored Claude accounts
-directly:
-
-```sh
-subswapper import-cswap
-```
-
-This reads the claude-swap data directory (default
-`~/.local/share/claude-swap` on Linux), decodes its stored credential backups,
-copies config snapshots, and imports the usage cache, naming each slot
-`cswap-N`. cswap's active slot is adopted as the active account when the live
-credential files still match it. After import, the `cswap` binary is no
-longer needed.
-
-## Migrating from Subswapper 0.1
-
-After upgrading an existing installation, run:
-
-```sh
-subswapper home migrate
-subswapper home repair -service claude -account <name>
-```
-
-Legacy Claude `credentials.json` and `claude.json` snapshots are copied to
-their native home names, `.credentials.json` and `.config.json`. Existing
-native files win; nothing is overwritten or deleted. Codex `auth.json` files
-already have their native filename. `home repair` adds only missing allowlisted
-Claude user-configuration links. Verify with `subswapper status`, then use
-`home path` to configure external launcher instances.
-
-### Safe Claude setup-token migration
-
-Do not restart a launcher or Subswapper for this migration. Existing agents
-keep their original process environment.
-
-1. List active agents and record the current Subswapper route.
-2. Obtain explicit approval before creating any setup token.
-3. Open a private browser profile that is signed out of Claude.
-4. Run `claude setup-token` and authenticate only the intended subscription.
-5. Abort if the browser identity is absent or ambiguous.
-6. Run `subswapper home token set -service claude -account <name>`.
-7. Paste the token only into the hidden prompt.
-8. Run `subswapper home token status -service claude -account <name>`.
-9. Launch one explicit test process with `subswapper home run -service claude -account <name> -- claude`.
-10. Wait for a normal response and fresh usage before enabling auto-selection.
-11. Repeat for each account.
-12. Obtain explicit approval before replacing or removing any live token.
-
-Rollback affects only new launches. With approval, use `home token remove` for
-the affected account. Existing processes retain the token supplied at launch.
+- **Codex launches fail after `codex login`.** The login replaced the
+  placeholder in `~/.codex/auth.json`. Run
+  `subswapper home proxy-auth -service codex`, or add that login as an account
+  with `subswapper add codex <name>`.
+- **A client cannot reach the hub.** Check Tailscale on both machines and that
+  the hub's proxies run (`systemctl --user status subswapper-hub`).
+- **The monitor is not probing.** Start it with
+  `systemctl --user start subswapper` or `subswapper monitor`.
+- **A Paseo provider runs an old binary.** Reinstall subswapper at the path the
+  provider uses.
 
 ## Data & security
 
-Defaults on Linux (macOS and Windows use their native config/data folders):
+Defaults on Linux (macOS and Windows use their native config and data folders):
 
 - config: `~/.config/subswapper/config.json`
 - state: `~/.local/share/subswapper/state.json`
 - account homes: `~/.local/share/subswapper/accounts/`
-- Claude setup tokens: `~/.local/share/subswapper/tokens/`
-- Claude proxy secret: `~/.local/share/subswapper/tokens/claude/proxy-secret.json`
-
-Linux and macOS are tested in CI; Windows builds are cross-compiled but
-currently untested. Claude setup-token storage requires POSIX `0600` and
-`0700` permission checks, so it fails closed on Windows. Other Windows support
-remains experimental. Claude user-configuration inheritance also needs Windows
-Developer Mode or symbolic-link privilege.
+- Claude setup tokens, proxy secret, and Codex placeholder:
+  `~/.local/share/subswapper/tokens/`
 
 Credentials and state are written with `0600` permissions under `0700`
-directories. Setup-token replacement uses atomic rename and directory sync.
-Home removal preserves the directory by default;
-`-delete-home` is required to erase it. Explicit bundle-mode changes still use
-rollback snapshots and a recovery journal. **Treat the account root like a
-password store** — it holds working OAuth tokens.
+directories, with atomic renames. Token values never enter config, state, or
+the provider process. Removing an account keeps its home unless `-delete-home`
+is given. Treat the data directory like a password store.
+
+Linux and macOS are tested in CI. Windows builds are cross-compiled but
+untested, and setup-token storage fails closed there because it relies on
+POSIX permission checks.
 
 ## Running as a service
 
-To keep the monitor running, a systemd user unit works well:
+`setup local` and `setup hub` install two systemd user services:
+`subswapper-hub.service` runs `subswapper proxy` and `subswapper.service` runs
+`subswapper monitor -interval 5m`. Enable lingering
+(`sudo loginctl enable-linger $USER`) so they run without a login session. On
+other systems, run `subswapper monitor -proxy` at login.
 
-```ini
-# ~/.config/systemd/user/subswapper.service
-[Unit]
-Description=subswapper account-home usage monitor
+## Upgrading from v0.6
 
-[Service]
-ExecStart=%h/go/bin/subswapper monitor
-Restart=on-failure
+v0.7 removed commands that `add`, `remove`, and `setup` replace: `capture`,
+`home create`, `home login`, `home token`, `home env`, `home repair`,
+`home migrate`, and `import-cswap`. Registered accounts, tokens, and homes are
+unchanged.
 
-[Install]
-WantedBy=default.target
-```
-
-```sh
-systemctl --user enable --now subswapper
-```
-
-The default five-minute monitor writes startup, switch, failure-transition,
-and recovery events. Use `monitor -verbose` only for interactive diagnostics
-when a complete status table every cycle is useful.
+Bundle mode (`account_mode: "bundle"`, custom `files`, and services other than
+Claude and Codex) is gone too; a config that uses it fails to load with a
+message naming the service.
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for the
 development workflow. Please report security issues privately (see
 [SECURITY.md](SECURITY.md)).
 
