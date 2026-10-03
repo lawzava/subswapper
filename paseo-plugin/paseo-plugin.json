@@ -1,0 +1,7 @@
+{
+  "id": "subswapper",
+  "description": "Subscription usage and account switching for Claude Code and Codex through subswapper",
+  "requirements": {
+    "paseo": ">=0.10.3"
+  }
+}

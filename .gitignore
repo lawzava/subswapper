@@ -8,3 +8,6 @@
 .vscode/
 .claude/
 .mcp.json
+
+# Paseo plugin dependencies (typechecking only)
+node_modules/
