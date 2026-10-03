@@ -311,6 +311,9 @@ func (p *ClaudeProxy) Serve(ctx context.Context) error {
 }
 
 func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if serveHubBundle(w, r, p.cfg, p.service) {
+		return
+	}
 	if r.URL.Path == claudeConnectivityPath && (r.Method == http.MethodHead || r.Method == http.MethodGet) {
 		p.relayConnectivityCheck(w, r)
 		return

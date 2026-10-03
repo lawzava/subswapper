@@ -63,6 +63,10 @@ type ServiceConfig struct {
 	// HubURL makes this machine a hub client. Launches relay through the hub's
 	// proxy instead of local accounts and never fall back to a direct launch.
 	HubURL string `json:"hub_url,omitempty"`
+	// HubEnroll hands the client bundle to any caller that asks, so
+	// `hub connect` needs no file or SSH. Enable it only when every tailnet
+	// member may use these accounts.
+	HubEnroll bool `json:"hub_enroll,omitempty"`
 	// ProxyEnvScrub sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 on proxy launches.
 	// Off by default: Claude Code then sandboxes every Bash command and ignores
 	// dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh and breaks
@@ -204,6 +208,9 @@ func (c Config) Validate() error {
 			if err := validateHubListen(service.HubListen); err != nil {
 				return fmt.Errorf("service %q hub_listen: %w", service.Name, err)
 			}
+		}
+		if service.HubEnroll && service.HubListen == "" {
+			return fmt.Errorf("service %q hub_enroll requires hub_listen", service.Name)
 		}
 		if service.HubURL != "" {
 			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {

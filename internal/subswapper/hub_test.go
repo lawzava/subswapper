@@ -393,3 +393,109 @@ func TestHubRelayReachesClaudeProxyHealth(t *testing.T) {
 		t.Fatal("wrong secret accepted through the relay")
 	}
 }
+
+func TestHubEnrollServesBundleWithoutCredential(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, _ := setupProxyAccounts(t, upstream.server.URL)
+	cfg.Services[0].HubListen = "100.67.68.117:7878"
+	proxy, err := NewClaudeProxy(cfg, "claude", func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://box-box:7878"+hubBundlePath, nil)
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if got := fetch(); got.Code != http.StatusUnauthorized {
+		t.Fatalf("bundle without hub_enroll: status %d", got.Code)
+	}
+
+	cfg.Services[0].HubEnroll = true
+	proxy, err = NewClaudeProxy(cfg, "claude", func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fetch()
+	if got.Code != http.StatusOK {
+		t.Fatalf("bundle with hub_enroll: status %d %s", got.Code, got.Body.String())
+	}
+	var bundle HubBundle
+	if err := json.Unmarshal(got.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := LoadOrCreateClaudeProxySecret(cfg, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The client reaches the hub by the host it dialed.
+	want := HubBundleService{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: secret}
+	if len(bundle.Services) != 1 || bundle.Services[0] != want {
+		t.Fatalf("bundle = %#v, want %#v", bundle.Services, want)
+	}
+}
+
+func TestCodexHubEnrollServesBundle(t *testing.T) {
+	cfg, _ := setupCodexProxyAccounts(t, "https://chatgpt.com")
+	cfg.Services[0].HubListen = "100.67.68.117:7879"
+	cfg.Services[0].HubEnroll = true
+	proxy, err := NewCodexProxy(cfg, "codex", func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://100.67.68.117:7879"+hubBundlePath, nil)
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"hub_url":"http://100.67.68.117:7879"`) {
+		t.Fatalf("codex bundle: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHubEnrollRequiresHubListen(t *testing.T) {
+	cfg := Config{Services: []ServiceConfig{{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubEnroll: true}}}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "hub_enroll requires hub_listen") {
+		t.Fatalf("Validate() = %v", err)
+	}
+}
+
+func TestFetchHubBundle(t *testing.T) {
+	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: "sk-ant-oat01-x"}}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != hubBundlePath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(bundle)
+	}))
+	t.Cleanup(server.Close)
+	host := strings.TrimPrefix(server.URL, "http://")
+	for _, address := range []string{server.URL, host} {
+		got, err := FetchHubBundle(context.Background(), address)
+		if err != nil || len(got.Services) != 1 || got.Services[0] != bundle.Services[0] {
+			t.Fatalf("FetchHubBundle(%q) = %#v, %v", address, got, err)
+		}
+	}
+	server.Close()
+	if _, err := FetchHubBundle(context.Background(), host); err == nil {
+		t.Fatal("fetch from a closed hub succeeded")
+	}
+}
+
+func TestHubAddressDefaultsToClaudePort(t *testing.T) {
+	for input, want := range map[string]string{
+		"100.67.68.117":             "http://100.67.68.117:7878",
+		"box-box:7879":              "http://box-box:7879",
+		"http://100.67.68.117:7878": "http://100.67.68.117:7878",
+		"https://hub.example":       "https://hub.example",
+	} {
+		got, err := hubBundleURL(input)
+		if err != nil || got != want+hubBundlePath {
+			t.Fatalf("hubBundleURL(%q) = %q, %v; want %q", input, got, err, want+hubBundlePath)
+		}
+	}
+	if _, err := hubBundleURL("http://box-box:7878/path"); err == nil {
+		t.Fatal("URL with a path accepted")
+	}
+}

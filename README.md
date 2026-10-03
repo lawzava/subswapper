@@ -118,6 +118,7 @@ ranking ties and paces switches away from an account at the threshold.
 | `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
 | `hub export [-service <name>] [-host <name>] -out <file\|->` | Write a bundle that lets another machine use this machine's proxies over Tailscale (see [Hub mode](#hub-mode-across-machines)). |
 | `hub import -in <file\|->` | Make this machine a hub client from a bundle. |
+| `hub connect <hub address>` | Fetch the bundle from a hub with `hub_enroll` and make this machine its client. |
 | `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
@@ -304,7 +305,19 @@ subswapper home run -service claude -- claude
 subswapper home run -service codex -- codex
 ```
 
-`hub import` stores the credential, sets `hub_url` on each service, and sets
+When every member of the tailnet may use these accounts, set
+`"hub_enroll": true` next to `hub_listen`. The hub then hands its bundle to
+any caller at `GET /subswapper/hub/bundle`, and a client needs one command
+with no file to copy:
+
+```sh
+subswapper hub connect 100.67.68.117   # port defaults to 7878
+```
+
+Leave `hub_enroll` off on a tailnet shared with people who should not use
+the accounts; with it on, reaching the hub is the only check.
+
+`hub import` and `hub connect` store the credential, sets `hub_url` on each service, and sets
 `shared_runtime_home: "native"` when the service had none. It refuses a
 service that has its own `proxy_listen` and no `hub_url`. A client has no
 accounts. `home run` opens a loopback relay to the hub for the lifetime of the
@@ -464,7 +477,7 @@ Claude home-mode services may set `shared_runtime_home`. This changes only the
 runtime home used by setup-token launches and status-line settings. Registered
 account homes and setup-token storage remain separate. Codex home-mode services accept the same
 keys. `proxy_listen` enables the local auth proxy; `proxy_upstream` overrides
-the API origin for testing. `hub_listen` and `hub_url` configure
+the API origin for testing. `hub_listen`, `hub_enroll`, and `hub_url` configure
 [hub mode](#hub-mode-across-machines).
 
 An explicit `files` list defaults a service to `account_mode: "bundle"`. This

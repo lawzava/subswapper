@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,7 +18,7 @@ const hubBundleLimit = 1 << 20
 
 func runHub(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("missing hub command: export or import")
+		return errors.New("missing hub command: connect, export, or import")
 	}
 	action := args[0]
 	fs := flag.NewFlagSet("hub "+action, flag.ContinueOnError)
@@ -80,24 +81,40 @@ func runHub(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		if err := json.Unmarshal(data, &bundle); err != nil {
 			return errors.New("hub bundle is not valid JSON")
 		}
-		names, err := subswapper.ImportHubBundle(*configPath, bundle)
+		return importHubBundle(*configPath, bundle, stdout)
+	case "connect":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New("usage: subswapper hub connect [-config path] <hub address, e.g. 100.67.68.117>")
+		}
+		bundle, err := subswapper.FetchHubBundle(context.Background(), fs.Arg(0))
 		if err != nil {
 			return err
 		}
-		for _, name := range names {
-			for _, service := range bundle.Services {
-				if service.Name != name {
-					continue
-				}
-				if _, err := fmt.Fprintf(stdout, "%s now uses the hub at %s\n", name, service.HubURL); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+		return importHubBundle(*configPath, bundle, stdout)
 	default:
 		return fmt.Errorf("unknown hub command %q", action)
 	}
+}
+
+func importHubBundle(configPath string, bundle subswapper.HubBundle, stdout io.Writer) error {
+	names, err := subswapper.ImportHubBundle(configPath, bundle)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		for _, service := range bundle.Services {
+			if service.Name != name {
+				continue
+			}
+			if _, err := fmt.Fprintf(stdout, "%s now uses the hub at %s\n", name, service.HubURL); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // writeNewPrivateFile refuses to replace an existing file, so an export

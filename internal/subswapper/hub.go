@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,7 +18,14 @@ import (
 	"time"
 )
 
-const hubBundleVersion = 1
+const (
+	hubBundleVersion = 1
+	hubBundlePath    = "/subswapper/hub/bundle"
+	// defaultHubPort is the Claude proxy port the README configures; any
+	// enrolled service's port returns the same bundle.
+	defaultHubPort       = "7878"
+	hubBundleFetchWindow = 15 * time.Second
+)
 
 // Tailscale assigns node addresses from these ranges. The hub listener
 // carries the proxy secret over plain HTTP, so it is only safe where
@@ -155,6 +163,85 @@ func ExportHubBundle(cfg Config, serviceName, host string) (HubBundle, error) {
 			return HubBundle{}, fmt.Errorf("service %q has no hub_listen configured", serviceName)
 		}
 		return HubBundle{}, errors.New("no service has hub_listen configured")
+	}
+	return bundle, nil
+}
+
+// serveHubBundle answers enrollment on a service with hub_enroll and reports
+// whether it handled r. The client reaches every service by the host it
+// dialed; the service it asked keeps the exact address it used.
+func serveHubBundle(w http.ResponseWriter, r *http.Request, cfg Config, service ServiceConfig) bool {
+	if r.URL.Path != hubBundlePath || !service.HubEnroll {
+		return false
+	}
+	if r.Method != http.MethodGet {
+		writeClaudeProxyError(w, http.StatusMethodNotAllowed, "invalid_request_error", "hub enrollment accepts GET only")
+		return true
+	}
+	host := r.Host
+	if name, _, err := net.SplitHostPort(r.Host); err == nil {
+		host = name
+	}
+	bundle, err := ExportHubBundle(cfg, "", host)
+	if err != nil {
+		writeClaudeProxyError(w, http.StatusInternalServerError, "api_error", "subswapper hub could not build the client bundle")
+		return true
+	}
+	if r.Host != "" {
+		for index := range bundle.Services {
+			if bundle.Services[index].Name == service.Name {
+				bundle.Services[index].HubURL = "http://" + r.Host
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(bundle)
+	return true
+}
+
+// hubBundleURL turns a hub address such as 100.67.68.117, box-box:7879, or
+// http://box-box:7878 into its enrollment URL.
+func hubBundleURL(address string) (string, error) {
+	raw := strings.TrimSpace(address)
+	if !strings.Contains(raw, "://") {
+		if _, _, err := net.SplitHostPort(raw); err != nil {
+			raw = net.JoinHostPort(raw, defaultHubPort)
+		}
+		raw = "http://" + raw
+	}
+	origin, err := parseProxyUpstream(raw)
+	if err != nil {
+		return "", fmt.Errorf("hub address: %w", err)
+	}
+	return origin.String() + hubBundlePath, nil
+}
+
+// FetchHubBundle asks a hub with hub_enroll for its client bundle.
+func FetchHubBundle(ctx context.Context, address string) (HubBundle, error) {
+	target, err := hubBundleURL(address)
+	if err != nil {
+		return HubBundle{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, hubBundleFetchWindow)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return HubBundle{}, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		return HubBundle{}, fmt.Errorf("reach hub at %s: %w", address, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return HubBundle{}, fmt.Errorf("hub at %s answered %s; enable hub_enroll there, or use hub export and hub import", address, resp.Status)
+	}
+	var bundle HubBundle
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&bundle); err != nil {
+		return HubBundle{}, errors.New("hub returned a malformed bundle")
 	}
 	return bundle, nil
 }

@@ -1289,6 +1289,7 @@ Usage:
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
   subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]
   subswapper proxy [-config ~/.config/subswapper/config.json] [-service claude] [-listen 127.0.0.1:7878]
+  subswapper hub connect [-config ~/.config/subswapper/config.json] <hub address>
   subswapper hub export [-config ~/.config/subswapper/config.json] [-service claude|codex] [-host box-box] -out <file|->
   subswapper hub import [-config ~/.config/subswapper/config.json] -in <file|->
   subswapper version`)

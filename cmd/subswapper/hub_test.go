@@ -295,3 +295,54 @@ func TestRunHomeClaudeUsesFixedClientRelayWhenServing(t *testing.T) {
 		t.Fatalf("launch with the fixed relay = %q", got)
 	}
 }
+
+func TestHubConnectEnrollsFromHub(t *testing.T) {
+	hubDir := t.TempDir()
+	hubConfig := writeProxyHomeConfig(t, hubDir, "127.0.0.1:1")
+	data, err := os.ReadFile(hubConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.Replace(data, []byte(`"proxy_listen"`), []byte(`"hub_listen":"127.0.0.2:1","hub_enroll":true,"proxy_listen"`), 1)
+	if err := os.WriteFile(hubConfig, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createHomeAccount(t, hubConfig, "claude", "work")
+	storeTestSetupToken(t, hubConfig, "work", "sk-ant-oat01-real-account-token")
+	cfg, err := subswapper.LoadConfig(hubConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := subswapper.NewClaudeProxy(*cfg, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := httptest.NewServer(proxy)
+	t.Cleanup(hub.Close)
+
+	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "native-home"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	configPath := filepath.Join(dir, "config.json")
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"hub", "connect", "-config", configPath, strings.TrimPrefix(hub.URL, "http://")}, &stdout, &stderr); err != nil {
+		t.Fatalf("hub connect failed: %v; stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "claude now uses the hub at "+hub.URL) {
+		t.Fatalf("hub connect output = %q", stdout.String())
+	}
+	fakeClaude := writeFakeClaude(t, dir, fakeClaudeEnvReport)
+	stdout.Reset()
+	if err := runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "--", fakeClaude, "-p"},
+		strings.NewReader(""), &stdout, &stderr,
+	); err != nil {
+		t.Fatalf("home run after connect failed: %v; stderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "proxy=1") {
+		t.Fatalf("launch after connect = %q", stdout.String())
+	}
+	if err := run([]string{"hub", "connect", "-config", configPath}, &stdout, &stderr); err == nil {
+		t.Fatal("hub connect without an address succeeded")
+	}
+}

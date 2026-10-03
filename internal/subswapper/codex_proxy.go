@@ -391,6 +391,9 @@ func (p *CodexProxy) Serve(ctx context.Context) error {
 }
 
 func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if serveHubBundle(w, r, p.cfg, p.service) {
+		return
+	}
 	if r.Header.Get("Authorization") == "" {
 		// Codex sends some backend calls (plugin MCP, connectivity) without
 		// credentials. They carry no identity to swap, so relay them as-is.
