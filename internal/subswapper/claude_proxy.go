@@ -236,8 +236,18 @@ func ClaudeProxyReachable(service ServiceConfig, secret string) bool {
 	if !service.ClaudeProxyEnabled() {
 		return false
 	}
+	return proxyHealthy(service.ProxyListen, secret)
+}
+
+// HubRelayReachable reports whether the relay at listen reaches a hub proxy
+// that accepts credential. The hub answers its health check through the relay.
+func HubRelayReachable(listen, credential string) bool {
+	return proxyHealthy(listen, credential)
+}
+
+func proxyHealthy(listen, secret string) bool {
 	client := &http.Client{Timeout: time.Second}
-	req, err := http.NewRequest(http.MethodGet, ClaudeProxyBaseURL(service.ProxyListen)+claudeProxyHealthPath, nil)
+	req, err := http.NewRequest(http.MethodGet, ClaudeProxyBaseURL(listen)+claudeProxyHealthPath, nil)
 	if err != nil {
 		return false
 	}
@@ -294,31 +304,10 @@ func NewClaudeProxy(cfg Config, serviceName string, logf func(format string, arg
 	}, nil
 }
 
-// Serve listens until ctx is cancelled. Streaming responses get a short grace
-// period before the listener is closed.
+// Serve listens on proxy_listen, and on hub_listen when set, until ctx is
+// cancelled. Streaming responses get a short grace period before shutdown.
 func (p *ClaudeProxy) Serve(ctx context.Context) error {
-	listener, err := net.Listen("tcp", p.service.ProxyListen)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", p.service.ProxyListen, err)
-	}
-	server := &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	select {
-	case err := <-served:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			_ = server.Close()
-		}
-		<-served
-		return nil
-	}
+	return serveProxy(ctx, p, proxyListenAddresses(p.service)...)
 }
 
 func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

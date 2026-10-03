@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -385,30 +384,10 @@ func NewCodexProxy(cfg Config, serviceName string, logf func(format string, args
 	}, nil
 }
 
-// Serve listens until ctx is cancelled.
+// Serve listens on proxy_listen, and on hub_listen when set, until ctx is
+// cancelled. Streaming responses get a short grace period before shutdown.
 func (p *CodexProxy) Serve(ctx context.Context) error {
-	listener, err := net.Listen("tcp", p.service.ProxyListen)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", p.service.ProxyListen, err)
-	}
-	server := &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	select {
-	case err := <-served:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			_ = server.Close()
-		}
-		<-served
-		return nil
-	}
+	return serveProxy(ctx, p, proxyListenAddresses(p.service)...)
 }
 
 func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

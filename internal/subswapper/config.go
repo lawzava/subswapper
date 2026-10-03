@@ -57,6 +57,12 @@ type ServiceConfig struct {
 	ProxyListen string `json:"proxy_listen,omitempty"`
 	// ProxyUpstream overrides the Anthropic API origin the proxy forwards to.
 	ProxyUpstream string `json:"proxy_upstream,omitempty"`
+	// HubListen also serves the proxy on a Tailscale address, so hub clients
+	// on other machines use this machine's accounts and network egress.
+	HubListen string `json:"hub_listen,omitempty"`
+	// HubURL makes this machine a hub client. Launches relay through the hub's
+	// proxy instead of local accounts and never fall back to a direct launch.
+	HubURL string `json:"hub_url,omitempty"`
 	// ProxyEnvScrub sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 on proxy launches.
 	// Off by default: Claude Code then sandboxes every Bash command and ignores
 	// dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh and breaks
@@ -168,8 +174,8 @@ func (c Config) Validate() error {
 			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {
 				return fmt.Errorf("service %q shared_runtime_home requires Claude or Codex account_mode %q", service.Name, AccountModeHome)
 			}
-			if service.UsesNativeRuntimeHome() && service.ProxyListen == "" {
-				return fmt.Errorf("service %q shared_runtime_home %q requires proxy_listen; a fixed-token launch must not use the native home", service.Name, NativeRuntimeHome)
+			if service.UsesNativeRuntimeHome() && service.ProxyListen == "" && service.HubURL == "" {
+				return fmt.Errorf("service %q shared_runtime_home %q requires proxy_listen or hub_url; a fixed-token launch must not use the native home", service.Name, NativeRuntimeHome)
 			}
 			if !service.UsesNativeRuntimeHome() && !filepath.IsAbs(ExpandPath(service.SharedRuntimeHome)) {
 				return fmt.Errorf("service %q shared_runtime_home must resolve to an absolute path", service.Name)
@@ -189,6 +195,28 @@ func (c Config) Validate() error {
 				if _, err := parseProxyUpstream(service.ProxyUpstream); err != nil {
 					return fmt.Errorf("service %q proxy_upstream: %w", service.Name, err)
 				}
+			}
+		}
+		if service.HubListen != "" {
+			if service.ProxyListen == "" {
+				return fmt.Errorf("service %q hub_listen requires proxy_listen", service.Name)
+			}
+			if err := validateHubListen(service.HubListen); err != nil {
+				return fmt.Errorf("service %q hub_listen: %w", service.Name, err)
+			}
+		}
+		if service.HubURL != "" {
+			if (!isClaudeService(service) && !isCodexService(service)) || !service.UsesAccountHomes() {
+				return fmt.Errorf("service %q hub_url requires Claude or Codex account_mode %q", service.Name, AccountModeHome)
+			}
+			if service.ProxyUpstream != "" || service.HubListen != "" {
+				return fmt.Errorf("service %q hub_url replaces the local proxy; remove proxy_upstream and hub_listen", service.Name)
+			}
+			if service.SharedRuntimeHome == "" {
+				return fmt.Errorf("service %q hub_url requires shared_runtime_home; a hub client has no account homes", service.Name)
+			}
+			if _, err := parseProxyUpstream(service.HubURL); err != nil {
+				return fmt.Errorf("service %q hub_url: %w", service.Name, err)
 			}
 		}
 		if len(service.Files) == 0 {
@@ -231,18 +259,30 @@ func (s ServiceConfig) UsesNativeRuntimeHome() bool {
 // ClaudeProxyEnabled reports whether launches should route through the
 // local auth proxy instead of carrying a real setup token.
 func (s ServiceConfig) ClaudeProxyEnabled() bool {
-	return s.ProxyListen != "" && isClaudeService(s) && s.UsesAccountHomes()
+	return s.ProxyListen != "" && s.HubURL == "" && isClaudeService(s) && s.UsesAccountHomes()
 }
 
 // CodexProxyEnabled reports whether Codex launches should route through the
 // local ChatGPT auth proxy instead of carrying a real login.
 func (s ServiceConfig) CodexProxyEnabled() bool {
-	return s.ProxyListen != "" && isCodexService(s) && s.UsesAccountHomes()
+	return s.ProxyListen != "" && s.HubURL == "" && isCodexService(s) && s.UsesAccountHomes()
 }
 
 // ProxyEnabled reports whether any local auth proxy serves this service.
 func (s ServiceConfig) ProxyEnabled() bool {
 	return s.ClaudeProxyEnabled() || s.CodexProxyEnabled()
+}
+
+// HubClient reports whether launches relay through another machine's hub.
+func (s ServiceConfig) HubClient() bool {
+	return s.HubURL != "" && (isClaudeService(s) || isCodexService(s)) && s.UsesAccountHomes()
+}
+
+// HubRelayEnabled reports whether a hub client also keeps a fixed loopback
+// relay at proxy_listen, so sessions launched against that address before
+// the machine became a client keep working.
+func (s ServiceConfig) HubRelayEnabled() bool {
+	return s.HubClient() && s.ProxyListen != ""
 }
 
 func (c Config) Service(name string) (ServiceConfig, bool) {

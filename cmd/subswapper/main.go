@@ -86,6 +86,8 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return runMonitor(args[1:], stdout)
 	case "proxy":
 		return runProxy(args[1:], stdout)
+	case "hub":
+		return runHub(args[1:], stdin, stdout, stderr)
 	case "version", "-version", "--version":
 		return printVersion(stdout)
 	case "help", "-h", "--help":
@@ -129,6 +131,9 @@ func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	if *serviceName == "" {
 		return errors.New("missing -service")
+	}
+	if service, ok := cfg.Service(*serviceName); ok && service.HubClient() {
+		return runHubClientHome(*cfg, *configPath, service, action, *accountName, fs.Args(), stdin, stdout, stderr)
 	}
 	if action == "create" {
 		if *accountName == "" {
@@ -205,21 +210,24 @@ func runHome(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		runtimeHome := subswapper.RuntimeHome(*cfg, service, account)
-		backup, err := subswapper.ReplaceCodexRuntimeAuth(runtimeHome, placeholder)
-		if err != nil {
-			return err
-		}
-		if backup != "" {
-			if _, err := fmt.Fprintf(stdout, "moved the previous login to %s\n", backup); err != nil {
-				return err
-			}
-		}
-		_, err = fmt.Fprintf(stdout, "installed the Codex proxy placeholder in %s\n", runtimeHome)
-		return err
+		return installCodexPlaceholder(subswapper.RuntimeHome(*cfg, service, account), placeholder, stdout)
 	default:
 		return fmt.Errorf("unknown home command %q", action)
 	}
+}
+
+func installCodexPlaceholder(runtimeHome string, placeholder subswapper.CodexProxyPlaceholder, stdout io.Writer) error {
+	backup, err := subswapper.ReplaceCodexRuntimeAuth(runtimeHome, placeholder)
+	if err != nil {
+		return err
+	}
+	if backup != "" {
+		if _, err := fmt.Fprintf(stdout, "moved the previous login to %s\n", backup); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(stdout, "installed the Codex proxy placeholder in %s\n", runtimeHome)
+	return err
 }
 
 func printHomeRepairResult(w io.Writer, serviceName, accountName string, result subswapper.HomeRepairResult) error {
@@ -554,6 +562,11 @@ func runClaudeWithSetupToken(
 		}
 		commandArgs = append([]string{"--settings", overlay}, commandArgs...)
 	}
+	return runClaudeProcess(command, commandArgs, environment, token, stdin, stdout, stderr)
+}
+
+// runClaudeProcess runs Claude with secret redacted from everything it prints.
+func runClaudeProcess(command string, commandArgs, environment []string, token string, stdin io.Reader, stdout, stderr io.Writer) error {
 	cmd := exec.Command(command, commandArgs...)
 	cmd.Env = environment
 	if handled, terminalErr := runClaudeTerminalCommand(cmd, stdin, stdout, stderr, token); handled {
@@ -1043,6 +1056,9 @@ func runMonitor(args []string, stdout io.Writer) error {
 			if _, err := fmt.Fprintf(stdout, "subswapper %s proxy listening on %s\n", proxyService.Name, proxyService.ProxyListen); err != nil {
 				return err
 			}
+			if err := printHubListen(stdout, proxyService); err != nil {
+				return err
+			}
 		}
 		monitorErr := runMonitorWithConfig(ctx, *cfg, *interval, *once, *noAuto, *verbose, stdout)
 		cancel(nil)
@@ -1074,6 +1090,8 @@ type serviceProxy interface {
 
 func newServiceProxy(cfg subswapper.Config, service subswapper.ServiceConfig, logf func(string, ...any)) (serviceProxy, error) {
 	switch {
+	case service.HubRelayEnabled():
+		return subswapper.NewHubRelay(service)
 	case service.ClaudeProxyEnabled():
 		return subswapper.NewClaudeProxy(cfg, service.Name, logf)
 	case service.CodexProxyEnabled():
@@ -1088,7 +1106,7 @@ func configuredProxyServices(cfg subswapper.Config, name string) []subswapper.Se
 		if name != "" && service.Name != name {
 			continue
 		}
-		if service.ProxyEnabled() && !service.Disabled {
+		if (service.ProxyEnabled() || service.HubRelayEnabled()) && !service.Disabled {
 			services = append(services, service)
 		}
 	}
@@ -1150,6 +1168,9 @@ func runProxy(args []string, stdout io.Writer) error {
 			cancel(nil)
 		}()
 		if _, err := fmt.Fprintf(stdout, "subswapper %s proxy listening on %s\n", service.Name, service.ProxyListen); err != nil {
+			return err
+		}
+		if err := printHubListen(stdout, service); err != nil {
 			return err
 		}
 	}
@@ -1268,6 +1289,8 @@ Usage:
   subswapper switch -service claude|codex|all [-account auto|name] [-config ~/.config/subswapper/config.json]
   subswapper monitor [-config ~/.config/subswapper/config.json] [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]
   subswapper proxy [-config ~/.config/subswapper/config.json] [-service claude] [-listen 127.0.0.1:7878]
+  subswapper hub export [-config ~/.config/subswapper/config.json] [-service claude|codex] [-host box-box] -out <file|->
+  subswapper hub import [-config ~/.config/subswapper/config.json] -in <file|->
   subswapper version`)
 	return err
 }

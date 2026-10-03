@@ -116,6 +116,8 @@ ranking ties and paces switches away from an account at the threshold.
 | `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
 | `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
+| `hub export [-service <name>] [-host <name>] -out <file\|->` | Write a bundle that lets another machine use this machine's proxies over Tailscale (see [Hub mode](#hub-mode-across-machines)). |
+| `hub import -in <file\|->` | Make this machine a hub client from a bundle. |
 | `remove -service <name> -account <name> [-force] [-delete-home]` (alias `rm`) | Unregister an account; preserve its home unless deletion is explicit. Remove a Claude setup token first. |
 | `import-cswap [-root <dir>]` | Import accounts from an existing claude-swap (`cswap`) install. |
 | `version` | Print the subswapper version. |
@@ -264,6 +266,63 @@ every five minutes; the monitor's app-server probe keeps refreshing the
 stored tokens. Without the proxy, `home run` falls back to the selected
 account home and its real login.
 
+### Hub mode across machines
+
+One machine, the hub, keeps every account and runs the proxies. Other
+machines, the clients, launch Claude Code and Codex through the hub over
+Tailscale. Real tokens never leave the hub, and only the hub refreshes them,
+so a rotating ChatGPT refresh token is never used from two machines. Proxied
+API traffic leaves from the hub's network, so a residential hub gives every
+client the same egress.
+
+On the hub, add `hub_listen` with the hub's Tailscale IP next to
+`proxy_listen`:
+
+```json
+{
+  "name": "claude",
+  "kind": "claude",
+  "proxy_listen": "127.0.0.1:7878",
+  "hub_listen": "100.67.68.117:7878",
+  "shared_runtime_home": "native"
+}
+```
+
+`hub_listen` accepts only a Tailscale address (`100.64.0.0/10` or
+`fd7a:115c:a1e0::/48`) or loopback, because the hub speaks plain HTTP and
+relies on WireGuard for encryption. Clients authenticate with the same proxy
+secret or Codex placeholder that local launches use. Start the proxies after
+`tailscaled`, or binding the Tailscale IP fails.
+
+```sh
+# on the hub
+subswapper monitor -interval 5m -proxy
+subswapper hub export -host box-box -out hub.json   # 0600, never overwrites
+# on each client, after copying hub.json there
+subswapper hub import -in hub.json && rm hub.json
+subswapper home run -service claude -- claude
+subswapper home run -service codex -- codex
+```
+
+`hub import` stores the credential, sets `hub_url` on each service, and sets
+`shared_runtime_home: "native"` when the service had none. It refuses a
+service that has its own `proxy_listen` and no `hub_url`. A client has no
+accounts. `home run` opens a loopback relay to the hub for the lifetime of the
+process, so the CLI still sees a local base URL.
+
+A client service may also keep a loopback `proxy_listen`. `subswapper proxy`
+then serves a fixed relay to the hub there, and `home run` uses it while it
+answers. This lets a former hub become a client without restarting its
+sessions: they keep their base URL and secret, and the relay now carries
+their requests to the new hub. If the hub is unreachable or rejects the
+credential, `home run` fails instead of launching directly. On a client,
+`home proxy-auth -service codex` also moves a real `~/.codex/auth.json` aside.
+Account commands such as `login`, `token`, and `switch` run on the hub.
+
+Only traffic sent to the proxy goes through the hub. Telemetry, MCP
+connectors, and tool web fetches from a client CLI still use the client's own
+network.
+
 ### Shared Claude user configuration
 
 Claude treats `CLAUDE_CONFIG_DIR` as the location for every documented
@@ -405,7 +464,8 @@ Claude home-mode services may set `shared_runtime_home`. This changes only the
 runtime home used by setup-token launches and status-line settings. Registered
 account homes and setup-token storage remain separate. Codex home-mode services accept the same
 keys. `proxy_listen` enables the local auth proxy; `proxy_upstream` overrides
-the API origin for testing.
+the API origin for testing. `hub_listen` and `hub_url` configure
+[hub mode](#hub-mode-across-machines).
 
 An explicit `files` list defaults a service to `account_mode: "bundle"`. This
 keeps custom-service support and legacy transactional switching available.
