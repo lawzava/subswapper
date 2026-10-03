@@ -53,3 +53,24 @@ export const switchRpc = defineRpc({
   input: z.object({ service: nameSchema, account: nameSchema }),
   output: z.object({ message: z.string() }),
 });
+
+const providerSchema = z.enum(["claude", "codex"]);
+
+// signinRpc opens a workspace terminal that runs `subswapper add`, so the
+// provider's interactive sign-in happens inside Paseo.
+export const signinRpc = defineRpc({
+  name: "subswapper.signin",
+  input: z.object({ workspaceId: z.string().min(1), service: providerSchema, account: nameSchema }),
+  output: z.object({ terminalId: z.string(), name: z.string() }),
+});
+
+// addTokenRpc registers a Claude setup token the user already has. The token
+// goes to the CLI on stdin and is never echoed or logged.
+export const addTokenRpc = defineRpc({
+  name: "subswapper.add-token",
+  input: z.object({
+    account: nameSchema,
+    token: z.string().regex(/^sk-ant-[A-Za-z0-9_-]{8,2048}$/),
+  }),
+  output: z.object({ message: z.string() }),
+});

@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -44,19 +44,49 @@ export function switchArgs(service: string, account: string): string[] {
   return ["switch", service, account];
 }
 
-export async function runSubswapper(args: string[], signal?: AbortSignal): Promise<string> {
+// addArgs builds `subswapper add`. Codex signs in with a device code because
+// the terminal runs on the daemon host, which may not be the device with
+// the browser.
+export function addArgs(service: string, account: string): string[] {
+  if (service !== "claude" && service !== "codex") {
+    throw new Error("service must be claude or codex");
+  }
+  if (!namePattern.test(account)) {
+    throw new Error("account names may contain only letters, digits, dots, dashes, and underscores");
+  }
+  return service === "codex" ? ["add", service, account, "-device"] : ["add", service, account];
+}
+
+export interface RunOptions {
+  signal?: AbortSignal;
+  // input is written to the CLI's stdin, e.g. a setup token.
+  input?: string;
+}
+
+export async function runSubswapper(args: string[], options: RunOptions = {}): Promise<string> {
   const binary = await findSubswapper();
   if (binary === null) {
     throw new Error("subswapper is not installed on the daemon host; install it or set SUBSWAPPER_BIN for the Paseo daemon");
   }
   return new Promise((resolve, reject) => {
-    execFile(binary, args, { timeout: cliTimeoutMs, maxBuffer: 4 << 20, signal }, (error, stdout, stderr) => {
-      if (error) {
-        const detail = String(stderr || stdout || error.message).trim().split("\n").slice(-3).join(" ");
-        reject(new Error(`subswapper ${args[0]} failed: ${detail}`));
+    const child = spawn(binary, args, { signal: options.signal, timeout: cliTimeoutMs, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout = (stdout + chunk).slice(-1 << 22);
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-1 << 16);
+    });
+    child.on("error", (error) => reject(new Error(`subswapper ${args[0]} failed: ${error.message}`)));
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
         return;
       }
-      resolve(String(stdout));
+      const detail = (stderr || stdout).trim().split("\n").slice(-3).join(" ");
+      reject(new Error(`subswapper ${args[0]} failed: ${detail || `exit ${code}`}`));
     });
+    child.stdin.end(options.input ?? "");
   });
 }

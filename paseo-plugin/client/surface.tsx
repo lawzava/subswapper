@@ -5,8 +5,9 @@ import { useMemo } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { accountLoad, percent, relativeTime, windowText } from "../shared/format";
 import { statusRpc, switchRpc, type AccountReport, type ServiceReport } from "../shared/subswapper";
+import { AddAccountForm } from "./add-account";
+import { statusQueryKey } from "./keys";
 
-export const statusQueryKey = ["subswapper", "status"] as const;
 const refreshMs = 60_000;
 
 export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
@@ -112,7 +113,8 @@ export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
       ))}
       <View style={styles.service}>
         <Text style={styles.title}>Add a subscription</Text>
-        <Text style={styles.muted}>Run on any machine that uses these accounts:</Text>
+        <AddAccountForm theme={theme} />
+        <Text style={styles.muted}>Or run on any machine that uses these accounts:</Text>
         <Text style={styles.code}>subswapper add claude &lt;name&gt;</Text>
         <Text style={styles.code}>subswapper add codex &lt;name&gt;</Text>
       </View>

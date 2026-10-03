@@ -8,6 +8,10 @@ accounts from inside Paseo.
   with a menu to switch a service to its best account.
 - A **Subscriptions** screen in the sidebar: each account's five-hour, weekly,
   and Fable windows with reset times, its state, and **Use** buttons.
+- **Add account** in the header menu and on the screen: signs a new Claude or
+  Codex account in through a terminal in the workspace (Codex uses a device
+  code, so any device can approve it), or adds a Claude setup token you
+  already have without it appearing in a terminal.
 - Command Center items to open the screen and to switch every service to its
   best account.
 

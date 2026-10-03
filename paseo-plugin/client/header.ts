@@ -1,5 +1,6 @@
 import type { PluginButtonMenuEntry, PluginButtonRegistration, PluginClientContext } from "@getpaseo/plugin/client";
 import { headerLabel } from "../shared/format";
+import { AddAccountPopover } from "./add-account";
 import { statusRpc, switchRpc, type StatusReport } from "../shared/subswapper";
 
 const refreshMs = 60_000;
@@ -18,6 +19,13 @@ export function startHeaderButtons(client: PluginClientContext, surfaceId: strin
       title: "Open subscriptions",
       icon: "Gauge",
       behavior: { kind: "action", onPress: () => client.openSurface(surfaceId) },
+    },
+    {
+      kind: "item",
+      id: "add-account",
+      title: "Add account…",
+      icon: "UserPlus",
+      behavior: { kind: "popover", Content: AddAccountPopover },
     },
     { kind: "separator", id: "switch-divider" },
     ...(report?.services ?? [])

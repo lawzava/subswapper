@@ -136,8 +136,10 @@ is how you renew an expired one.
 ## Paseo
 
 The [Paseo plugin](paseo-plugin/README.md) shows every account's usage in the
-workspace header and on a **Subscriptions** screen, and switches accounts from
-the header menu or the Command Center. Turn on **Settings → Plugins → Enable
+workspace header and on a **Subscriptions** screen, switches accounts from
+the header menu or the Command Center, and adds accounts: **Add account** opens
+a terminal in the workspace that runs `subswapper add`, or takes a Claude setup
+token directly. Turn on **Settings → Plugins → Enable
 plugins** on the daemon, then:
 
 ```sh
