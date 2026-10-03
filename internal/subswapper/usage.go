@@ -54,6 +54,9 @@ type AccountStatus struct {
 type ServiceStatus struct {
 	Service  ServiceConfig
 	Accounts []AccountStatus
+	// Note replaces "no registered accounts" for a service without rows,
+	// e.g. a hub client whose hub did not answer.
+	Note string `json:",omitempty"`
 }
 
 // errCredentialsInvalid marks usage-fetch failures caused by rejected or

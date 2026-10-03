@@ -499,3 +499,75 @@ func TestHubAddressDefaultsToClaudePort(t *testing.T) {
 		t.Fatal("URL with a path accepted")
 	}
 }
+
+func TestHubStatusEndpointRequiresCredential(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	usage := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(usage.Close)
+	oldURL := claudeUsageURL
+	claudeUsageURL = usage.URL
+	t.Cleanup(func() { claudeUsageURL = oldURL })
+	_, proxy := setupProxyAccounts(t, upstream.server.URL)
+	request := func(secret string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, hubStatusPath, nil)
+		if secret != "" {
+			req.Header.Set("Authorization", "Bearer "+secret)
+		}
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if got := request(""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("status without credential: %d", got.Code)
+	}
+	got := request(proxy.secret)
+	if got.Code != http.StatusOK {
+		t.Fatalf("status with credential: %d %s", got.Code, got.Body.String())
+	}
+	var results []ServiceStatus
+	if err := json.Unmarshal(got.Body.Bytes(), &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Service.Name != "claude" || len(results[0].Accounts) != 2 {
+		t.Fatalf("hub status = %#v", results)
+	}
+	names := []string{results[0].Accounts[0].Account.Name, results[0].Accounts[1].Account.Name}
+	if strings.Join(names, ",") != "a,b" || !results[0].Accounts[0].Active {
+		t.Fatalf("hub status accounts = %v, first active = %v", names, results[0].Accounts[0].Active)
+	}
+	if strings.Contains(got.Body.String(), "setup-token-a") {
+		t.Fatal("hub status leaked a setup token")
+	}
+}
+
+func TestFetchHubStatus(t *testing.T) {
+	want := []ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Accounts: []AccountStatus{{Service: "claude", Account: AccountState{Name: "work"}, Active: true}}}}
+	var sawAuth string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = r.Header.Get("Authorization")
+		if r.URL.Path != hubStatusPath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(want)
+	}))
+	t.Cleanup(hub.Close)
+	got, err := FetchHubStatus(context.Background(), hub.URL, "sk-ant-oat01-launch")
+	if err != nil || len(got) != 1 || got[0].Accounts[0].Account.Name != "work" || !got[0].Accounts[0].Active {
+		t.Fatalf("FetchHubStatus = %#v, %v", got, err)
+	}
+	if sawAuth != "Bearer sk-ant-oat01-launch" {
+		t.Fatalf("hub saw Authorization %q", sawAuth)
+	}
+	hub.Close()
+	if _, err := FetchHubStatus(context.Background(), hub.URL, "x"); err == nil {
+		t.Fatal("status from a closed hub succeeded")
+	}
+}
+
+func TestRenderStatusShowsServiceNote(t *testing.T) {
+	out := RenderStatus([]ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Note: "hub at box-box unreachable"}}, nil, time.Now())
+	if !strings.Contains(out, "hub at box-box unreachable") || strings.Contains(out, "no registered accounts") {
+		t.Fatalf("render = %s", out)
+	}
+}

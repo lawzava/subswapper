@@ -861,8 +861,16 @@ func runStatus(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now()))
-	return err
+	notes := applyHubStatus(*cfg, cycle.Results)
+	if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now())); err != nil {
+		return err
+	}
+	for _, note := range notes {
+		if _, err := fmt.Fprintln(stdout, note); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runImportClaudeSwap(args []string, stdout io.Writer) error {

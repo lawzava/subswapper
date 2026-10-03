@@ -409,6 +409,9 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"service":"` + p.service.Name + `","proxy":"subswapper"}` + "\n"))
 		return
 	}
+	if serveHubStatus(w, r, p.cfg) {
+		return
+	}
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		writeClaudeProxyError(w, http.StatusNotImplemented, "invalid_request_error",
 			"subswapper codex proxy relays HTTP only; proxied launches set supports_websockets=false")

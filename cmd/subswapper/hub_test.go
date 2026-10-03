@@ -346,3 +346,62 @@ func TestHubConnectEnrollsFromHub(t *testing.T) {
 		t.Fatal("hub connect without an address succeeded")
 	}
 }
+
+func TestStatusOnHubClientShowsHubAccounts(t *testing.T) {
+	hubDir := t.TempDir()
+	hubConfig := writeProxyHomeConfig(t, hubDir, "127.0.0.1:1")
+	createHomeAccount(t, hubConfig, "claude", "work")
+	storeTestSetupToken(t, hubConfig, "work", "sk-ant-oat01-real-account-token")
+	cfg, err := subswapper.LoadConfig(hubConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A probe backoff keeps the hub's status run off the network.
+	state, err := subswapper.LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := state.Service("claude").Accounts["work"]
+	account.FetchBackoffUntil = time.Now().Add(time.Hour)
+	account.CredentialsError = "probe paused for test"
+	state.Service("claude").Accounts["work"] = account
+	state.Service("claude").ActiveAccount = "work"
+	if err := subswapper.SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := subswapper.NewClaudeProxy(*cfg, "claude", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := subswapper.LoadOrCreateClaudeProxySecret(*cfg, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := httptest.NewServer(proxy)
+	t.Cleanup(hub.Close)
+
+	dir := t.TempDir()
+	configPath := writeHubClientConfig(t, dir, "claude", hub.URL, secret)
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"status", "-config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	got := stdout.String()
+	for _, want := range []string{"work", "probe paused for test", "claude: accounts on the hub at " + hub.URL} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("client status lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "no registered accounts") {
+		t.Fatalf("client status still reports no accounts:\n%s", got)
+	}
+
+	hub.Close()
+	stdout.Reset()
+	if err := run([]string{"status", "-config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("status with the hub down failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "hub at "+hub.URL+" unavailable") {
+		t.Fatalf("client status with the hub down:\n%s", stdout.String())
+	}
+}

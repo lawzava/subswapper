@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 
@@ -130,6 +131,84 @@ func writeNewPrivateFile(path string, data []byte) error {
 		return err
 	}
 	return file.Close()
+}
+
+// applyHubStatus fills each hub client service in results with the rows its
+// hub reports, asking each hub host once, and returns one line per service
+// saying where its accounts live.
+func applyHubStatus(cfg subswapper.Config, results []subswapper.ServiceStatus) []string {
+	type hubGroup struct {
+		url, credential string
+		services        []subswapper.ServiceConfig
+	}
+	var groups []*hubGroup
+	byHost := map[string]*hubGroup{}
+	var notes []string
+	resultIndex := map[string]int{}
+	for index, result := range results {
+		resultIndex[result.Service.Name] = index
+	}
+	setNote := func(name, note string) {
+		if index, ok := resultIndex[name]; ok {
+			results[index].Note = note
+		}
+	}
+	for _, service := range cfg.Services {
+		if !service.HubClient() || service.Disabled {
+			continue
+		}
+		var credential string
+		var err error
+		if isClaudeServiceConfig(service) {
+			credential, err = subswapper.LoadHubClaudeSecret(cfg, service.Name)
+		} else {
+			var placeholder subswapper.CodexProxyPlaceholder
+			placeholder, err = subswapper.LoadHubCodexPlaceholder(cfg, service.Name)
+			credential = placeholder.Token
+		}
+		if err != nil {
+			setNote(service.Name, "no hub credential; run hub connect")
+			continue
+		}
+		host := service.HubURL
+		if parsed, parseErr := url.Parse(service.HubURL); parseErr == nil {
+			host = parsed.Scheme + "://" + parsed.Hostname()
+		}
+		group := byHost[host]
+		if group == nil {
+			group = &hubGroup{url: service.HubURL, credential: credential}
+			byHost[host] = group
+			groups = append(groups, group)
+		}
+		group.services = append(group.services, service)
+	}
+	for _, group := range groups {
+		hubResults, err := subswapper.FetchHubStatus(context.Background(), group.url, group.credential)
+		for _, service := range group.services {
+			if err != nil {
+				setNote(service.Name, "hub at "+service.HubURL+" unavailable")
+				notes = append(notes, fmt.Sprintf("%s: hub at %s unavailable: %v", service.Name, service.HubURL, err))
+				continue
+			}
+			found := false
+			for _, hubResult := range hubResults {
+				if hubResult.Service.Name != service.Name {
+					continue
+				}
+				found = true
+				if index, ok := resultIndex[service.Name]; ok {
+					results[index].Accounts = hubResult.Accounts
+					results[index].Note = hubResult.Note
+				}
+			}
+			if !found {
+				setNote(service.Name, "hub has no "+service.Name+" service")
+				continue
+			}
+			notes = append(notes, fmt.Sprintf("%s: accounts on the hub at %s", service.Name, service.HubURL))
+		}
+	}
+	return notes
 }
 
 func printHubListen(stdout io.Writer, service subswapper.ServiceConfig) error {

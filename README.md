@@ -113,7 +113,7 @@ ranking ties and paces switches away from an account at the threshold.
 | `capture -service <name> -account <name> [-email <label>]` | Import the current login into a home; retained for migration and bundle-mode services. |
 | `switch -service <name> [-account <name>\|auto]` | Change the preferred route; `auto` picks the best healthy account (see [How auto-switching works](#how-auto-switching-works)). |
 | `switch -service all -account auto` | Auto-pick the best account for every service at once. |
-| `status` (alias `list`) | Show every captured account with usage windows, score, and state. |
+| `status` (alias `list`) | Show every captured account with usage windows, score, and state. On a hub client, show the hub's accounts. |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Poll usage on a loop and auto-switch when thresholds are hit. Continuous mode logs events; `-verbose` prints every table; `-proxy` also serves every configured auth proxy. |
 | `proxy [-service <name>] [-listen 127.0.0.1:7878]` | Serve the auth proxies configured by `proxy_listen`; `-listen` overrides one service's address. |
 | `hub export [-service <name>] [-host <name>] -out <file\|->` | Write a bundle that lets another machine use this machine's proxies over Tailscale (see [Hub mode](#hub-mode-across-machines)). |
@@ -331,6 +331,8 @@ their requests to the new hub. If the hub is unreachable or rejects the
 credential, `home run` fails instead of launching directly. On a client,
 `home proxy-auth -service codex` also moves a real `~/.codex/auth.json` aside.
 Account commands such as `login`, `token`, and `switch` run on the hub.
+`status` on a client asks each hub once, using the stored credential, and
+prints the hub's rows with a line saying where the accounts live.
 
 Only traffic sent to the proxy goes through the hub. Telemetry, MCP
 connectors, and tool web fetches from a client CLI still use the client's own

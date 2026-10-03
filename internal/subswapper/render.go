@@ -13,7 +13,11 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", "-------", "-------", "--------", "--", "------", "------", "-----", "-----")
 	for _, result := range results {
 		if len(result.Accounts) == 0 {
-			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", "no registered accounts")
+			state := "no registered accounts"
+			if result.Note != "" {
+				state = result.Note
+			}
+			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", state)
 			continue
 		}
 		for _, account := range result.Accounts {

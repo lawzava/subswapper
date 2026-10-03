@@ -327,6 +327,9 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"service":"` + p.service.Name + `","proxy":"subswapper"}` + "\n"))
 		return
 	}
+	if serveHubStatus(w, r, p.cfg) {
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, claudeProxyRequestBodyLimit+1))
 	if err != nil {
 		writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", "request body could not be read")

@@ -25,6 +25,11 @@ const (
 	// enrolled service's port returns the same bundle.
 	defaultHubPort       = "7878"
 	hubBundleFetchWindow = 15 * time.Second
+	hubStatusPath        = "/subswapper/hub/status"
+	// hubStatusWindow bounds the hub's status run; a client waits a little
+	// longer so it sees the hub's answer rather than its own timeout.
+	hubStatusWindow      = 30 * time.Second
+	hubStatusFetchWindow = 45 * time.Second
 )
 
 // Tailscale assigns node addresses from these ranges. The hub listener
@@ -198,6 +203,59 @@ func serveHubBundle(w http.ResponseWriter, r *http.Request, cfg Config, service 
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(bundle)
 	return true
+}
+
+// serveHubStatus answers an authenticated client with the hub's status run,
+// the same probe `subswapper status` makes on the hub, for every service.
+func serveHubStatus(w http.ResponseWriter, r *http.Request, cfg Config) bool {
+	if r.URL.Path != hubStatusPath {
+		return false
+	}
+	if r.Method != http.MethodGet {
+		writeClaudeProxyError(w, http.StatusMethodNotAllowed, "invalid_request_error", "hub status accepts GET only")
+		return true
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), hubStatusWindow)
+	defer cancel()
+	cycle, err := StatusOnce(ctx, cfg)
+	if err != nil {
+		writeClaudeProxyError(w, http.StatusInternalServerError, "api_error", "subswapper hub status failed")
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(cycle.Results)
+	return true
+}
+
+// FetchHubStatus asks the hub at hubURL for its status with a client credential.
+func FetchHubStatus(ctx context.Context, hubURL, credential string) ([]ServiceStatus, error) {
+	origin, err := parseProxyUpstream(hubURL)
+	if err != nil {
+		return nil, fmt.Errorf("hub_url: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, hubStatusFetchWindow)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin.String()+hubStatusPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		return nil, errors.New("hub did not answer")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hub answered %s", resp.Status)
+	}
+	var results []ServiceStatus
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&results); err != nil {
+		return nil, errors.New("hub returned malformed status")
+	}
+	return results, nil
 }
 
 // hubBundleURL turns a hub address such as 100.67.68.117, box-box:7879, or
