@@ -73,27 +73,16 @@ type codexAppServerError struct {
 func (e *codexAppServerError) Error() string { return fmt.Sprintf("codex app-server: %v", e.cause) }
 func (e *codexAppServerError) Unwrap() error { return e.cause }
 
-func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, account AccountState, active bool) (UsageSnapshot, error) {
-	source, err := snapshotCredentialSource(ctx, cfg, service, account, active, func() (credentialSource, error) {
-		return findCodexAuth(cfg, service, account, active)
-	})
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-	if err := validateCodexAuth(source.data); err != nil {
-		return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
-	}
-
+// fetchCodexUsage reads an account's limits through codex app-server in the
+// account's own home, so Codex's official token refresh stays in that home.
+func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, account AccountState) (UsageSnapshot, error) {
 	codexHome := AccountDir(cfg, service.Name, account.Name)
-	if !service.UsesAccountHomes() {
-		codexHome, err = os.MkdirTemp("", "subswapper-codex-*")
-		if err != nil {
-			return UsageSnapshot{}, err
-		}
-		defer func() { _ = os.RemoveAll(codexHome) }()
-		if err := writeFileAtomic(filepath.Join(codexHome, "auth.json"), source.data); err != nil {
-			return UsageSnapshot{}, err
-		}
+	data, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		return UsageSnapshot{}, fmt.Errorf("%w: read stored Codex login: %v", errCredentialsInvalid, err)
+	}
+	if err := validateCodexAuth(data); err != nil {
+		return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
 	}
 	raw, err := readCodexRateLimits(ctx, codexHome)
 	if err != nil {
@@ -105,14 +94,6 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 		}
 		return UsageSnapshot{}, err
 	}
-	refreshed, readErr := os.ReadFile(filepath.Join(codexHome, "auth.json"))
-	if !service.UsesAccountHomes() && readErr == nil && !bytes.Equal(refreshed, source.data) && validateCodexAuth(refreshed) == nil {
-		// Only touch the live file when it was the source of these tokens;
-		// never clobber a live login we did not read.
-		if err := applyCredentialUpdate(ctx, cfg, service, account, source, refreshed, true); err != nil {
-			return UsageSnapshot{}, err
-		}
-	}
 
 	usage := convertCodexRateLimits(raw)
 	if !usage.HasLimits() {
@@ -120,19 +101,6 @@ func fetchCodexUsage(ctx context.Context, cfg Config, service ServiceConfig, acc
 	}
 	usage.ObservedAt = time.Now().UTC()
 	return usage, nil
-}
-
-func findCodexAuth(cfg Config, service ServiceConfig, account AccountState, active bool) (credentialSource, error) {
-	return findCredentialSource(cfg, service, account, active,
-		func(data []byte) bool {
-			var auth codexAuthFile
-			if err := json.Unmarshal(data, &auth); err != nil {
-				return false
-			}
-			return auth.Tokens != nil || auth.AuthMode != ""
-		},
-		"no managed file contains Codex auth",
-		"read stored Codex auth")
 }
 
 func isCodexRateLimitedError(err error) bool {

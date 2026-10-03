@@ -49,7 +49,7 @@ done
 		t.Fatal(err)
 	}
 
-	usage, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, false)
+	usage, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ done
 		t.Fatal(err)
 	}
 
-	if _, err := fetchCodexUsage(testContext(t), cfg, service, account, false); err != nil {
+	if _, err := fetchCodexUsage(testContext(t), cfg, service, account); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(home, "probe-marker")); err != nil {
@@ -153,7 +153,7 @@ done
 		t.Fatal(err)
 	}
 
-	usage, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, false)
+	usage, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}

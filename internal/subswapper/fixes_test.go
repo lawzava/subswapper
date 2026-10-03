@@ -3,14 +3,10 @@ package subswapper
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -58,9 +54,8 @@ func TestProbeErrorsAreSanitizedAndBackedOff(t *testing.T) {
 		Monitor:    MonitorConfig{Interval: Duration{Duration: 5 * time.Minute}},
 		Services: []ServiceConfig{
 			{
-				Name:  "svc",
-				Kind:  "custom",
-				Files: []ManagedFile{requiredFile(live, "auth.json")},
+				Name: "svc",
+				Kind: "codex",
 				UsageCommand: []string{"sh", "-c",
 					`{ printf '\033[31mboom\n  repeated   whitespace '; i=0; while [ "$i" -lt 600 ]; do printf x; i=$((i+1)); done; printf '\033[0m'; } >&2; exit 1`},
 			},
@@ -100,8 +95,7 @@ func TestStatusProbeDoesNotHoldStateLock(t *testing.T) {
 		Services: []ServiceConfig{
 			{
 				Name:         "svc",
-				Kind:         "custom",
-				Files:        []ManagedFile{requiredFile(live, "auth.json")},
+				Kind:         "codex",
 				UsageCommand: []string{"sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep 0.01; done; echo '{"five_hour":{"pct":10},"weekly":{"pct":20}}'`, "probe", started, release},
 			},
 		},
@@ -169,8 +163,7 @@ func TestConcurrentActiveChangeSuppressesAutoSwitch(t *testing.T) {
 		Services: []ServiceConfig{
 			{
 				Name:         "svc",
-				Kind:         "custom",
-				Files:        []ManagedFile{requiredFile(live, "auth.json")},
+				Kind:         "codex",
 				UsageCommand: []string{"sh", "-c", command, "probe", started, release},
 			},
 		},
@@ -206,168 +199,6 @@ func TestConcurrentActiveChangeSuppressesAutoSwitch(t *testing.T) {
 	}
 	if got := state.Service("svc").ActiveAccount; got != "b" {
 		t.Fatalf("active account = %q, want b", got)
-	}
-}
-
-func TestStaleCredentialRefreshDoesNotOverwriteNewLogin(t *testing.T) {
-	dir := t.TempDir()
-	refreshStarted := make(chan struct{})
-	releaseRefresh := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/usage":
-			w.WriteHeader(http.StatusUnauthorized)
-		case "/token":
-			close(refreshStarted)
-			<-releaseRefresh
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"refreshed","refresh_token":"refreshed-r","expires_in":3600}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL+"/usage", server.URL+"/token"
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	liveCredentials := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	service := ServiceConfig{
-		Name: "claude",
-		Kind: "claude",
-		Files: []ManagedFile{
-			requiredFile(liveCredentials, "credentials.json"),
-			optionalFile(liveConfig, "claude.json"),
-		},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	accountDir := AccountDir(cfg, "claude", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	oldCredentials := `{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-r"}}`
-	identity := `{"oauthAccount":{"accountUuid":"account-a"}}`
-	for path, content := range map[string]string{
-		liveCredentials: oldCredentials,
-		liveConfig:      identity,
-		filepath.Join(accountDir, "credentials.json"): oldCredentials,
-		filepath.Join(accountDir, "claude.json"):      identity,
-	} {
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	setActiveTestAccount(t, cfg, "claude", "a")
-	done := make(chan error, 1)
-	go func() {
-		_, err := fetchClaudeUsage(context.Background(), cfg, service, AccountState{Name: "a"}, true)
-		done <- err
-	}()
-	<-refreshStarted
-	newCredentials := `{"claudeAiOauth":{"accessToken":"new-login","refreshToken":"new-r"}}`
-	if err := os.WriteFile(liveCredentials, []byte(newCredentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	close(releaseRefresh)
-	if err := <-done; err == nil || !strings.Contains(err.Error(), "changed during probe") {
-		t.Fatalf("expected stale refresh rejection, got %v", err)
-	}
-	assertFileContent(t, liveCredentials, newCredentials)
-	assertFileContent(t, filepath.Join(accountDir, "credentials.json"), oldCredentials)
-}
-
-func TestRefreshFinishingAfterSwitchUpdatesOnlyOriginalBackup(t *testing.T) {
-	dir := t.TempDir()
-	refreshStarted := make(chan struct{})
-	releaseRefresh := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/usage":
-			if r.Header.Get("Authorization") == "Bearer refreshed" {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"five_hour":{"utilization":10},"seven_day":{"utilization":20}}`))
-				return
-			}
-			w.WriteHeader(http.StatusUnauthorized)
-		case "/token":
-			close(refreshStarted)
-			<-releaseRefresh
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"access_token":"refreshed","refresh_token":"refreshed-r","expires_in":3600}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL+"/usage", server.URL+"/token"
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	liveCredentials := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	service := ServiceConfig{
-		Name: "claude",
-		Kind: "claude",
-		Files: []ManagedFile{
-			requiredFile(liveCredentials, "credentials.json"),
-			optionalFile(liveConfig, "claude.json"),
-		},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	writeClaudeAccount := func(name, token, uuid string) {
-		t.Helper()
-		if err := os.WriteFile(liveCredentials, []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q}}`, token, token+"-r")), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(liveConfig, []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q}}`, uuid)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := CaptureAccount(cfg, "claude", name, ""); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeClaudeAccount("a", "old", "account-a")
-	writeClaudeAccount("b", "account-b-token", "account-b")
-	if err := SwitchAccount(cfg, "claude", "a"); err != nil {
-		t.Fatal(err)
-	}
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	accountA := state.Service("claude").Accounts["a"]
-	done := make(chan error, 1)
-	go func() {
-		_, err := fetchClaudeUsage(context.Background(), cfg, service, accountA, true)
-		done <- err
-	}()
-	<-refreshStarted
-	if err := SwitchAccount(cfg, "claude", "b"); err != nil {
-		close(releaseRefresh)
-		<-done
-		t.Fatal(err)
-	}
-	close(releaseRefresh)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	assertClaudeAccessToken(t, filepath.Join(AccountDir(cfg, "claude", "a"), "credentials.json"), "refreshed")
-	assertClaudeAccessToken(t, liveCredentials, "account-b-token")
-}
-
-func assertClaudeAccessToken(t *testing.T, path, want string) {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oauth, err := parseClaudeOAuth(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if oauth.AccessToken != want {
-		t.Fatalf("access token = %q, want %q", oauth.AccessToken, want)
 	}
 }
 
@@ -424,36 +255,6 @@ func TestSanitizeProbeErrorRedactsCredentials(t *testing.T) {
 	}
 }
 
-func TestClaudeProviderBodyIsNotPersisted(t *testing.T) {
-	dir := t.TempDir()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("diagnostic opaque-claude-secret"))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	service := ServiceConfig{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	if err := os.WriteFile(live, []byte(`{"claudeAiOauth":{"accessToken":"test-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "claude", "a", ""); err != nil {
-		t.Fatal(err)
-	}
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	CollectService(context.Background(), cfg, state, service)
-	if got := state.Service("claude").Accounts["a"].LastProbeError; strings.Contains(got, "opaque-claude-secret") {
-		t.Fatalf("provider body persisted: %q", got)
-	}
-}
-
 func TestCodexStderrIsNotPersisted(t *testing.T) {
 	dir := t.TempDir()
 	fakeCodex := filepath.Join(dir, "codex")
@@ -465,15 +266,10 @@ func TestCodexStderrIsNotPersisted(t *testing.T) {
 	codexCommand = fakeCodex
 	t.Cleanup(func() { codexCommand = oldCommand })
 
-	live := filepath.Join(dir, "auth.json")
-	service := ServiceConfig{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"test-token","account_id":"account-a"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "a", ""); err != nil {
-		t.Fatal(err)
-	}
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{{Name: "codex", Kind: "codex"}}}
+	cfg.ApplyDefaults()
+	service := cfg.Services[0]
+	registerHomeAccount(t, cfg, "codex", "a", `{"auth_mode":"chatgpt","tokens":{"access_token":"test-token","refresh_token":"r","account_id":"account-a"}}`)
 	state, err := LoadState(cfg.StatePath)
 	if err != nil {
 		t.Fatal(err)
@@ -486,20 +282,14 @@ func TestCodexStderrIsNotPersisted(t *testing.T) {
 
 func TestCustomCommandDiagnosticsAreNotPersisted(t *testing.T) {
 	dir := t.TempDir()
-	live := filepath.Join(dir, "credential")
-	service := ServiceConfig{
+	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{{
 		Name:         "custom",
-		Kind:         "custom",
-		Files:        []ManagedFile{requiredFile(live, "credential")},
+		Kind:         "codex",
 		UsageCommand: []string{"sh", "-c", "printf '%s\\n' 'diagnostic opaque-command-secret' >&2; exit 1"},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	if err := os.WriteFile(live, []byte("credential"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "custom", "a", ""); err != nil {
-		t.Fatal(err)
-	}
+	}}}
+	cfg.ApplyDefaults()
+	service := cfg.Services[0]
+	registerHomeAccount(t, cfg, "custom", "a", "credential")
 	state, err := LoadState(cfg.StatePath)
 	if err != nil {
 		t.Fatal(err)
@@ -604,67 +394,6 @@ func TestSafeNameNeverEscapesBackupRoot(t *testing.T) {
 	}
 }
 
-func TestCaptureRejectsReservedAccountNames(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	if err := os.WriteFile(active, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig(dir, active)
-	for _, name := range []string{"auto", ".", "..", "  "} {
-		if _, err := CaptureAccount(cfg, "codex", name, ""); err == nil {
-			t.Fatalf("expected capture of account %q to fail", name)
-		}
-	}
-}
-
-func TestCaptureRejectsCaseInsensitiveDuplicate(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	if err := os.WriteFile(active, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig(dir, active)
-	if _, err := CaptureAccount(cfg, "codex", "Work", ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "work", ""); err == nil {
-		t.Fatal("expected case-colliding capture to fail")
-	}
-	if _, err := CaptureAccount(cfg, "codex", "Work", ""); err != nil {
-		t.Fatalf("recapturing the same name must stay allowed: %v", err)
-	}
-}
-
-func TestSwitchAccountSyncsOutgoingAccountFiles(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(active, "auth.json")}},
-		},
-	}
-
-	captureWithUsage(t, cfg, "codex", active, `{"auth_mode":"chatgpt","tokens":{"access_token":"a1","account_id":"account-a"}}`, "a", 10, 10)
-	captureWithUsage(t, cfg, "codex", active, `{"auth_mode":"chatgpt","tokens":{"access_token":"b1","account_id":"account-b"}}`, "b", 10, 10)
-	// Simulate the live client rotating b's credentials after capture.
-	rotated := `{"auth_mode":"chatgpt","tokens":{"access_token":"b2","account_id":"account-b"}}`
-	if err := os.WriteFile(active, []byte(rotated), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := SwitchAccount(cfg, "codex", "a"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, active, `{"auth_mode":"chatgpt","tokens":{"access_token":"a1","account_id":"account-a"}}`)
-	if err := SwitchAccount(cfg, "codex", "b"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, active, rotated)
-}
-
 func TestSwitchAccountRefusesDisabledService(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "active-auth.json")
@@ -673,57 +402,6 @@ func TestSwitchAccountRefusesDisabledService(t *testing.T) {
 	cfg.Services[0].Disabled = true
 	if err := SwitchAccount(cfg, "codex", "a"); err == nil {
 		t.Fatal("expected switch on disabled service to fail")
-	}
-}
-
-func TestRestoreRemovesLiveOptionalFileWhenBackupMissing(t *testing.T) {
-	dir := t.TempDir()
-	required := filepath.Join(dir, "required.json")
-	optional := filepath.Join(dir, "optional.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{
-				Name: "svc",
-				Kind: "custom",
-				Files: []ManagedFile{
-					requiredFile(required, "required.json"),
-					optionalFile(optional, "optional.json"),
-				},
-			},
-		},
-	}
-	cfg.ApplyDefaults()
-
-	if err := os.WriteFile(required, []byte("one"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(optional, []byte("one-optional"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "svc", "one", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(required, []byte("two"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(optional); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "svc", "two", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := SwitchAccount(cfg, "svc", "one"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, optional, "one-optional")
-	if err := SwitchAccount(cfg, "svc", "two"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(optional); !os.IsNotExist(err) {
-		t.Fatalf("expected live optional file to be removed for account without it, got %v", err)
 	}
 }
 
@@ -737,7 +415,7 @@ func TestSwitchBestSkipsDisabledAndEmptyServices(t *testing.T) {
 		Services: []ServiceConfig{
 			testService("alpha", alphaActive),
 			testService("beta", betaActive),
-			{Name: "off", Kind: "custom", Disabled: true, Files: []ManagedFile{requiredFile(filepath.Join(dir, "off.json"), "off.json")}},
+			{Name: "off", Kind: "codex", Disabled: true},
 		},
 	}
 	cfg.ApplyDefaults()
@@ -754,7 +432,7 @@ func TestSwitchBestSkipsDisabledAndEmptyServices(t *testing.T) {
 	if len(switches) != 1 || switches[0].Service != "alpha" || switches[0].Account != "b" {
 		t.Fatalf("unexpected switches %#v", switches)
 	}
-	assertFileContent(t, alphaActive, "b1")
+	assertActive(t, cfg, "alpha", "b")
 }
 
 func TestSwitchBestPersistsEarlierSwitchWhenLaterServiceFails(t *testing.T) {
@@ -776,12 +454,7 @@ func TestSwitchBestPersistsEarlierSwitchWhenLaterServiceFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	// beta has a captured account but no usage data: nothing is selectable.
-	if err := os.WriteFile(betaActive, []byte("c1"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "beta", "c", ""); err != nil {
-		t.Fatal(err)
-	}
+	registerHomeAccount(t, cfg, "beta", "c", "c1")
 
 	switches, err := SwitchBest(testContext(t), cfg, "all")
 	if err == nil {
@@ -797,7 +470,6 @@ func TestSwitchBestPersistsEarlierSwitchWhenLaterServiceFails(t *testing.T) {
 	if got := state.Service("alpha").ActiveAccount; got != "b" {
 		t.Fatalf("alpha switch was not persisted, active is %q", got)
 	}
-	assertFileContent(t, alphaActive, "b1")
 }
 
 func TestSwitchBestDoesNotRestoreWhenBestAlreadyActive(t *testing.T) {
@@ -809,10 +481,6 @@ func TestSwitchBestDoesNotRestoreWhenBestAlreadyActive(t *testing.T) {
 	if err := SwitchAccount(cfg, "codex", "a"); err != nil {
 		t.Fatal(err)
 	}
-	// Live rotation after the switch: a no-op "switch" must not clobber it.
-	if err := os.WriteFile(active, []byte("a-rotated"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
 	switches, err := SwitchBest(testContext(t), cfg, "codex")
 	if err != nil {
@@ -821,7 +489,7 @@ func TestSwitchBestDoesNotRestoreWhenBestAlreadyActive(t *testing.T) {
 	if len(switches) != 0 {
 		t.Fatalf("expected no switch, got %#v", switches)
 	}
-	assertFileContent(t, active, "a-rotated")
+	assertActive(t, cfg, "codex", "a")
 }
 
 func TestMonitorOnceSkipsDisabledAndEmptyServices(t *testing.T) {
@@ -833,7 +501,7 @@ func TestMonitorOnceSkipsDisabledAndEmptyServices(t *testing.T) {
 		Services: []ServiceConfig{
 			testService("alpha", active),
 			testService("empty", filepath.Join(dir, "empty.json")),
-			{Name: "off", Kind: "custom", Disabled: true, Files: []ManagedFile{requiredFile(filepath.Join(dir, "off.json"), "off.json")}},
+			{Name: "off", Kind: "codex", Disabled: true},
 		},
 	}
 	cfg.ApplyDefaults()
@@ -915,7 +583,7 @@ func TestMonitorOnceEscapesExhaustedActiveDespiteCooldown(t *testing.T) {
 	if len(result.Switches) != 1 {
 		t.Fatalf("expected immediate escape from exhausted account, got %d switches", len(result.Switches))
 	}
-	assertFileContent(t, active, "claude-b")
+	assertActive(t, cfg, "claude", "b")
 }
 
 func TestCollectServiceMarksAccountWithMissingBackupUnselectable(t *testing.T) {
@@ -941,182 +609,6 @@ func TestCollectServiceMarksAccountWithMissingBackupUnselectable(t *testing.T) {
 	}
 	if !strings.Contains(status.Reason, "missing backup files") {
 		t.Fatalf("unexpected reason %q", status.Reason)
-	}
-}
-
-func TestSyncNeverOverwritesGoodBackupWithCorruptLiveFile(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	service := ServiceConfig{
-		Name: "claude", Kind: "claude",
-		Files: []ManagedFile{
-			requiredFile(live, "credentials.json"),
-			optionalFile(liveConfig, "claude.json"),
-		},
-	}
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services:   []ServiceConfig{service},
-	}
-	cfg.ApplyDefaults()
-	goodBackup := `{"claudeAiOauth":{"accessToken":"good-token"}}`
-	accountDir := AccountDir(cfg, "claude", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backupPath := filepath.Join(accountDir, "credentials.json")
-	if err := os.WriteFile(backupPath, []byte(goodBackup), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	identity := `{"oauthAccount":{"accountUuid":"account-a"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "claude.json"), []byte(identity), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveConfig, []byte(identity), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// A logged-out/truncated live file must not poison the backup...
-	for _, corrupt := range []string{"", "   ", "{}", `{"claudeAiOauth":{}}`, "not-json"} {
-		if err := os.WriteFile(live, []byte(corrupt), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := syncAccountFiles(cfg, service, "a"); err != nil {
-			t.Fatal(err)
-		}
-		assertFileContent(t, backupPath, goodBackup)
-	}
-	// ...while genuinely rotated credentials still sync.
-	rotated := `{"claudeAiOauth":{"accessToken":"rotated-token"}}`
-	if err := os.WriteFile(live, []byte(rotated), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := syncAccountFiles(cfg, service, "a"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, backupPath, rotated)
-}
-
-// Replays the 2026-07-02 incident: an account whose stored refresh token was
-// rotated out (every fetch 401s, refresh rejected) but whose cached usage is
-// the lowest in the store. The monitor must never switch to it.
-func TestMonitorNeverSwitchesToAccountWithDeadCredentials(t *testing.T) {
-	dir := t.TempDir()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL, server.URL
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	// Active account "busy" at 100%, dead account "dead" cached at 5%.
-	captureWithUsage(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"dead","refreshToken":"dead"}}`, "dead", 5, 5)
-	captureWithUsage(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"busy","refreshToken":"busy"}}`, "busy", 100, 60)
-	if err := SwitchAccount(cfg, "claude", "busy"); err != nil {
-		t.Fatal(err)
-	}
-	setServiceLastSwitchedAt(t, cfg, "claude", time.Now().Add(-defaultAutoSwitchCooldown-time.Minute))
-
-	result := MonitorOnce(testContext(t), cfg, true)
-	if len(result.Switches) != 0 {
-		t.Fatalf("expected no switch to the dead account, got %#v", result.Switches)
-	}
-	assertFileContent(t, live, `{"claudeAiOauth":{"accessToken":"busy","refreshToken":"busy"}}`)
-	for _, status := range result.Results[0].Accounts {
-		if status.Account.Name == "dead" && status.Selectable {
-			t.Fatalf("dead account must not be selectable, reason %q", status.Reason)
-		}
-	}
-}
-
-// A credentials file that parses but has no tokens at all (captured
-// mid-logout) must be credentials-invalid, not a plain error that falls back
-// to the cached usage snapshot.
-func TestClaudeAccountWithoutAnyTokensIsUnselectable(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	captureWithUsage(t, cfg, "claude", live, `{"claudeAiOauth":{}}`, "dead", 5, 5)
-
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := CollectService(testContext(t), cfg, state, cfg.Services[0])
-	status := result.Accounts[0]
-	if status.Selectable {
-		t.Fatalf("expected tokenless account to be unselectable, reason %q", status.Reason)
-	}
-	if !strings.Contains(status.Reason, "unusable") {
-		t.Fatalf("expected credentials-invalid reason, got %q", status.Reason)
-	}
-}
-
-// A missing access token with a refresh token present is recoverable: the
-// fetch must refresh instead of failing.
-func TestClaudeFetchRefreshesWhenAccessTokenMissing(t *testing.T) {
-	dir := t.TempDir()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"fresh","expires_in":3600,"refresh_token":"fresh-refresh"}`))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer fresh" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"five_hour":{"utilization":12},"seven_day":{"utilization":34}}`))
-	})
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL, server.URL+"/token"
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	accountDir := AccountDir(cfg, "claude", "main")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(accountDir, "credentials.json"), []byte(`{"claudeAiOauth":{"refreshToken":"r"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	usage, err := fetchClaudeUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ratio, ok := usage.FiveHour.Ratio(); !ok || ratio != 0.12 {
-		t.Fatalf("unexpected five-hour ratio %v %v", ratio, ok)
 	}
 }
 
@@ -1163,7 +655,7 @@ done
 		t.Fatal(err)
 	}
 
-	_, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, false)
+	_, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1172,165 +664,9 @@ done
 	}
 }
 
-// A 429 must pause fetches for that account (honoring Retry-After) instead of
-// retrying at full rate every cycle, while cached usage keeps it selectable.
-func TestCollectServiceBacksOffOnRateLimit(t *testing.T) {
-	dir := t.TempDir()
-	var requests atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.Header().Set("Retry-After", "300")
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	captureWithUsage(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"tok"}}`, "a", 10, 10)
-
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("expected one request, got %d", got)
-	}
-	if !first.Selectable || !strings.Contains(first.Reason, "stale usage") {
-		t.Fatalf("expected selectable with stale annotation, got %v %q", first.Selectable, first.Reason)
-	}
-	until := first.Account.FetchBackoffUntil
-	if remaining := time.Until(until); remaining < 4*time.Minute || remaining > 6*time.Minute {
-		t.Fatalf("expected ~5m backoff from Retry-After, got %s", remaining)
-	}
-
-	second := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("expected no request during backoff, got %d", got)
-	}
-	if !second.Selectable || !strings.Contains(second.Reason, "paused") {
-		t.Fatalf("expected selectable with paused annotation, got %v %q", second.Selectable, second.Reason)
-	}
-}
-
-// Dead credentials must stop being probed every cycle: one failing round sets
-// a long backoff, and the account stays unselectable throughout it.
-func TestDeadCredentialsBackOffAndStayUnselectable(t *testing.T) {
-	dir := t.TempDir()
-	var requests atomic.Int64
-	mux := http.NewServeMux()
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.WriteHeader(http.StatusUnauthorized)
-	})
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL, server.URL+"/token"
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	captureWithUsage(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"x","refreshToken":"rotated-out"}}`, "dead", 5, 5)
-
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
-	afterFirst := requests.Load()
-	if afterFirst == 0 {
-		t.Fatal("expected the first cycle to probe the credentials")
-	}
-	if first.Selectable || !strings.Contains(first.Reason, "unusable") {
-		t.Fatalf("expected unselectable dead account, got %v %q", first.Selectable, first.Reason)
-	}
-
-	second := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
-	if got := requests.Load(); got != afterFirst {
-		t.Fatalf("expected no requests during credentials backoff, got %d after %d", got, afterFirst)
-	}
-	if second.Selectable {
-		t.Fatal("dead account must stay unselectable during backoff")
-	}
-	if !strings.Contains(second.Reason, "retry at") {
-		t.Fatalf("expected retry-at annotation, got %q", second.Reason)
-	}
-}
-
-// Inactive accounts with a fresh cached snapshot skip the network fetch; the
-// active account is always fetched.
-func TestInactiveAccountsUseCachedUsageWithinTTL(t *testing.T) {
-	dir := t.TempDir()
-	var requests atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"five_hour":{"utilization":12},"seven_day":{"utilization":34}}`))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	live := filepath.Join(dir, "credentials.json")
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	cfg.ApplyDefaults()
-	fresh := usageForTest(10, 10)
-	fresh.ObservedAt = time.Now().UTC()
-	captureWithUsageSnapshot(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"tok-b"}}`, "b", fresh)
-	captureWithUsageSnapshot(t, cfg, "claude", live, `{"claudeAiOauth":{"accessToken":"tok-a"}}`, "a", fresh)
-
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	CollectService(testContext(t), cfg, state, cfg.Services[0])
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("expected only the active account to be fetched, got %d requests", got)
-	}
-
-	// Age the inactive account's snapshot past the TTL: it gets fetched again.
-	stale := state.Service("claude").Accounts["b"]
-	stale.Usage.ObservedAt = time.Now().UTC().Add(-inactiveUsageTTL - time.Minute)
-	state.Service("claude").Accounts["b"] = stale
-	CollectService(testContext(t), cfg, state, cfg.Services[0])
-	if got := requests.Load(); got != 3 {
-		t.Fatalf("expected active + aged inactive fetches, got %d requests", got)
-	}
-}
-
 func TestValidateRejectsOutOfRangeMonitorKnobs(t *testing.T) {
 	base := func() Config {
-		cfg := Config{Services: []ServiceConfig{{Name: "svc", Kind: "custom", Files: []ManagedFile{{Path: "/tmp/a", BackupName: "a"}}}}}
+		cfg := Config{Services: []ServiceConfig{{Name: "svc", Kind: "codex"}}}
 		cfg.ApplyDefaults()
 		return cfg
 	}
@@ -1382,8 +718,9 @@ func TestValidateRejectsDuplicateBackupNameAfterCleaning(t *testing.T) {
 	cfg := Config{
 		Services: []ServiceConfig{
 			{
-				Name: "svc",
-				Kind: "custom",
+				Name:        "svc",
+				Kind:        "codex",
+				AccountMode: AccountModeHome,
 				Files: []ManagedFile{
 					{Path: "/tmp/a", BackupName: "auth.json"},
 					{Path: "/tmp/b", BackupName: "./auth.json"},
@@ -1419,8 +756,7 @@ func TestCollectServiceKeepsCachedUsageWhenProbeFails(t *testing.T) {
 		Services: []ServiceConfig{
 			{
 				Name:         "svc",
-				Kind:         "custom",
-				Files:        []ManagedFile{requiredFile(active, "auth.json")},
+				Kind:         "codex",
 				UsageCommand: []string{"sh", "-c", "echo boom >&2; exit 1"},
 			},
 		},
@@ -1484,145 +820,6 @@ func TestCollectServiceOrdersAccountsByName(t *testing.T) {
 	}
 }
 
-func TestFetchClaudeUsageActiveReadsLiveAndSyncsBackup(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer live-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"five_hour": {"utilization": 12, "resets_at": "2030-07-02T01:49:59Z"},
-			"seven_day": {"utilization": 34, "resets_at": "2030-07-05T03:59:59Z"}
-		}`))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{
-				requiredFile(live, "credentials.json"),
-				optionalFile(liveConfig, "claude.json"),
-			}},
-		},
-	}
-	liveCredentials := `{"claudeAiOauth":{"accessToken":"live-token"}}`
-	if err := os.WriteFile(live, []byte(liveCredentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	accountDir := AccountDir(cfg, "claude", "main")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backupPath := filepath.Join(accountDir, "credentials.json")
-	if err := os.WriteFile(backupPath, []byte(`{"claudeAiOauth":{"accessToken":"stale-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	identity := `{"oauthAccount":{"accountUuid":"account-main"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "claude.json"), []byte(identity), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveConfig, []byte(identity), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setActiveTestAccount(t, cfg, "claude", "main")
-
-	usage, err := fetchClaudeUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ratio, ok := usage.FiveHour.Ratio(); !ok || ratio != 0.12 {
-		t.Fatalf("unexpected five-hour ratio %v %v", ratio, ok)
-	}
-	assertFileContent(t, backupPath, liveCredentials)
-}
-
-func TestFetchCodexUsageActiveSyncsRefreshedAuthToLiveAndBackup(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "auth.json")
-	refreshed := `{"auth_mode":"chatgpt","tokens":{"access_token":"refreshed","refresh_token":"r2","account_id":"account-main"}}`
-	fakeCodex := filepath.Join(dir, "codex")
-	script := `#!/bin/sh
-while IFS= read -r line; do
-	case "$line" in
-		*'"id":1'*)
-			printf '%s\n' '{"id":1,"result":{"userAgent":"test"}}'
-			;;
-		*'"id":2'*)
-			printf '%s' '` + refreshed + `' > "$CODEX_HOME/auth.json"
-			printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300},"secondary":{"usedPercent":6,"windowDurationMins":10080}}}}'
-			exit 0
-			;;
-	esac
-done
-`
-	if err := os.WriteFile(fakeCodex, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	oldCommand := codexCommand
-	codexCommand = fakeCodex
-	t.Cleanup(func() { codexCommand = oldCommand })
-
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}},
-		},
-	}
-	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"live","refresh_token":"r1","account_id":"account-main"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	accountDir := AccountDir(cfg, "codex", "main")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backupPath := filepath.Join(accountDir, "auth.json")
-	if err := os.WriteFile(backupPath, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"stale","refresh_token":"r0","account_id":"account-main"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	setActiveTestAccount(t, cfg, "codex", "main")
-
-	if _, err := fetchCodexUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, true); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, backupPath, refreshed)
-	assertFileContent(t, live, refreshed)
-}
-
-func setActiveTestAccount(t *testing.T, cfg Config, serviceName, accountName string) {
-	t.Helper()
-	state := NewState()
-	state.Service(serviceName).ActiveAccount = accountName
-	if err := SaveState(cfg.StatePath, state); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSwitchAccountToActiveAccountIsNoop(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	cfg := testConfig(dir, active)
-	captureWithUsage(t, cfg, "codex", active, "a1", "a", 10, 10)
-	// Live rotation after capture: an explicit re-switch to the same account
-	// must not clobber it with the stale backup.
-	if err := os.WriteFile(active, []byte("a-rotated"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := SwitchAccount(cfg, "codex", "a"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, active, "a-rotated")
-}
-
 func TestSwitchBestErrorsWhenNothingCapturedAnywhere(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{
@@ -1636,138 +833,6 @@ func TestSwitchBestErrorsWhenNothingCapturedAnywhere(t *testing.T) {
 	cfg.ApplyDefaults()
 	if _, err := SwitchBest(testContext(t), cfg, "all"); err == nil {
 		t.Fatal("expected error when no service has captured accounts")
-	}
-}
-
-// An active account whose live credentials file is unusable must fall back to
-// its backup copy instead of failing, and must not overwrite the live file.
-func TestFetchClaudeUsageActiveFallsBackToBackupWhenLiveUnusable(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "credentials.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer backup-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"five_hour":{"utilization":12},"seven_day":{"utilization":34}}`))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	if err := os.WriteFile(live, []byte("not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	accountDir := AccountDir(cfg, "claude", "main")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backup := `{"claudeAiOauth":{"accessToken":"backup-token"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "credentials.json"), []byte(backup), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	usage, err := fetchClaudeUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "main"}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ratio, ok := usage.FiveHour.Ratio(); !ok || ratio != 0.12 {
-		t.Fatalf("unexpected five-hour ratio %v %v", ratio, ok)
-	}
-	assertFileContent(t, live, "not json")
-}
-
-// An inactive account must never read (or touch) the live credentials file,
-// even when one exists with valid credentials.
-func TestFetchClaudeUsageInactiveIgnoresLiveFile(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "credentials.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer backup-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"five_hour":{"utilization":12},"seven_day":{"utilization":34}}`))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := claudeUsageURL
-	claudeUsageURL = server.URL
-	t.Cleanup(func() { claudeUsageURL = oldURL })
-
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", Files: []ManagedFile{requiredFile(live, "credentials.json")}},
-		},
-	}
-	liveCredentials := `{"claudeAiOauth":{"accessToken":"live-token"}}`
-	if err := os.WriteFile(live, []byte(liveCredentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	accountDir := AccountDir(cfg, "claude", "other")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backup := `{"claudeAiOauth":{"accessToken":"backup-token"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "credentials.json"), []byte(backup), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	usage, err := fetchClaudeUsage(testContext(t), cfg, cfg.Services[0], AccountState{Name: "other"}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ratio, ok := usage.FiveHour.Ratio(); !ok || ratio != 0.12 {
-		t.Fatalf("unexpected five-hour ratio %v %v", ratio, ok)
-	}
-	assertFileContent(t, live, liveCredentials)
-}
-
-// Restores and state writes must always land with owner-only permissions,
-// even over a pre-existing looser-mode target.
-func TestSwitchRestoresFilesWithOwnerOnlyPermissions(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	cfg := testConfig(dir, active)
-	if err := os.WriteFile(active, []byte(`{"token":"one"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "first", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(active, []byte(`{"token":"two"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "second", ""); err != nil {
-		t.Fatal(err)
-	}
-	// Loosen the live file; the restore must tighten it back to 0600.
-	if err := os.Chmod(active, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := SwitchAccount(cfg, "codex", "first"); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{active, cfg.StatePath} {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if perm := info.Mode().Perm(); perm != 0o600 {
-			t.Fatalf("expected %s to have 0600 permissions, got %o", path, perm)
-		}
 	}
 }
 
@@ -1789,5 +854,163 @@ func TestShouldAutoSwitchLeavesHealthyActiveForEarlierWeeklyReset(t *testing.T) 
 	result = ServiceStatus{Accounts: []AccountStatus{active, idle}}
 	if shouldAutoSwitch(MonitorConfig{}, result, idle, aged, now) {
 		t.Fatal("expected no switch from a running weekly window to an idle account")
+	}
+}
+
+const codexLimitsResponse = `{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1909954910},"secondary":{"usedPercent":34,"windowDurationMins":10080,"resetsAt":1910414767},"planType":"pro","rateLimitReachedType":null}}}`
+
+// fakeCodexAppServer installs a codex that answers the rate-limit request
+// with response and counts its launches.
+func fakeCodexAppServer(t *testing.T, response string) func() int {
+	t.Helper()
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\necho call >> '" + calls + "'\n" + `while IFS= read -r line; do
+	case "$line" in
+		*'"id":1'*) printf '%s\n' '{"id":1,"result":{"userAgent":"test"}}' ;;
+		*'"id":2'*) printf '%s\n' '` + response + `'; exit 0 ;;
+	esac
+done
+`
+	path := filepath.Join(dir, "codex")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldCommand := codexCommand
+	codexCommand = path
+	t.Cleanup(func() { codexCommand = oldCommand })
+	return func() int {
+		data, _ := os.ReadFile(calls)
+		return strings.Count(string(data), "call")
+	}
+}
+
+func codexHomeConfig(dir string) Config {
+	cfg := Config{
+		BackupRoot: filepath.Join(dir, "backups"),
+		StatePath:  filepath.Join(dir, "state.json"),
+		Services:   []ServiceConfig{{Name: "codex", Kind: "codex"}},
+	}
+	cfg.ApplyDefaults()
+	return cfg
+}
+
+const codexTestLoginJSON = `{"auth_mode":"chatgpt","tokens":{"access_token":"tok","refresh_token":"ref"}}`
+
+// An account whose login was rotated out (every probe fails to refresh) but
+// whose cached usage is the lowest must never become the route.
+func TestMonitorNeverSwitchesToAccountWithDeadCredentials(t *testing.T) {
+	fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to refresh token: 401 Unauthorized"}}`)
+	cfg := codexHomeConfig(t.TempDir())
+	captureWithUsage(t, cfg, "codex", "", codexTestLoginJSON, "dead", 5, 5)
+	captureWithUsage(t, cfg, "codex", "", codexTestLoginJSON, "busy", 100, 60)
+	setServiceLastSwitchedAt(t, cfg, "codex", time.Now().Add(-defaultAutoSwitchCooldown-time.Minute))
+
+	result := MonitorOnce(testContext(t), cfg, true)
+	if len(result.Switches) != 0 {
+		t.Fatalf("expected no switch to the dead account, got %#v", result.Switches)
+	}
+	assertActive(t, cfg, "codex", "busy")
+	for _, status := range result.Results[0].Accounts {
+		if status.Account.Name == "dead" && status.Selectable {
+			t.Fatalf("dead account must not be selectable, reason %q", status.Reason)
+		}
+	}
+}
+
+// A login file that parses but has no tokens (written mid-logout) must be
+// credentials-invalid, not a plain error that keeps the cached usage.
+func TestCodexLoginWithoutTokensIsUnselectable(t *testing.T) {
+	calls := fakeCodexAppServer(t, codexLimitsResponse)
+	cfg := codexHomeConfig(t.TempDir())
+	captureWithUsage(t, cfg, "codex", "", `{"auth_mode":"chatgpt","tokens":{}}`, "dead", 5, 5)
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	if status.Selectable || !strings.Contains(status.Reason, "unusable") {
+		t.Fatalf("expected an unselectable tokenless account, got %v %q", status.Selectable, status.Reason)
+	}
+	if calls() != 0 {
+		t.Fatal("a tokenless login reached codex app-server")
+	}
+}
+
+func TestCollectServiceBacksOffOnRateLimit(t *testing.T) {
+	calls := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"429 Too Many Requests"}}`)
+	cfg := codexHomeConfig(t.TempDir())
+	captureWithUsage(t, cfg, "codex", "", codexTestLoginJSON, "a", 10, 10)
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	if got := calls(); got != 1 {
+		t.Fatalf("expected one probe, got %d", got)
+	}
+	if !first.Selectable || !strings.Contains(first.Reason, "stale usage") {
+		t.Fatalf("expected selectable with stale annotation, got %v %q", first.Selectable, first.Reason)
+	}
+	if remaining := time.Until(first.Account.FetchBackoffUntil); remaining < rateLimitBackoffMin-time.Minute || remaining > rateLimitBackoffMin+time.Minute {
+		t.Fatalf("expected ~%s backoff, got %s", rateLimitBackoffMin, remaining)
+	}
+
+	second := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	if got := calls(); got != 1 {
+		t.Fatalf("expected no probe during backoff, got %d", got)
+	}
+	if !second.Selectable || !strings.Contains(second.Reason, "paused") {
+		t.Fatalf("expected selectable with paused annotation, got %v %q", second.Selectable, second.Reason)
+	}
+}
+
+func TestDeadCredentialsBackOffAndStayUnselectable(t *testing.T) {
+	calls := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to refresh token: invalid_grant"}}`)
+	cfg := codexHomeConfig(t.TempDir())
+	captureWithUsage(t, cfg, "codex", "", codexTestLoginJSON, "dead", 5, 5)
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	afterFirst := calls()
+	if afterFirst == 0 {
+		t.Fatal("expected the first cycle to probe the login")
+	}
+	if first.Selectable || !strings.Contains(first.Reason, "unusable") {
+		t.Fatalf("expected unselectable dead account, got %v %q", first.Selectable, first.Reason)
+	}
+	second := CollectService(testContext(t), cfg, state, cfg.Services[0]).Accounts[0]
+	if got := calls(); got != afterFirst {
+		t.Fatalf("expected no probes during credentials backoff, got %d after %d", got, afterFirst)
+	}
+	if second.Selectable || !strings.Contains(second.Reason, "retry at") {
+		t.Fatalf("expected an unselectable account with retry-at, got %v %q", second.Selectable, second.Reason)
+	}
+}
+
+func TestInactiveAccountsUseCachedUsageWithinTTL(t *testing.T) {
+	calls := fakeCodexAppServer(t, codexLimitsResponse)
+	cfg := codexHomeConfig(t.TempDir())
+	fresh := usageForTest(10, 10)
+	fresh.ObservedAt = time.Now().UTC()
+	captureWithUsageSnapshot(t, cfg, "codex", "", codexTestLoginJSON, "b", fresh)
+	captureWithUsageSnapshot(t, cfg, "codex", "", codexTestLoginJSON, "a", fresh)
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	CollectService(testContext(t), cfg, state, cfg.Services[0])
+	if got := calls(); got != 1 {
+		t.Fatalf("expected only the active account to be probed, got %d", got)
+	}
+	// Age the inactive account's snapshot past the TTL: it is probed again.
+	stale := state.Service("codex").Accounts["b"]
+	stale.Usage.ObservedAt = time.Now().UTC().Add(-inactiveUsageTTL - time.Minute)
+	state.Service("codex").Accounts["b"] = stale
+	CollectService(testContext(t), cfg, state, cfg.Services[0])
+	if got := calls(); got != 3 {
+		t.Fatalf("expected active + aged inactive probes, got %d", got)
 	}
 }

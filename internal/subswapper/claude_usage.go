@@ -1,40 +1,25 @@
 package subswapper
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	claudeOAuthClientID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	claudeOAuthBetaHeader = "oauth-2025-04-20"
 )
 
 var (
 	claudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
 	claudeProfileURL = "https://api.anthropic.com/api/oauth/profile"
-	claudeTokenURL   = "https://platform.claude.com/v1/oauth/token"
 	httpClient       = &http.Client{Timeout: 10 * time.Second}
 )
-
-type claudeCredentials struct {
-	ClaudeAiOauth *claudeOAuth `json:"claudeAiOauth"`
-}
-
-type claudeOAuth struct {
-	AccessToken  string   `json:"accessToken"`
-	RefreshToken string   `json:"refreshToken,omitempty"`
-	ExpiresAt    int64    `json:"expiresAt,omitempty"`
-	Scopes       []string `json:"scopes,omitempty"`
-}
 
 type claudeUsageAPIResponse struct {
 	FiveHour *struct {
@@ -58,85 +43,6 @@ type claudeLimit struct {
 			DisplayName string `json:"display_name"`
 		} `json:"model"`
 	} `json:"scope"`
-}
-
-type claudeTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	ExpiresIn    int64  `json:"expires_in"`
-	RefreshToken string `json:"refresh_token"`
-	Scope        string `json:"scope"`
-}
-
-func fetchClaudeUsage(ctx context.Context, cfg Config, service ServiceConfig, account AccountState, active bool) (UsageSnapshot, error) {
-	source, err := snapshotCredentialSource(ctx, cfg, service, account, active, func() (credentialSource, error) {
-		return findClaudeCredentials(cfg, service, account, active)
-	})
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-
-	usage, err := fetchClaudeUsageWithCredentials(ctx, source.data)
-	if err == nil {
-		if source.fromLive && !backupMatches(source.backupPath, source.data) {
-			// Opportunistically sync the live credentials into the backup so
-			// tokens rotated by the running client are never lost on switch.
-			if writeErr := applyCredentialUpdate(ctx, cfg, service, account, source, source.data, false); writeErr != nil {
-				return UsageSnapshot{}, writeErr
-			}
-		}
-		return usage, nil
-	}
-	if service.UsesAccountHomes() && shouldRefreshClaudeCredentials(err, source.data) {
-		// The provider process owns refresh-token rotation for permanent homes.
-		// Refreshing a copied token here can race the running client and revoke
-		// the branch that an authenticated session still depends on.
-		return UsageSnapshot{}, fmt.Errorf("%w: Claude account home requires provider login or token refresh", errCredentialsInvalid)
-	}
-	if !shouldRefreshClaudeCredentials(err, source.data) {
-		if errors.Is(err, errClaudeUnauthorized) || errors.Is(err, errClaudeTokenMissing) {
-			return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
-		}
-		return UsageSnapshot{}, err
-	}
-
-	refreshed, refreshErr := refreshClaudeCredentials(ctx, source.data)
-	if refreshErr != nil {
-		return UsageSnapshot{}, refreshErr
-	}
-	if err := applyCredentialUpdate(ctx, cfg, service, account, source, refreshed, true); err != nil {
-		return UsageSnapshot{}, err
-	}
-	usage, err = fetchClaudeUsageWithCredentials(ctx, refreshed)
-	if errors.Is(err, errClaudeUnauthorized) {
-		return UsageSnapshot{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
-	}
-	return usage, err
-}
-
-func backupMatches(path string, data []byte) bool {
-	existing, err := os.ReadFile(path)
-	return err == nil && bytes.Equal(existing, data)
-}
-
-func findClaudeCredentials(cfg Config, service ServiceConfig, account AccountState, active bool) (credentialSource, error) {
-	return findCredentialSource(cfg, service, account, active,
-		func(data []byte) bool {
-			_, err := parseClaudeOAuth(data)
-			return err == nil
-		},
-		"no managed file contains Claude OAuth credentials",
-		"read stored Claude credentials")
-}
-
-func fetchClaudeUsageWithCredentials(ctx context.Context, credentials []byte) (UsageSnapshot, error) {
-	oauth, err := parseClaudeOAuth(credentials)
-	if err != nil {
-		return UsageSnapshot{}, err
-	}
-	if oauth.AccessToken == "" {
-		return UsageSnapshot{}, errClaudeTokenMissing
-	}
-	return fetchClaudeUsageWithAccessToken(ctx, oauth.AccessToken, false)
 }
 
 func fetchClaudeUsageWithSetupToken(ctx context.Context, token string) (UsageSnapshot, error) {
@@ -259,104 +165,6 @@ var (
 	errClaudeTokenMissing         = errors.New("claude OAuth access token missing")
 	errSetupTokenUsageUnavailable = errors.New("setup-token usage unavailable")
 )
-
-func shouldRefreshClaudeCredentials(err error, credentials []byte) bool {
-	oauth, parseErr := parseClaudeOAuth(credentials)
-	if parseErr != nil || oauth.RefreshToken == "" {
-		return false
-	}
-	// A missing access token (e.g. captured mid-logout) is recoverable with
-	// the refresh token, same as an expired or rejected one.
-	return errors.Is(err, errClaudeUnauthorized) ||
-		errors.Is(err, errClaudeTokenMissing) ||
-		claudeCredentialsExpired(credentials)
-}
-
-func claudeCredentialsExpired(credentials []byte) bool {
-	oauth, err := parseClaudeOAuth(credentials)
-	if err != nil || oauth.ExpiresAt <= 0 {
-		return false
-	}
-	return time.Now().Add(5*time.Minute).UnixMilli() >= oauth.ExpiresAt
-}
-
-func refreshClaudeCredentials(ctx context.Context, credentials []byte) ([]byte, error) {
-	var data map[string]any
-	if err := json.Unmarshal(credentials, &data); err != nil {
-		return nil, err
-	}
-	oauthAny, ok := data["claudeAiOauth"].(map[string]any)
-	if !ok {
-		return nil, errors.New("claude OAuth payload missing")
-	}
-	refreshToken, ok := oauthAny["refreshToken"].(string)
-	if !ok || refreshToken == "" {
-		return nil, errors.New("claude OAuth refresh token missing")
-	}
-
-	body, err := json.Marshal(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": refreshToken,
-		"client_id":     claudeOAuthClientID,
-	})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeTokenURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "subswapper/1.0")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		refreshErr := fmt.Errorf("claude token refresh returned %s", resp.Status)
-		switch resp.StatusCode {
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-			return nil, fmt.Errorf("%w: %v", errCredentialsInvalid, refreshErr)
-		case http.StatusTooManyRequests:
-			return nil, &rateLimitedError{
-				retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
-				message:    refreshErr.Error(),
-			}
-		}
-		return nil, refreshErr
-	}
-
-	var token claudeTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return nil, err
-	}
-	if token.AccessToken == "" {
-		return nil, errors.New("claude token refresh response missing access token")
-	}
-	nowMS := time.Now().UnixMilli()
-	oauthAny["accessToken"] = token.AccessToken
-	oauthAny["expiresAt"] = nowMS + token.ExpiresIn*1000
-	if token.RefreshToken != "" {
-		oauthAny["refreshToken"] = token.RefreshToken
-	}
-	if token.Scope != "" {
-		oauthAny["scopes"] = strings.Fields(token.Scope)
-	}
-	return json.Marshal(data)
-}
-
-func parseClaudeOAuth(credentials []byte) (claudeOAuth, error) {
-	var decoded claudeCredentials
-	if err := json.Unmarshal(credentials, &decoded); err != nil {
-		return claudeOAuth{}, err
-	}
-	if decoded.ClaudeAiOauth == nil {
-		return claudeOAuth{}, errors.New("claude OAuth payload missing")
-	}
-	return *decoded.ClaudeAiOauth, nil
-}
 
 func convertClaudeUsage(raw claudeUsageAPIResponse) UsageSnapshot {
 	var usage UsageSnapshot

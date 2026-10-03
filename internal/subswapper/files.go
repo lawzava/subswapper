@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,20 +37,18 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 		return fmt.Errorf("account %q not found for service %q", accountName, service.Name)
 	}
 	if state.Service(service.Name).ActiveAccount == accountName {
-		// Restoring the backup over the live files would discard any
-		// credentials the live client rotated since the last sync.
 		return nil
 	}
-	if service.UsesAccountHomes() {
-		serviceState := state.Service(service.Name)
-		serviceState.ActiveAccount = accountName
-		serviceState.LastSwitchedAt = time.Now().UTC()
-		return SaveState(cfg.StatePath, state)
-	}
-	if err := switchServiceFiles(cfg, service, state, accountName, time.Now().UTC()); err != nil {
-		return err
-	}
-	return nil
+	selectAccount(state, service, accountName, time.Now().UTC())
+	return SaveState(cfg.StatePath, state)
+}
+
+// selectAccount makes accountName the route for new requests. Running
+// processes follow through the proxy; nothing on disk changes.
+func selectAccount(state *State, service ServiceConfig, accountName string, switchedAt time.Time) {
+	serviceState := state.Service(service.Name)
+	serviceState.ActiveAccount = accountName
+	serviceState.LastSwitchedAt = switchedAt
 }
 
 func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force, deleteHome bool) error {
@@ -80,7 +77,7 @@ func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force
 	if serviceState.ActiveAccount == accountName && !force {
 		return fmt.Errorf("account %q is active; switch away first or pass -force", accountName)
 	}
-	if isClaudeService(service) && service.UsesAccountHomes() {
+	if isClaudeService(service) {
 		_, tokenExists, tokenErr := readClaudeSetupTokenEnvelope(cfg, service.Name, accountName)
 		if tokenErr != nil {
 			return tokenErr
@@ -89,25 +86,17 @@ func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force
 			return errors.New("remove the Claude setup token before unregistering this account")
 		}
 	}
-	accountDir := AccountDir(cfg, service.Name, accountName)
-	staged := make([]stagedFile, 0, len(service.Files))
-	for _, file := range service.Files {
-		staged = append(staged, stagedFile{
-			target: filepath.Join(accountDir, file.BackupName),
-			remove: true,
-		})
-	}
 	delete(serviceState.Accounts, accountName)
 	if serviceState.ActiveAccount == accountName {
 		serviceState.ActiveAccount = ""
 	}
-	if service.UsesAccountHomes() && !deleteHome {
-		return SaveState(cfg.StatePath, state)
-	}
-	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
+	if err := SaveState(cfg.StatePath, state); err != nil {
 		return err
 	}
-	return os.RemoveAll(accountDir)
+	if !deleteHome {
+		return nil
+	}
+	return os.RemoveAll(AccountDir(cfg, service.Name, accountName))
 }
 
 func validateAccountName(name string) error {
@@ -123,186 +112,44 @@ func validateAccountName(name string) error {
 	return nil
 }
 
-// switchServiceFiles makes accountName's backup the live file set and commits
-// the matching active-account state in the same recoverable transaction. It
-// first syncs the outgoing account so rotated credentials are not lost.
-func switchServiceFiles(cfg Config, service ServiceConfig, state *State, accountName string, switchedAt time.Time) error {
-	serviceState := state.Service(service.Name)
-	if service.UsesAccountHomes() {
-		serviceState.ActiveAccount = accountName
-		serviceState.LastSwitchedAt = switchedAt
-		return nil
-	}
-	outgoing := serviceState.ActiveAccount
-	if outgoing != "" && outgoing != accountName {
-		if _, ok := serviceState.Accounts[outgoing]; ok {
-			if err := syncAccountFiles(cfg, service, outgoing); err != nil {
-				return fmt.Errorf("sync active account %q before switch: %w", outgoing, err)
-			}
-		}
-	}
-	specs, err := accountRestoreSpecs(cfg, service, accountName)
+func writeFileAtomic(path string, data []byte) error {
+	staged, err := stageFile(path, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	staged, err := stageManagedFiles(specs)
-	if err != nil {
-		return err
-	}
-	oldActive := serviceState.ActiveAccount
-	oldSwitchedAt := serviceState.LastSwitchedAt
-	restoreState := func() {
-		serviceState.ActiveAccount = oldActive
-		serviceState.LastSwitchedAt = oldSwitchedAt
-	}
-	serviceState.ActiveAccount = accountName
-	serviceState.LastSwitchedAt = switchedAt
-	if err := executeStagedFilesAndState(cfg, staged, state); err != nil {
-		restoreState()
+	if err := staged.commit(); err != nil {
+		staged.discard()
 		return err
 	}
 	return nil
 }
 
-// syncAccountFiles copies the live managed files into accountName's backup.
-// A missing required live file keeps the existing backup copy; a missing
-// optional live file removes the stale backup, mirroring capture.
-func syncAccountFiles(cfg Config, service ServiceConfig, accountName string) error {
-	if err := verifyActiveIdentity(cfg, service, AccountState{Name: accountName}); err != nil {
-		return err
-	}
-	accountDir := AccountDir(cfg, service.Name, accountName)
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		return err
-	}
-	specs := make([]copySpec, 0, len(service.Files))
-	for _, file := range service.Files {
-		sourcePath := ExpandPath(file.Path)
-		backupPath := filepath.Join(accountDir, file.BackupName)
-		if _, err := os.Stat(sourcePath); err != nil {
-			if errors.Is(err, os.ErrNotExist) && file.IsRequired() {
-				continue
-			}
-			if !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		} else if syncWouldCorruptBackup(service, sourcePath, backupPath) {
-			continue
-		}
-		specs = append(specs, copySpec{
-			source:   sourcePath,
-			target:   backupPath,
-			required: file.IsRequired(),
-		})
-	}
-	return copyManagedFiles(cfg, specs)
+func AccountDir(cfg Config, serviceName, accountName string) string {
+	return filepath.Join(ExpandPath(cfg.BackupRoot), safeName(serviceName), safeName(accountName))
 }
 
-// syncWouldCorruptBackup reports whether copying the live file over the
-// backup would replace working credentials with empty or unparseable
-// content — e.g. a truncated file left by a crashed client or a logout
-// happening at switch time. The good backup is kept in that case.
-func syncWouldCorruptBackup(service ServiceConfig, livePath, backupPath string) bool {
-	backup, err := os.ReadFile(backupPath)
-	if err != nil || len(bytes.TrimSpace(backup)) == 0 {
-		return false
-	}
-	live, err := os.ReadFile(livePath)
-	if err != nil {
-		return false
-	}
-	if len(bytes.TrimSpace(live)) == 0 {
-		return true
-	}
-	if isClaudeService(service) && claudeCredentialsUsable(backup) && !claudeCredentialsUsable(live) {
-		return true
-	}
-	if isCodexService(service) && validateCodexAuth(backup) == nil && validateCodexAuth(live) != nil {
-		return true
-	}
-	return false
-}
-
-func claudeCredentialsUsable(data []byte) bool {
-	oauth, err := parseClaudeOAuth(data)
-	return err == nil && (oauth.AccessToken != "" || oauth.RefreshToken != "")
-}
-
-func accountRestoreSpecs(cfg Config, service ServiceConfig, accountName string) ([]copySpec, error) {
-	accountDir := AccountDir(cfg, service.Name, accountName)
-	specs := make([]copySpec, 0, len(service.Files))
-	for _, file := range service.Files {
-		sourcePath := filepath.Join(accountDir, file.BackupName)
-		if _, err := os.Stat(sourcePath); err != nil {
-			if !errors.Is(err, os.ErrNotExist) || file.IsRequired() {
-				return nil, fmt.Errorf("account %q missing backup %s: %w", accountName, file.BackupName, err)
-			}
-		}
-		specs = append(specs, copySpec{
-			source:   sourcePath,
-			target:   ExpandPath(file.Path),
-			required: file.IsRequired(),
-		})
-	}
-	return specs, nil
-}
-
-type copySpec struct {
-	source   string
-	target   string
-	required bool
-}
-
-// copyManagedFiles applies all copies in two phases: every source is staged
-// into a temp file next to its target first, then all targets are committed.
-// A failure while staging leaves every target untouched.
-func copyManagedFiles(cfg Config, specs []copySpec) error {
-	staged, err := stageManagedFiles(specs)
-	if err != nil {
-		return err
-	}
-	discard := func() {
-		for _, s := range staged {
-			s.discard()
+func safeName(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		case r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)):
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
 		}
 	}
-	err = executeFileTransaction(cfg, staged)
-	discard()
-	return err
-}
-
-func stageManagedFiles(specs []copySpec) ([]stagedFile, error) {
-	staged := make([]stagedFile, 0, len(specs))
-	for _, spec := range specs {
-		s, err := stageCopy(spec.source, spec.target, spec.required)
-		if err != nil {
-			for _, file := range staged {
-				file.discard()
-			}
-			return nil, err
-		}
-		staged = append(staged, s)
+	sanitized := b.String()
+	if strings.Trim(sanitized, ".") == "" {
+		sanitized = "account"
 	}
-	return staged, nil
-}
-
-func executeStagedFilesAndState(cfg Config, staged []stagedFile, state *State) error {
-	stateData, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		discardStagedFiles(staged)
-		return err
+	if sanitized == value {
+		return sanitized
 	}
-	stagedState, err := stageFile(ExpandPath(cfg.StatePath), bytes.NewReader(stateData))
-	if err != nil {
-		discardStagedFiles(staged)
-		return err
-	}
-	staged = append(staged, stagedState)
-	err = executeFileTransaction(cfg, staged)
-	discardStagedFiles(staged)
-	return err
+	sum := sha256.Sum256([]byte(value))
+	return sanitized + "-" + hex.EncodeToString(sum[:])[:12]
 }
-
 func discardStagedFiles(staged []stagedFile) {
 	for _, file := range staged {
 		file.discard()
@@ -315,20 +162,6 @@ type stagedFile struct {
 	remove  bool
 }
 
-func stageCopy(sourcePath, targetPath string, required bool) (stagedFile, error) {
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && !required {
-			return stagedFile{target: targetPath, remove: true}, nil
-		}
-		return stagedFile{}, err
-	}
-	defer func() { _ = source.Close() }()
-	return stageFile(targetPath, source)
-}
-
-// stageFile writes content to a 0600 temp file next to targetPath, ready to
-// be committed into place atomically.
 func stageFile(targetPath string, content io.Reader) (stagedFile, error) {
 	target := resolveTargetPath(targetPath)
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
@@ -382,51 +215,10 @@ func (s stagedFile) discard() {
 	}
 }
 
-// resolveTargetPath follows an existing symlink so writes land in the file it
-// points at instead of replacing the link with a regular file.
 func resolveTargetPath(path string) string {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return path
 	}
 	return resolved
-}
-
-func writeFileAtomic(path string, data []byte) error {
-	staged, err := stageFile(path, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	if err := staged.commit(); err != nil {
-		staged.discard()
-		return err
-	}
-	return nil
-}
-
-func AccountDir(cfg Config, serviceName, accountName string) string {
-	return filepath.Join(ExpandPath(cfg.BackupRoot), safeName(serviceName), safeName(accountName))
-}
-
-func safeName(value string) string {
-	var b strings.Builder
-	for _, r := range value {
-		switch {
-		case r == '-' || r == '_' || r == '.':
-			b.WriteRune(r)
-		case r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)):
-			b.WriteRune(r)
-		default:
-			b.WriteRune('_')
-		}
-	}
-	sanitized := b.String()
-	if strings.Trim(sanitized, ".") == "" {
-		sanitized = "account"
-	}
-	if sanitized == value {
-		return sanitized
-	}
-	sum := sha256.Sum256([]byte(value))
-	return sanitized + "-" + hex.EncodeToString(sum[:])[:12]
 }

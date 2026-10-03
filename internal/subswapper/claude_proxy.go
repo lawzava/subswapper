@@ -710,9 +710,7 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 		serviceState.Accounts[route.Account] = account
 	}
 	if switchTo && serviceState.ActiveAccount != route.Account {
-		if err := switchServiceFiles(cfg, service, state, route.Account, now); err != nil {
-			return err
-		}
+		selectAccount(state, service, route.Account, now)
 		changed = true
 	}
 	if !changed {

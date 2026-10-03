@@ -2,8 +2,6 @@ package subswapper
 
 import (
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -261,96 +259,4 @@ func TestHomeModeSwitchDoesNotReplaceLiveCredentials(t *testing.T) {
 	if state.Service("codex").ActiveAccount != "b" {
 		t.Fatalf("active account = %q, want b", state.Service("codex").ActiveAccount)
 	}
-}
-
-func TestHomeCredentialRefreshNeverTouchesLiveCredentials(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "live-auth.json")
-	liveData := `{"auth_mode":"chatgpt","tokens":{"access_token":"live","account_id":"live-account"}}`
-	if err := os.WriteFile(live, []byte(liveData), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	service := ServiceConfig{
-		Name:        "codex",
-		Kind:        "codex",
-		AccountMode: AccountModeHome,
-		Files:       []ManagedFile{requiredFile(live, "auth.json")},
-	}
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "accounts"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services:   []ServiceConfig{service},
-	}
-	home := AccountDir(cfg, "codex", "work")
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	original := `{"auth_mode":"chatgpt","tokens":{"access_token":"old","account_id":"work-account"}}`
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	state := NewState()
-	account := AccountState{Name: "work"}
-	state.Service("codex").Accounts["work"] = account
-	state.Service("codex").ActiveAccount = "work"
-	if err := SaveState(cfg.StatePath, state); err != nil {
-		t.Fatal(err)
-	}
-	source, err := findCodexAuth(cfg, service, account, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	updated := `{"auth_mode":"chatgpt","tokens":{"access_token":"refreshed","account_id":"work-account"}}`
-	if err := applyCredentialUpdate(testContext(t), cfg, service, account, source, []byte(updated), true); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, filepath.Join(home, "auth.json"), updated)
-	assertFileContent(t, live, liveData)
-}
-
-func TestClaudeHomeProbeNeverRefreshesOAuthItself(t *testing.T) {
-	refreshCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/token" {
-			refreshCalls++
-			_, _ = w.Write([]byte(`{"access_token":"new","refresh_token":"new-r","expires_in":3600}`))
-			return
-		}
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	t.Cleanup(server.Close)
-	oldUsageURL, oldTokenURL := claudeUsageURL, claudeTokenURL
-	claudeUsageURL, claudeTokenURL = server.URL+"/usage", server.URL+"/token"
-	t.Cleanup(func() { claudeUsageURL, claudeTokenURL = oldUsageURL, oldTokenURL })
-
-	dir := t.TempDir()
-	service := ServiceConfig{
-		Name:        "claude",
-		Kind:        "claude",
-		AccountMode: AccountModeHome,
-		Files:       []ManagedFile{requiredFile(filepath.Join(dir, "live.json"), ".credentials.json")},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "accounts"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	home := AccountDir(cfg, "claude", "work")
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	credentials := `{"claudeAiOauth":{"accessToken":"expired","refreshToken":"must-not-be-used"}}`
-	if err := os.WriteFile(filepath.Join(home, ".credentials.json"), []byte(credentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	account := AccountState{Name: "work"}
-	state := NewState()
-	state.Service("claude").Accounts["work"] = account
-	if err := SaveState(cfg.StatePath, state); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := fetchClaudeUsage(testContext(t), cfg, service, account, false); err == nil || !errors.Is(err, errCredentialsInvalid) {
-		t.Fatalf("expected credentials error without refresh, got %v", err)
-	}
-	if refreshCalls != 0 {
-		t.Fatalf("home probe made %d OAuth refresh calls", refreshCalls)
-	}
-	assertFileContent(t, filepath.Join(home, ".credentials.json"), credentials)
 }

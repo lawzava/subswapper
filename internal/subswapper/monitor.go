@@ -84,10 +84,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 			if !shouldAutoSwitch(cfg.Monitor, *result, best, serviceState.LastSwitchedAt, now) {
 				continue
 			}
-			if err := switchServiceFiles(cfg, result.Service, state, best.Account.Name, now); err != nil {
-				cycle.Errors = append(cycle.Errors, fmt.Errorf("switch %s to %s: %w", result.Service.Name, best.Account.Name, err))
-				continue
-			}
+			selectAccount(state, result.Service, best.Account.Name, now)
 			markActive(result, best.Account.Name)
 			cycle.Switches = append(cycle.Switches, SwitchEvent{Service: result.Service.Name, Account: best.Account.Name})
 		}
@@ -158,14 +155,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 		if best.Active {
 			continue
 		}
-		if err := switchServiceFiles(cfg, service, state, best.Account.Name, time.Now().UTC()); err != nil {
-			err = fmt.Errorf("switch %s to %s: %w", service.Name, best.Account.Name, err)
-			if !all {
-				return nil, err
-			}
-			errs = append(errs, err)
-			continue
-		}
+		selectAccount(state, service, best.Account.Name, time.Now().UTC())
 		switches = append(switches, SwitchEvent{Service: service.Name, Account: best.Account.Name})
 	}
 	if !matched {

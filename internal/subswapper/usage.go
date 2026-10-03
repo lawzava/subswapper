@@ -64,154 +64,6 @@ type ServiceStatus struct {
 // selectable off a cached snapshot.
 var errCredentialsInvalid = errors.New("stored credentials unusable")
 
-var errCredentialSourceChanged = errors.New("credential source changed during probe")
-
-// credentialSource is the managed file that holds an account's credentials.
-// For the active account the live file is preferred, since the running
-// client keeps it fresh; the backup copy is the fallback and the destination
-// for refresh write-backs.
-type credentialSource struct {
-	data       []byte
-	livePath   string
-	backupPath string
-	fromLive   bool
-}
-
-func snapshotCredentialSource(
-	ctx context.Context,
-	cfg Config,
-	service ServiceConfig,
-	account AccountState,
-	active bool,
-	find func() (credentialSource, error),
-) (credentialSource, error) {
-	lock, err := AcquireStateLock(ctx, cfg)
-	if err != nil {
-		return credentialSource{}, err
-	}
-	defer lock.Release()
-	source, err := find()
-	if err != nil {
-		return credentialSource{}, err
-	}
-	if active && source.fromLive {
-		if err := verifyActiveIdentity(cfg, service, account); err != nil {
-			return credentialSource{}, fmt.Errorf("%w: %v", errCredentialsInvalid, err)
-		}
-	}
-	return source, nil
-}
-
-func applyCredentialUpdate(
-	ctx context.Context,
-	cfg Config,
-	service ServiceConfig,
-	account AccountState,
-	source credentialSource,
-	updated []byte,
-	updateLiveIfActive bool,
-) error {
-	lock, err := AcquireStateLock(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		return err
-	}
-	if !account.AddedAt.IsZero() {
-		current, ok := state.Account(service.Name, account.Name)
-		if !ok || !current.AddedAt.Equal(account.AddedAt) {
-			return errCredentialSourceChanged
-		}
-	}
-	currentActive := state.Service(service.Name).ActiveAccount == account.Name
-	if currentActive && !service.UsesAccountHomes() {
-		if err := verifyActiveIdentity(cfg, service, account); err != nil {
-			return fmt.Errorf("%w: %v", errCredentialsInvalid, err)
-		}
-	}
-	sourcePath := source.backupPath
-	if source.fromLive && currentActive {
-		sourcePath = source.livePath
-	}
-	currentSource, err := os.ReadFile(sourcePath)
-	if err != nil || !bytes.Equal(currentSource, source.data) {
-		return errCredentialSourceChanged
-	}
-	if currentActive && !service.UsesAccountHomes() && !source.fromLive {
-		currentLive, err := os.ReadFile(source.livePath)
-		if err != nil || !bytes.Equal(currentLive, source.data) {
-			return errCredentialSourceChanged
-		}
-	}
-	staged := make([]stagedFile, 0, 2)
-	backup, err := stageFile(source.backupPath, bytes.NewReader(updated))
-	if err != nil {
-		return err
-	}
-	staged = append(staged, backup)
-	if updateLiveIfActive && currentActive && !service.UsesAccountHomes() {
-		live, err := stageFile(source.livePath, bytes.NewReader(updated))
-		if err != nil {
-			backup.discard()
-			return err
-		}
-		staged = append(staged, live)
-	}
-	if err := executeFileTransaction(cfg, staged); err != nil {
-		for _, file := range staged {
-			file.discard()
-		}
-		return err
-	}
-	for _, file := range staged {
-		file.discard()
-	}
-	return nil
-}
-
-// findCredentialSource returns the first managed file whose contents satisfy
-// usable, preferring the live file over the backup for the active account.
-func findCredentialSource(cfg Config, service ServiceConfig, account AccountState, active bool, usable func([]byte) bool, missingMsg, readMsg string) (credentialSource, error) {
-	accountDir := AccountDir(cfg, service.Name, account.Name)
-	var firstErr error
-	for _, file := range service.Files {
-		backupPath := filepath.Join(accountDir, file.BackupName)
-		livePath := ExpandPath(file.Path)
-		candidates := []struct {
-			path     string
-			fromLive bool
-		}{{livePath, true}, {backupPath, false}}
-		if service.UsesAccountHomes() || !active {
-			candidates = candidates[1:]
-		}
-		for _, candidate := range candidates {
-			data, err := os.ReadFile(candidate.path)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			if !usable(data) {
-				continue
-			}
-			return credentialSource{
-				data:       data,
-				livePath:   livePath,
-				backupPath: backupPath,
-				fromLive:   candidate.fromLive,
-			}, nil
-		}
-	}
-	if firstErr == nil {
-		firstErr = errors.New(missingMsg)
-	}
-	return credentialSource{}, fmt.Errorf("%w: %s: %v", errCredentialsInvalid, readMsg, firstErr)
-}
-
 const (
 	// rateLimitBackoffMin/Max bound how long usage fetches pause after a 429.
 	rateLimitBackoffMin = 2 * time.Minute
@@ -269,7 +121,7 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 			statuses = append(statuses, status)
 			continue
 		}
-		if isClaudeService(service) && service.UsesAccountHomes() {
+		if isClaudeService(service) {
 			collectClaudeSetupTokenAccount(ctx, cfg, serviceState, &status, service)
 			statuses = append(statuses, status)
 			continue
@@ -283,13 +135,9 @@ func CollectService(ctx context.Context, cfg Config, state *State, service Servi
 		switch {
 		case len(service.UsageCommand) > 0:
 			fetch = func() (UsageSnapshot, error) { return runUsageCommand(ctx, cfg, service, account) }
-		case isClaudeService(service):
-			fetch = func() (UsageSnapshot, error) {
-				return fetchClaudeUsage(ctx, cfg, service, account, status.Active)
-			}
 		case isCodexService(service):
 			fetch = func() (UsageSnapshot, error) {
-				return fetchCodexUsage(ctx, cfg, service, account, status.Active)
+				return fetchCodexUsage(ctx, cfg, service, account)
 			}
 		}
 		now := time.Now().UTC()

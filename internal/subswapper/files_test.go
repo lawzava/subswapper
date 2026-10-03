@@ -2,10 +2,10 @@ package subswapper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -23,377 +23,6 @@ func TestAcquireStateLockHonorsContext(t *testing.T) {
 	_, err = AcquireStateLock(ctx, cfg)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded, got %v", err)
-	}
-}
-
-func TestCaptureAndSwitchAccountCopiesCredentialBundles(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	if err := os.WriteFile(active, []byte(`{"email":"first@example.com","token":"one"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig(dir, active)
-
-	account, err := CaptureAccount(cfg, "codex", "first", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if account.Email != "first@example.com" {
-		t.Fatalf("expected inferred email, got %q", account.Email)
-	}
-	if err := os.WriteFile(active, []byte(`{"email":"second@example.com","token":"two"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "second", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := SwitchAccount(cfg, "codex", "first"); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(active)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != `{"email":"first@example.com","token":"one"}` {
-		t.Fatalf("unexpected active auth content %q", string(data))
-	}
-}
-
-func TestClaudeForeignLiveIdentityDoesNotOverwriteBackup(t *testing.T) {
-	dir := t.TempDir()
-	liveCredentials := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	service := ServiceConfig{
-		Name: "claude",
-		Kind: "claude",
-		Files: []ManagedFile{
-			requiredFile(liveCredentials, "credentials.json"),
-			optionalFile(liveConfig, "claude.json"),
-		},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	accountDir := AccountDir(cfg, "claude", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backupCredentials := `{"claudeAiOauth":{"accessToken":"account-a-token"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "credentials.json"), []byte(backupCredentials), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(accountDir, "claude.json"), []byte(`{"oauthAccount":{"accountUuid":"account-a"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveCredentials, []byte(`{"claudeAiOauth":{"accessToken":"foreign-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveConfig, []byte(`{"oauthAccount":{"accountUuid":"account-c"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	err := syncAccountFiles(cfg, service, "a")
-	if err == nil || !strings.Contains(err.Error(), "identity") {
-		t.Fatalf("expected identity mismatch, got %v", err)
-	}
-	assertFileContent(t, filepath.Join(accountDir, "credentials.json"), backupCredentials)
-}
-
-func TestClaudeMatchingIdentityAllowsTokenRotation(t *testing.T) {
-	dir := t.TempDir()
-	liveCredentials := filepath.Join(dir, "credentials.json")
-	liveConfig := filepath.Join(dir, "claude.json")
-	service := ServiceConfig{
-		Name: "claude",
-		Kind: "claude",
-		Files: []ManagedFile{
-			requiredFile(liveCredentials, "credentials.json"),
-			optionalFile(liveConfig, "claude.json"),
-		},
-	}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	accountDir := AccountDir(cfg, "claude", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{filepath.Join(accountDir, "claude.json"), liveConfig} {
-		if err := os.WriteFile(path, []byte(`{"oauthAccount":{"accountUuid":"account-a"}}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(accountDir, "credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"old"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rotated := `{"claudeAiOauth":{"accessToken":"rotated"}}`
-	if err := os.WriteFile(liveCredentials, []byte(rotated), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := syncAccountFiles(cfg, service, "a"); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, filepath.Join(accountDir, "credentials.json"), rotated)
-}
-
-func TestCodexForeignAccountIDIsRejected(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "auth.json")
-	service := ServiceConfig{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	accountDir := AccountDir(cfg, "codex", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backup := `{"auth_mode":"chatgpt","tokens":{"access_token":"old","account_id":"account-a"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "auth.json"), []byte(backup), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"foreign","account_id":"account-c"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	err := syncAccountFiles(cfg, service, "a")
-	if err == nil || !strings.Contains(err.Error(), "identity") {
-		t.Fatalf("expected identity mismatch, got %v", err)
-	}
-	_, probeErr := fetchCodexUsage(testContext(t), cfg, service, AccountState{Name: "a"}, true)
-	if probeErr == nil || !errors.Is(probeErr, errCredentialsInvalid) || !strings.Contains(probeErr.Error(), "identity") {
-		t.Fatalf("expected probe identity rejection, got %v", probeErr)
-	}
-	assertFileContent(t, filepath.Join(accountDir, "auth.json"), backup)
-}
-
-func TestAmbiguousChangedCredentialsAreRejected(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "auth.json")
-	service := ServiceConfig{Name: "codex", Kind: "codex", Files: []ManagedFile{requiredFile(live, "auth.json")}}
-	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json"), Services: []ServiceConfig{service}}
-	accountDir := AccountDir(cfg, "codex", "a")
-	if err := os.MkdirAll(accountDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	backup := `{"auth_mode":"chatgpt","tokens":{"access_token":"old"}}`
-	if err := os.WriteFile(filepath.Join(accountDir, "auth.json"), []byte(backup), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(live, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"changed"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	err := syncAccountFiles(cfg, service, "a")
-	if err == nil || !strings.Contains(err.Error(), "identity") {
-		t.Fatalf("expected ambiguous identity error, got %v", err)
-	}
-	assertFileContent(t, filepath.Join(accountDir, "auth.json"), backup)
-}
-
-func TestCopyManagedFilesRollsBackCommittedTargets(t *testing.T) {
-	dir := t.TempDir()
-	source1 := filepath.Join(dir, "source1")
-	source2 := filepath.Join(dir, "source2")
-	target1 := filepath.Join(dir, "target1")
-	target2 := filepath.Join(dir, "target2")
-	for path, content := range map[string]string{
-		source1: "new-one",
-		source2: "new-two",
-		target1: "old-one",
-		target2: "old-two",
-	} {
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	oldCommit := commitStagedFile
-	commits := 0
-	commitStagedFile = func(file stagedFile) error {
-		commits++
-		if commits == 2 {
-			return errors.New("injected second commit failure")
-		}
-		return file.commit()
-	}
-	t.Cleanup(func() { commitStagedFile = oldCommit })
-
-	cfg := Config{StatePath: filepath.Join(dir, "state.json")}
-	err := copyManagedFiles(cfg, []copySpec{
-		{source: source1, target: target1, required: true},
-		{source: source2, target: target2, required: true},
-	})
-	if err == nil {
-		t.Fatal("expected second target commit to fail")
-	}
-	assertFileContent(t, target1, "old-one")
-	assertFileContent(t, target2, "old-two")
-	rollbacks, globErr := filepath.Glob(filepath.Join(dir, ".subswapper-rollback-*"))
-	if globErr != nil {
-		t.Fatal(globErr)
-	}
-	if len(rollbacks) != 0 {
-		t.Fatalf("expected rollback cleanup after recovery, got %v", rollbacks)
-	}
-}
-
-func TestRecoverFileTransactionRestoresOriginalBundle(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "auth.json")
-	rollback := filepath.Join(dir, ".subswapper-rollback-test")
-	if err := os.WriteFile(target, []byte("partially-committed"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(rollback, []byte("original"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := Config{StatePath: filepath.Join(dir, "state.json")}
-	journal := fileTransactionJournal{Entries: []fileTransactionEntry{{
-		Target:       target,
-		RollbackPath: rollback,
-		Existed:      true,
-	}}}
-	if err := writeFileTransactionJournal(cfg, journal); err != nil {
-		t.Fatal(err)
-	}
-
-	lock, err := AcquireStateLock(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock.Release()
-	assertFileContent(t, target, "original")
-	if _, err := os.Stat(fileTransactionJournalPath(cfg)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected recovered journal removal, got %v", err)
-	}
-	if _, err := os.Stat(rollback); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected recovered rollback removal, got %v", err)
-	}
-}
-
-func TestSwitchRollsBackFilesWhenStateCommitFails(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "active.json")
-	cfg := testConfig(dir, live)
-	captureWithUsage(t, cfg, "codex", live, "account-a", "a", 10, 10)
-	captureWithUsage(t, cfg, "codex", live, "account-b", "b", 20, 20)
-	oldCommit := commitStagedFile
-	commits := 0
-	commitStagedFile = func(file stagedFile) error {
-		commits++
-		if commits == 3 {
-			return errors.New("injected state commit failure")
-		}
-		return file.commit()
-	}
-	t.Cleanup(func() { commitStagedFile = oldCommit })
-
-	err := SwitchAccount(cfg, "codex", "a")
-	if err == nil || !strings.Contains(err.Error(), "injected state commit failure") {
-		t.Fatalf("expected state commit failure, got %v", err)
-	}
-	assertFileContent(t, live, "account-b")
-	state, loadErr := LoadState(cfg.StatePath)
-	if loadErr != nil {
-		t.Fatal(loadErr)
-	}
-	if got := state.Service("codex").ActiveAccount; got != "b" {
-		t.Fatalf("active account = %q, want b", got)
-	}
-}
-
-func TestSwitchRemainsCommittedWhenRollbackCleanupFails(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "active.json")
-	cfg := testConfig(dir, live)
-	captureWithUsage(t, cfg, "codex", live, "account-a", "a", 10, 10)
-	captureWithUsage(t, cfg, "codex", live, "account-b", "b", 20, 20)
-	oldRemove := removeRollbackFile
-	removeRollbackFile = func(string) error { return errors.New("injected rollback cleanup failure") }
-	t.Cleanup(func() { removeRollbackFile = oldRemove })
-
-	if err := SwitchAccount(cfg, "codex", "a"); err != nil {
-		t.Fatalf("committed switch reported failure: %v", err)
-	}
-	assertFileContent(t, live, "account-a")
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := state.Service("codex").ActiveAccount; got != "a" {
-		t.Fatalf("active account = %q, want a", got)
-	}
-}
-
-func TestCaptureRollsBackBackupWhenStateCommitFails(t *testing.T) {
-	realDir := t.TempDir()
-	dir := filepath.Join(t.TempDir(), "linked")
-	if err := os.Symlink(realDir, dir); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-	live := filepath.Join(dir, "active.json")
-	cfg := testConfig(dir, live)
-	if err := os.WriteFile(live, []byte("old-credential"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	first, err := CaptureAccount(cfg, "codex", "a", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(live, []byte("new-credential"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	oldCommit := commitStagedFile
-	commitStagedFile = func(file stagedFile) error {
-		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
-			return errors.New("injected state commit failure")
-		}
-		return file.commit()
-	}
-	t.Cleanup(func() { commitStagedFile = oldCommit })
-
-	if _, err := CaptureAccount(cfg, "codex", "a", ""); err == nil || !strings.Contains(err.Error(), "injected state commit failure") {
-		t.Fatalf("expected state commit failure, got %v", err)
-	}
-	assertFileContent(t, filepath.Join(AccountDir(cfg, "codex", "a"), "auth.json"), "old-credential")
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := state.Service("codex").Accounts["a"].AddedAt; !got.Equal(first.AddedAt) {
-		t.Fatalf("AddedAt changed after failed capture: got %s want %s", got, first.AddedAt)
-	}
-}
-
-func TestSuccessfulTransactionLeavesNoJournalOrRollbackFiles(t *testing.T) {
-	dir := t.TempDir()
-	source1 := filepath.Join(dir, "source1")
-	source2 := filepath.Join(dir, "source2")
-	target1 := filepath.Join(dir, "target1")
-	target2 := filepath.Join(dir, "target2")
-	for path, content := range map[string]string{
-		source1: "new-one",
-		source2: "new-two",
-		target1: "old-one",
-		target2: "old-two",
-	} {
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	cfg := Config{StatePath: filepath.Join(dir, "state.json")}
-	if err := copyManagedFiles(cfg, []copySpec{
-		{source: source1, target: target1, required: true},
-		{source: source2, target: target2, required: true},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	assertFileContent(t, target1, "new-one")
-	assertFileContent(t, target2, "new-two")
-	if _, err := os.Stat(fileTransactionJournalPath(cfg)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected no journal, got %v", err)
-	}
-	rollbacks, err := filepath.Glob(filepath.Join(dir, ".subswapper-rollback-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rollbacks) != 0 {
-		t.Fatalf("expected no rollback files, got %v", rollbacks)
 	}
 }
 
@@ -438,8 +67,8 @@ func TestMonitorOnceSwitchesEachServiceToLeastUsedAccount(t *testing.T) {
 		t.Fatalf("expected 2 switches, got %d", len(result.Switches))
 	}
 
-	assertFileContent(t, claudeActive, "claude-b")
-	assertFileContent(t, codexActive, "codex-b")
+	assertActive(t, cfg, "claude", "b")
+	assertActive(t, cfg, "codex", "b")
 }
 
 func TestMonitorOnceDoesNotSwitchBelowThreshold(t *testing.T) {
@@ -471,7 +100,7 @@ func TestMonitorOnceDoesNotSwitchBelowThreshold(t *testing.T) {
 	if len(result.Switches) != 0 {
 		t.Fatalf("expected no switches below threshold, got %d", len(result.Switches))
 	}
-	assertFileContent(t, active, "claude-a")
+	assertActive(t, cfg, "claude", "a")
 }
 
 func TestMonitorOnceDoesNotSwitchDuringCooldown(t *testing.T) {
@@ -502,7 +131,7 @@ func TestMonitorOnceDoesNotSwitchDuringCooldown(t *testing.T) {
 	if len(result.Switches) != 0 {
 		t.Fatalf("expected no switches during cooldown, got %d", len(result.Switches))
 	}
-	assertFileContent(t, active, "claude-a")
+	assertActive(t, cfg, "claude", "a")
 }
 
 func TestMonitorOnceDoesNotSwitchForSmallImprovement(t *testing.T) {
@@ -534,7 +163,7 @@ func TestMonitorOnceDoesNotSwitchForSmallImprovement(t *testing.T) {
 	if len(result.Switches) != 0 {
 		t.Fatalf("expected no switches for small improvement, got %d", len(result.Switches))
 	}
-	assertFileContent(t, active, "claude-a")
+	assertActive(t, cfg, "claude", "a")
 }
 
 func TestMonitorOnceSwitchesWhenFableWeeklyHitsThreshold(t *testing.T) {
@@ -568,48 +197,7 @@ func TestMonitorOnceSwitchesWhenFableWeeklyHitsThreshold(t *testing.T) {
 	if len(result.Switches) != 1 {
 		t.Fatalf("expected Fable-triggered switch, got %d", len(result.Switches))
 	}
-	assertFileContent(t, active, "claude-b")
-}
-
-func TestCaptureRemovesStaleOptionalBackup(t *testing.T) {
-	dir := t.TempDir()
-	required := filepath.Join(dir, "required.json")
-	optional := filepath.Join(dir, "optional.json")
-	if err := os.WriteFile(required, []byte("required"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(optional, []byte("optional"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []ServiceConfig{
-			{
-				Name: "claude",
-				Kind: "custom",
-				Files: []ManagedFile{
-					requiredFile(required, "required.json"),
-					optionalFile(optional, "optional.json"),
-				},
-			},
-		},
-	}
-	cfg.ApplyDefaults()
-	if _, err := CaptureAccount(cfg, "claude", "work", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(optional); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "claude", "work", ""); err != nil {
-		t.Fatal(err)
-	}
-
-	backupPath := filepath.Join(AccountDir(cfg, "claude", "work"), "optional.json")
-	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
-		t.Fatalf("expected stale optional backup to be removed, got %v", err)
-	}
+	assertActive(t, cfg, "claude", "b")
 }
 
 func TestRemoveAccountDeletesStateAndBackup(t *testing.T) {
@@ -619,20 +207,15 @@ func TestRemoveAccountDeletesStateAndBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := testConfig(dir, active)
-	if _, err := CaptureAccount(cfg, "codex", "first", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(active, []byte(`{"email":"second@example.com","token":"two"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := CaptureAccount(cfg, "codex", "second", ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := SwitchAccount(cfg, "codex", "second"); err != nil {
-		t.Fatal(err)
-	}
+	registerHomeAccount(t, cfg, "codex", "first", "one")
+	registerHomeAccount(t, cfg, "codex", "second", "two")
+	registerHomeAccount(t, cfg, "codex", "third", "three")
 
+	// Unregistering keeps the home; -delete-home erases it.
 	if err := RemoveAccount(cfg, "codex", "first", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveAccountWithOptions(cfg, "codex", "second", false, true); err != nil {
 		t.Fatal(err)
 	}
 	state, err := LoadState(cfg.StatePath)
@@ -642,36 +225,14 @@ func TestRemoveAccountDeletesStateAndBackup(t *testing.T) {
 	if _, ok := state.Service("codex").Accounts["first"]; ok {
 		t.Fatal("expected first account to be removed from state")
 	}
-	if _, err := os.Stat(AccountDir(cfg, "codex", "first")); !os.IsNotExist(err) {
-		t.Fatalf("expected backup directory removal, got %v", err)
+	if _, ok := state.Service("codex").Accounts["second"]; ok {
+		t.Fatal("expected second account to be removed from state")
 	}
-}
-
-func TestRemoveAccountRollsBackBackupWhenStateCommitFails(t *testing.T) {
-	dir := t.TempDir()
-	active := filepath.Join(dir, "active-auth.json")
-	cfg := testConfig(dir, active)
-	captureWithUsage(t, cfg, "codex", active, "account-a", "a", 10, 10)
-	captureWithUsage(t, cfg, "codex", active, "account-b", "b", 20, 20)
-	oldCommit := commitStagedFile
-	commitStagedFile = func(file stagedFile) error {
-		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
-			return errors.New("injected state commit failure")
-		}
-		return file.commit()
+	if _, err := os.Stat(AccountDir(cfg, "codex", "first")); err != nil {
+		t.Fatalf("unregistering deleted the home: %v", err)
 	}
-	t.Cleanup(func() { commitStagedFile = oldCommit })
-
-	if err := RemoveAccount(cfg, "codex", "a", false); err == nil || !strings.Contains(err.Error(), "injected state commit failure") {
-		t.Fatalf("expected state commit failure, got %v", err)
-	}
-	assertFileContent(t, filepath.Join(AccountDir(cfg, "codex", "a"), "auth.json"), "account-a")
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := state.Service("codex").Accounts["a"]; !ok {
-		t.Fatal("failed removal disappeared from state")
+	if _, err := os.Stat(AccountDir(cfg, "codex", "second")); !os.IsNotExist(err) {
+		t.Fatalf("expected home removal, got %v", err)
 	}
 }
 
@@ -682,9 +243,7 @@ func TestRemoveActiveAccountRequiresForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := testConfig(dir, active)
-	if _, err := CaptureAccount(cfg, "codex", "first", ""); err != nil {
-		t.Fatal(err)
-	}
+	registerHomeAccount(t, cfg, "codex", "first", "one")
 
 	if err := RemoveAccount(cfg, "codex", "first", false); err == nil {
 		t.Fatal("expected active account removal to fail without force")
@@ -714,10 +273,13 @@ func captureWithUsage(t *testing.T, cfg Config, serviceName, activePath, content
 
 func captureWithUsageSnapshot(t *testing.T, cfg Config, serviceName, activePath, content, account string, usage UsageSnapshot) {
 	t.Helper()
-	if err := os.WriteFile(activePath, []byte(content), 0o600); err != nil {
+	registerHomeAccount(t, cfg, serviceName, account, content)
+	home := AccountDir(cfg, serviceName, account)
+	data, err := json.Marshal(usage)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CaptureAccount(cfg, serviceName, account, account+"@example.com"); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "usage.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	state, err := LoadState(cfg.StatePath)
@@ -728,6 +290,30 @@ func captureWithUsageSnapshot(t *testing.T, cfg Config, serviceName, activePath,
 	updated := service.Accounts[account]
 	updated.Usage = usage
 	service.Accounts[account] = updated
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// registerHomeAccount registers account with login content in its home and
+// selects it, as the last registration used to.
+func registerHomeAccount(t *testing.T, cfg Config, serviceName, account, content string) {
+	t.Helper()
+	// Tests that never validate their config still need home-mode defaults.
+	local := cfg
+	local.Services = append([]ServiceConfig(nil), cfg.Services...)
+	local.ApplyDefaults()
+	if _, _, err := CreateAccountHome(local, serviceName, account, account+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(AccountDir(cfg, serviceName, account), "auth.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Service(serviceName).ActiveAccount = account
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		t.Fatal(err)
 	}
@@ -757,13 +343,15 @@ func testConfig(dir, active string) Config {
 	return cfg
 }
 
-func testService(name, active string) ServiceConfig {
+// testService is a Codex-kind account-home service whose usage comes from
+// a usage.json each fixture account keeps in its home, so monitor tests stay
+// deterministic without a codex binary. active is accepted for older
+// callers; account homes have no live credential file.
+func testService(name, _ string) ServiceConfig {
 	return ServiceConfig{
-		Name: name,
-		Kind: "custom",
-		Files: []ManagedFile{
-			requiredFile(active, "auth.json"),
-		},
+		Name:         name,
+		Kind:         "codex",
+		UsageCommand: []string{"sh", "-c", `cat "$SUBSWAPPER_ACCOUNT_DIR/usage.json"`},
 	}
 }
 
@@ -775,6 +363,17 @@ func usageForTest(fiveHourPct, weeklyPct float64) UsageSnapshot {
 		Weekly: LimitWindow{
 			Pct: PtrFloat64(weeklyPct),
 		},
+	}
+}
+
+func assertActive(t *testing.T, cfg Config, service, want string) {
+	t.Helper()
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Service(service).ActiveAccount; got != want {
+		t.Fatalf("%s selects %q, want %q", service, got, want)
 	}
 }
 

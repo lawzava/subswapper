@@ -24,12 +24,7 @@ func AcquireStateLock(ctx context.Context, cfg Config) (*StateLock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lock state file %s: %w", path, err)
 	}
-	lock := &StateLock{file: file}
-	if err := recoverFileTransaction(cfg); err != nil {
-		lock.Release()
-		return nil, err
-	}
-	return lock, nil
+	return &StateLock{file: file}, nil
 }
 
 func (l *StateLock) Release() {
