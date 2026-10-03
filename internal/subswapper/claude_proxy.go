@@ -65,6 +65,9 @@ type ClaudeProxy struct {
 	upstream *url.URL
 	client   *http.Client
 	logf     func(format string, args ...any)
+	// IdentityLookup resolves the Claude account of a setup token that a hub
+	// client adds, so duplicates are refused as they are for local adds.
+	IdentityLookup ClaudeSetupTokenIdentityLookup
 }
 
 type claudeProxyRoute struct {
@@ -300,7 +303,8 @@ func NewClaudeProxy(cfg Config, serviceName string, logf func(format string, arg
 				return http.ErrUseLastResponse
 			},
 		},
-		logf: logf,
+		logf:           logf,
+		IdentityLookup: LookupClaudeSetupTokenIdentity,
 	}, nil
 }
 
@@ -323,11 +327,10 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == claudeProxyHealthPath {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"service":"` + p.service.Name + `","proxy":"subswapper"}` + "\n"))
+		writeProxyHealth(w, p.service)
 		return
 	}
-	if serveHubStatus(w, r, p.cfg) {
+	if serveHubStatus(w, r, p.cfg) || serveHubManagement(w, r, p.cfg, p.service, p.IdentityLookup) {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, claudeProxyRequestBodyLimit+1))

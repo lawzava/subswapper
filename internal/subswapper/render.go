@@ -9,15 +9,15 @@ import (
 func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt time.Time) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "subswapper status %s\n\n", observedAt.Format(time.RFC3339))
-	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", "SERVICE", "ACCOUNT", "SELECTED", "5H", "WEEKLY", "FABLE5", "SCORE", "STATE")
-	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", "-------", "-------", "--------", "--", "------", "------", "-----", "-----")
+	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n", "SERVICE", "ACCOUNT", "SELECTED", "5H", "WEEKLY", "FABLE5", "SCORE", "UPDATED", "STATE")
+	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n", "-------", "-------", "--------", "--", "------", "------", "-----", "-------", "-----")
 	for _, result := range results {
 		if len(result.Accounts) == 0 {
 			state := "no registered accounts"
 			if result.Note != "" {
 				state = result.Note
 			}
-			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", state)
+			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n", result.Service.Name, "-", "", "-", "-", "-", "-", "-", state)
 			continue
 		}
 		for _, account := range result.Accounts {
@@ -29,7 +29,7 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 			if account.Selectable {
 				score = fmt.Sprintf("%.0f%%", account.Score*100)
 			}
-			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %s\n",
+			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n",
 				account.Service,
 				account.Account.Name,
 				active,
@@ -37,6 +37,7 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 				formatWindow(account.Account.Usage.Weekly),
 				formatWindow(account.Account.Usage.FableWeekly),
 				score,
+				formatAge(account.Account.Usage.ObservedAt, observedAt),
 				account.Reason,
 			)
 		}

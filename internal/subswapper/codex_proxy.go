@@ -405,11 +405,10 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == claudeProxyHealthPath {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"service":"` + p.service.Name + `","proxy":"subswapper"}` + "\n"))
+		writeProxyHealth(w, p.service)
 		return
 	}
-	if serveHubStatus(w, r, p.cfg) {
+	if serveHubStatus(w, r, p.cfg) || serveHubManagement(w, r, p.cfg, p.service, nil) {
 		return
 	}
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {

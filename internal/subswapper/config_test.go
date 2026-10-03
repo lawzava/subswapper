@@ -162,7 +162,7 @@ func TestConfigValidatesProxyListen(t *testing.T) {
 		{name: "public host", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "0.0.0.0:7878"}, wantErr: "loopback"},
 		{name: "no port", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1"}, wantErr: "host:port"},
 		{name: "ephemeral port", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:0"}, wantErr: "port"},
-		{name: "custom kind", service: ServiceConfig{Name: "other", Kind: "custom", Files: []ManagedFile{requiredFile("/tmp/other.json", "other.json")}, ProxyListen: "127.0.0.1:7878"}, wantErr: "requires Claude or Codex"},
+		{name: "custom kind", service: ServiceConfig{Name: "other", Kind: "custom", Files: []ManagedFile{requiredFile("/tmp/other.json", "other.json")}, ProxyListen: "127.0.0.1:7878"}, wantErr: "is not supported"},
 		{name: "upstream without listen", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyUpstream: "https://example.com"}, wantErr: "requires proxy_listen"},
 		{name: "upstream with path", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", ProxyUpstream: "https://example.com/v1"}, wantErr: "origin"},
 	} {

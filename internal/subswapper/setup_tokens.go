@@ -129,11 +129,6 @@ func ReplaceClaudeSetupToken(ctx context.Context, cfg Config, serviceName, accou
 	return setupTokenStatus(account, envelope, storedAt), nil
 }
 
-func LoadClaudeSetupToken(cfg Config, serviceName, accountName string) (string, error) {
-	token, _, err := LoadClaudeSetupTokenWithStatus(cfg, serviceName, accountName)
-	return token, err
-}
-
 // LoadClaudeSetupTokenWithStatus returns the token and its revision from one
 // locked snapshot. Callers use the revision to reject concurrent replacement.
 func LoadClaudeSetupTokenWithStatus(cfg Config, serviceName, accountName string) (string, ClaudeSetupTokenStatus, error) {
@@ -166,36 +161,6 @@ func LoadClaudeSetupTokenWithStatus(cfg Config, serviceName, accountName string)
 		return "", status, ErrClaudeSetupTokenExpired
 	}
 	return envelope.Token, status, nil
-}
-
-func ClaudeSetupTokenStatusForAccount(cfg Config, serviceName, accountName string) (ClaudeSetupTokenStatus, error) {
-	lock, err := AcquireStateLock(context.Background(), cfg)
-	if err != nil {
-		return ClaudeSetupTokenStatus{}, err
-	}
-	defer lock.Release()
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		return ClaudeSetupTokenStatus{}, err
-	}
-	account, err := claudeSetupTokenAccount(cfg, state, serviceName, accountName)
-	if err != nil {
-		return ClaudeSetupTokenStatus{}, err
-	}
-	envelope, exists, err := readClaudeSetupTokenEnvelope(cfg, serviceName, accountName)
-	if err != nil {
-		return ClaudeSetupTokenStatus{}, err
-	}
-	if !exists {
-		if account.SetupTokenRevision != "" {
-			return ClaudeSetupTokenStatus{}, ErrClaudeSetupTokenRevisionMismatch
-		}
-		return ClaudeSetupTokenStatus{}, nil
-	}
-	if account.SetupTokenRevision == "" || account.SetupTokenRevision != envelope.Revision {
-		return ClaudeSetupTokenStatus{}, ErrClaudeSetupTokenRevisionMismatch
-	}
-	return setupTokenStatus(account, envelope, claudeSetupTokenNow().UTC()), nil
 }
 
 func RemoveClaudeSetupToken(ctx context.Context, cfg Config, serviceName, accountName string) error {

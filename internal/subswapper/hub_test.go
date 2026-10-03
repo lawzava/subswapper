@@ -571,3 +571,58 @@ func TestRenderStatusShowsServiceNote(t *testing.T) {
 		t.Fatalf("render = %s", out)
 	}
 }
+
+func TestHubHealthReportsVersion(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	_, proxy := setupProxyAccounts(t, upstream.server.URL)
+	hub := httptest.NewServer(proxy)
+	t.Cleanup(hub.Close)
+	health, err := HubHealth(context.Background(), hub.URL, proxy.secret)
+	if err != nil || health.Service != "claude" || health.Version != Version() {
+		t.Fatalf("HubHealth = %#v, %v", health, err)
+	}
+	if _, err := HubHealth(context.Background(), hub.URL, "sk-ant-oat01-wrong"); err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("wrong credential: %v", err)
+	}
+	hub.Close()
+	if _, err := HubHealth(context.Background(), hub.URL, proxy.secret); err == nil || !strings.Contains(err.Error(), "did not answer") {
+		t.Fatalf("closed hub: %v", err)
+	}
+}
+
+func TestConfigureHubWritesHubServices(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"state_path":"`+filepath.Join(dir, "state.json")+`","monitor":{"interval":"1m"},"services":[{"name":"claude","kind":"claude","proxy_listen":"127.0.0.1:9000"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureHub(path, "100.67.68.117", true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude, _ := cfg.Service("claude")
+	codex, _ := cfg.Service("codex")
+	if claude.ProxyListen != "127.0.0.1:9000" || claude.HubListen != "100.67.68.117:9000" || !claude.HubEnroll || !claude.UsesNativeRuntimeHome() {
+		t.Fatalf("claude = %#v; an existing proxy port is kept", claude)
+	}
+	if codex.ProxyListen != "127.0.0.1:7879" || codex.HubListen != "100.67.68.117:7879" || !codex.HubEnroll {
+		t.Fatalf("codex = %#v", codex)
+	}
+	if cfg.Monitor.Interval.Duration != time.Minute {
+		t.Fatal("monitor settings were lost")
+	}
+	if err := ConfigureHub(path, "192.168.1.5", false); err == nil {
+		t.Fatal("a LAN address was accepted")
+	}
+
+	client := filepath.Join(dir, "client.json")
+	if err := os.WriteFile(client, []byte(`{"services":[{"name":"claude","kind":"claude","hub_url":"http://box-box:7878","shared_runtime_home":"native"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureHub(client, "100.67.68.117", false); err == nil || !strings.Contains(err.Error(), "hub client") {
+		t.Fatalf("hub setup over a client: %v", err)
+	}
+}

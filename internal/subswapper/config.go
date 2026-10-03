@@ -165,11 +165,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate service %q (names may not differ only by letter case)", service.Name)
 		}
 		seen[serviceKey] = struct{}{}
-		if service.AccountMode != AccountModeHome && service.AccountMode != AccountModeBundle {
-			return fmt.Errorf("service %q account_mode must be %q or %q", service.Name, AccountModeHome, AccountModeBundle)
+		if !isBuiltInKind(service.Kind) {
+			return fmt.Errorf("service %q kind %q is not supported; subswapper manages claude and codex services", service.Name, service.Kind)
 		}
-		if service.UsesAccountHomes() && !isBuiltInKind(service.Kind) {
-			return fmt.Errorf("service %q account_mode %q requires kind claude or codex", service.Name, AccountModeHome)
+		if service.AccountMode != AccountModeHome {
+			return fmt.Errorf("service %q: account_mode %q and custom managed files were removed in v0.7; remove account_mode and files from the config", service.Name, service.AccountMode)
 		}
 		if service.SharedRuntimeHome != "" {
 			if strings.TrimSpace(service.SharedRuntimeHome) == "" {

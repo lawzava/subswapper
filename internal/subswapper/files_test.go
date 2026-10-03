@@ -416,9 +416,6 @@ func TestMonitorOnceSwitchesEachServiceToLeastUsedAccount(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 
 	captureWithUsage(t, cfg, "claude", claudeActive, "claude-a", "a", 90, 80)
 	captureWithUsage(t, cfg, "claude", claudeActive, "claude-b", "b", 10, 20)
@@ -459,9 +456,6 @@ func TestMonitorOnceDoesNotSwitchBelowThreshold(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 
 	captureWithUsage(t, cfg, "claude", active, "claude-a", "a", 80, 80)
 	captureWithUsage(t, cfg, "claude", active, "claude-b", "b", 10, 20)
@@ -494,9 +488,6 @@ func TestMonitorOnceDoesNotSwitchDuringCooldown(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 
 	captureWithUsage(t, cfg, "claude", active, "claude-a", "a", 95, 95)
 	captureWithUsage(t, cfg, "claude", active, "claude-b", "b", 10, 20)
@@ -528,9 +519,6 @@ func TestMonitorOnceDoesNotSwitchForSmallImprovement(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 
 	captureWithUsage(t, cfg, "claude", active, "claude-a", "a", 95, 95)
 	captureWithUsage(t, cfg, "claude", active, "claude-b", "b", 88, 88)
@@ -563,9 +551,6 @@ func TestMonitorOnceSwitchesWhenFableWeeklyHitsThreshold(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 
 	fableHeavy := usageForTest(10, 10)
 	fableHeavy.FableWeekly = LimitWindow{Pct: PtrFloat64(90)}

@@ -157,15 +157,7 @@ func applyHubStatus(cfg subswapper.Config, results []subswapper.ServiceStatus) [
 		if !service.HubClient() || service.Disabled {
 			continue
 		}
-		var credential string
-		var err error
-		if isClaudeServiceConfig(service) {
-			credential, err = subswapper.LoadHubClaudeSecret(cfg, service.Name)
-		} else {
-			var placeholder subswapper.CodexProxyPlaceholder
-			placeholder, err = subswapper.LoadHubCodexPlaceholder(cfg, service.Name)
-			credential = placeholder.Token
-		}
+		credential, err := hubCredential(cfg, service)
 		if err != nil {
 			setNote(service.Name, "no hub credential; run hub connect")
 			continue

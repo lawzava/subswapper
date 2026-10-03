@@ -1,7 +1,6 @@
 package subswapper
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -30,46 +29,6 @@ type HomeRepairResult struct {
 	Unchanged []string
 	Missing   []string
 	Conflicts []string
-}
-
-// RepairAccountHome adds missing links to user-authored Claude configuration.
-// It does not replace any existing account-home entry.
-func RepairAccountHome(cfg Config, serviceName, accountName string) (HomeRepairResult, error) {
-	if err := validateAccountName(accountName); err != nil {
-		return HomeRepairResult{}, err
-	}
-	service, ok := cfg.Service(serviceName)
-	if !ok {
-		return HomeRepairResult{}, fmt.Errorf("service %q not found", serviceName)
-	}
-	if !service.UsesAccountHomes() {
-		return HomeRepairResult{}, fmt.Errorf("service %q uses credential bundles; set account_mode to %q", serviceName, AccountModeHome)
-	}
-	if !isClaudeService(service) {
-		return HomeRepairResult{}, fmt.Errorf("service %q does not support shared Claude user configuration", serviceName)
-	}
-
-	lock, err := AcquireStateLock(context.Background(), cfg)
-	if err != nil {
-		return HomeRepairResult{}, err
-	}
-	defer lock.Release()
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		return HomeRepairResult{}, err
-	}
-	if _, ok := state.Account(service.Name, accountName); !ok {
-		return HomeRepairResult{}, fmt.Errorf("account %q not found for service %q", accountName, service.Name)
-	}
-	home := AccountDir(cfg, service.Name, accountName)
-	info, err := os.Lstat(home)
-	if err != nil {
-		return HomeRepairResult{}, fmt.Errorf("inspect account home: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return HomeRepairResult{}, errors.New("account home is not a regular directory")
-	}
-	return repairClaudeSharedConfig(home)
 }
 
 func repairClaudeSharedConfig(accountHome string) (HomeRepairResult, error) {

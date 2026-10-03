@@ -741,9 +741,6 @@ func TestSwitchBestSkipsDisabledAndEmptyServices(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 	captureWithUsage(t, cfg, "alpha", alphaActive, "a1", "a", 90, 90)
 	captureWithUsage(t, cfg, "alpha", alphaActive, "b1", "b", 10, 10)
 	if err := SwitchAccount(cfg, "alpha", "a"); err != nil {
@@ -773,9 +770,6 @@ func TestSwitchBestPersistsEarlierSwitchWhenLaterServiceFails(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 	captureWithUsage(t, cfg, "alpha", alphaActive, "a1", "a", 90, 90)
 	captureWithUsage(t, cfg, "alpha", alphaActive, "b1", "b", 10, 10)
 	if err := SwitchAccount(cfg, "alpha", "a"); err != nil {
@@ -843,9 +837,6 @@ func TestMonitorOnceSkipsDisabledAndEmptyServices(t *testing.T) {
 		},
 	}
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
-	}
 	captureWithUsage(t, cfg, "alpha", active, "a1", "a", 10, 10)
 
 	result := MonitorOnce(testContext(t), cfg, true)
@@ -1616,128 +1607,6 @@ func setActiveTestAccount(t *testing.T, cfg Config, serviceName, accountName str
 	}
 }
 
-func TestImportClaudeSwapSkipsExistingAccountsAndKeepsActive(t *testing.T) {
-	dir := t.TempDir()
-	root := buildClaudeSwapFixture(t, dir)
-	cfg := testClaudeImportConfig(dir)
-	// Live credentials match slot 2, cswap's active slot.
-	if err := os.WriteFile(filepath.Join(dir, "live-credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"two"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	first, err := ImportClaudeSwap(cfg, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(first.Imported) != 2 {
-		t.Fatalf("expected 2 imported, got %d", len(first.Imported))
-	}
-	// A later refresh updates the stored credentials; re-import must not undo it.
-	fresh := `{"claudeAiOauth":{"accessToken":"fresh"}}`
-	credentialsPath := filepath.Join(AccountDir(cfg, "claude", "cswap-1"), "credentials.json")
-	if err := os.WriteFile(credentialsPath, []byte(fresh), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	second, err := ImportClaudeSwap(cfg, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(second.Imported) != 0 || len(second.Skipped) != 2 {
-		t.Fatalf("expected everything skipped, got %#v", second)
-	}
-	assertFileContent(t, credentialsPath, fresh)
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := state.Service("claude").ActiveAccount; got != "cswap-2" {
-		t.Fatalf("expected active account preserved, got %q", got)
-	}
-}
-
-func TestImportClaudeSwapRollsBackFilesWhenStateCommitFails(t *testing.T) {
-	dir := t.TempDir()
-	root := buildClaudeSwapFixture(t, dir)
-	cfg := testClaudeImportConfig(dir)
-	oldCommit := commitStagedFile
-	commitStagedFile = func(file stagedFile) error {
-		if file.target == resolveTargetPath(ExpandPath(cfg.StatePath)) {
-			return errors.New("injected state commit failure")
-		}
-		return file.commit()
-	}
-	t.Cleanup(func() { commitStagedFile = oldCommit })
-
-	if _, err := ImportClaudeSwap(cfg, root); err == nil || !strings.Contains(err.Error(), "injected state commit failure") {
-		t.Fatalf("expected state commit failure, got %v", err)
-	}
-	for _, account := range []string{"cswap-1", "cswap-2"} {
-		for _, name := range []string{"credentials.json", "claude.json"} {
-			if _, err := os.Stat(filepath.Join(AccountDir(cfg, "claude", account), name)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("expected %s/%s rollback, got %v", account, name, err)
-			}
-		}
-	}
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(state.Service("claude").Accounts); got != 0 {
-		t.Fatalf("imported state survived failed commit: %d accounts", got)
-	}
-}
-
-func TestImportClaudeSwapSkipsBrokenSlots(t *testing.T) {
-	dir := t.TempDir()
-	root := buildClaudeSwapFixture(t, dir)
-	if err := os.Remove(filepath.Join(root, "configs", ".claude-config-1-one@example.com.json")); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testClaudeImportConfig(dir)
-
-	result, err := ImportClaudeSwap(cfg, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Imported) != 1 || result.Imported[0].Name != "cswap-2" {
-		t.Fatalf("expected only cswap-2 imported, got %#v", result.Imported)
-	}
-	if len(result.Errors) != 1 {
-		t.Fatalf("expected one slot error, got %v", result.Errors)
-	}
-	if _, err := os.Stat(AccountDir(cfg, "claude", "cswap-1")); !os.IsNotExist(err) {
-		t.Fatalf("expected no orphaned directory for broken slot, got %v", err)
-	}
-}
-
-func TestImportClaudeSwapDoesNotMarkActiveWhenLiveFilesDiffer(t *testing.T) {
-	dir := t.TempDir()
-	root := buildClaudeSwapFixture(t, dir)
-	cfg := testClaudeImportConfig(dir)
-	// Live credentials belong to some other login, not cswap slot 2. Marking
-	// cswap-2 active would make the next switch sync a foreign login into
-	// cswap-2's backup.
-	if err := os.WriteFile(filepath.Join(dir, "live-credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"someone-else"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := ImportClaudeSwap(cfg, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Active != "" {
-		t.Fatalf("expected no active account for mismatched live files, got %q", result.Active)
-	}
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := state.Service("claude").ActiveAccount; got != "" {
-		t.Fatalf("expected no active account in state, got %q", got)
-	}
-}
-
 func TestSwitchAccountToActiveAccountIsNoop(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "active-auth.json")
@@ -1768,30 +1637,6 @@ func TestSwitchBestErrorsWhenNothingCapturedAnywhere(t *testing.T) {
 	if _, err := SwitchBest(testContext(t), cfg, "all"); err == nil {
 		t.Fatal("expected error when no service has captured accounts")
 	}
-}
-
-func buildClaudeSwapFixture(t *testing.T, dir string) string {
-	t.Helper()
-	root := filepath.Join(dir, "claude-swap")
-	for _, sub := range []string{"configs", "credentials", "cache"} {
-		if err := os.MkdirAll(filepath.Join(root, sub), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sequence := `{
-		"activeAccountNumber": 2,
-		"sequence": [1, 2],
-		"accounts": {
-			"1": {"email": "one@example.com", "added": "2026-07-01T20:00:00Z"},
-			"2": {"email": "two@example.com", "added": "2026-07-01T21:00:00Z"}
-		}
-	}`
-	if err := os.WriteFile(filepath.Join(root, "sequence.json"), []byte(sequence), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	writeClaudeSwapFixtureAccount(t, root, "1", "one@example.com", `{"claudeAiOauth":{"accessToken":"one"}}`, `{"account":"one"}`)
-	writeClaudeSwapFixtureAccount(t, root, "2", "two@example.com", `{"claudeAiOauth":{"accessToken":"two"}}`, `{"account":"two"}`)
-	return root
 }
 
 // An active account whose live credentials file is unusable must fall back to

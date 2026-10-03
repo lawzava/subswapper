@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -341,43 +342,15 @@ func ImportHubBundle(configPath string, bundle HubBundle) ([]string, error) {
 	if err := bundle.validate(); err != nil {
 		return nil, err
 	}
-	path := ExpandPath(configPath)
-	var raw Config
-	data, err := os.ReadFile(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		raw.Monitor.Interval.Duration = 5 * time.Minute
-	case err != nil:
+	raw, err := readRawConfig(configPath)
+	if err != nil {
 		return nil, err
-	default:
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&raw); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", filepath.Base(path), err)
-		}
 	}
 	names := make([]string, 0, len(bundle.Services))
 	for _, imported := range bundle.Services {
-		index := -1
-		for candidate := range raw.Services {
-			if raw.Services[candidate].Name == imported.Name {
-				index = candidate
-			}
-		}
-		if index < 0 {
-			raw.Services = append(raw.Services, ServiceConfig{Name: imported.Name, Kind: imported.Kind})
-			index = len(raw.Services) - 1
-		}
-		service := &raw.Services[index]
-		kind := strings.ToLower(service.Kind)
-		if kind == "" {
-			kind = strings.ToLower(service.Name)
-		}
-		if kind == "claude-code" {
-			kind = "claude"
-		}
-		if kind != imported.Kind {
-			return nil, fmt.Errorf("service %q is kind %q here but %q on the hub", service.Name, kind, imported.Kind)
+		service, err := rawService(&raw, imported.Name, imported.Kind)
+		if err != nil {
+			return nil, err
 		}
 		// Overwriting these would silently turn the hub itself, or a machine
 		// with its own accounts, into a client. An existing client keeps its
@@ -391,10 +364,8 @@ func ImportHubBundle(configPath string, bundle HubBundle) ([]string, error) {
 		}
 		names = append(names, service.Name)
 	}
-	cfg := raw
-	cfg.Services = append([]ServiceConfig(nil), raw.Services...)
-	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
+	cfg, err := effectiveConfig(raw)
+	if err != nil {
 		return nil, err
 	}
 	// Credentials go first: a launch must never find hub_url without them.
@@ -403,17 +374,111 @@ func ImportHubBundle(configPath string, bundle HubBundle) ([]string, error) {
 			return nil, err
 		}
 	}
+	return names, writeRawConfig(configPath, raw)
+}
+
+// ConfigureHub makes the Claude and Codex services at configPath serve a hub
+// on tailscaleIP, creating the file if needed. Existing proxy ports are kept;
+// new services use 7878 and 7879. An empty tailscaleIP configures the
+// local proxies only.
+func ConfigureHub(configPath, tailscaleIP string, enroll bool) error {
+	raw, err := readRawConfig(configPath)
+	if err != nil {
+		return err
+	}
+	for _, defaults := range []struct{ name, port string }{{"claude", "7878"}, {"codex", "7879"}} {
+		service, err := rawService(&raw, defaults.name, defaults.name)
+		if err != nil {
+			return err
+		}
+		if service.HubURL != "" {
+			return fmt.Errorf("service %q is a hub client of %s; remove hub_url before making this machine a hub", service.Name, service.HubURL)
+		}
+		if service.ProxyListen == "" {
+			service.ProxyListen = net.JoinHostPort("127.0.0.1", defaults.port)
+		}
+		_, port, err := net.SplitHostPort(service.ProxyListen)
+		if err != nil {
+			return fmt.Errorf("service %q proxy_listen: %w", service.Name, err)
+		}
+		service.HubListen, service.HubEnroll = "", false
+		if tailscaleIP != "" {
+			service.HubListen = net.JoinHostPort(tailscaleIP, port)
+			service.HubEnroll = enroll
+		}
+		if service.SharedRuntimeHome == "" {
+			service.SharedRuntimeHome = NativeRuntimeHome
+		}
+	}
+	if _, err := effectiveConfig(raw); err != nil {
+		return err
+	}
+	return writeRawConfig(configPath, raw)
+}
+
+// readRawConfig reads a config without defaults, so writing it back keeps
+// only what the user set. A missing file yields an empty config.
+func readRawConfig(configPath string) (Config, error) {
+	var raw Config
+	path := ExpandPath(configPath)
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		raw.Monitor.Interval.Duration = 5 * time.Minute
+		return raw, nil
+	case err != nil:
+		return Config{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", filepath.Base(path), err)
+	}
+	return raw, nil
+}
+
+func writeRawConfig(configPath string, raw Config) error {
+	path := ExpandPath(configPath)
 	encoded, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
+		return err
 	}
-	if err := writePrivateFile(path, append(encoded, '\n')); err != nil {
-		return nil, err
+	return writePrivateFile(path, append(encoded, '\n'))
+}
+
+// effectiveConfig validates raw as LoadConfig would see it.
+func effectiveConfig(raw Config) (Config, error) {
+	cfg := raw
+	cfg.Services = append([]ServiceConfig(nil), raw.Services...)
+	cfg.ApplyDefaults()
+	return cfg, cfg.Validate()
+}
+
+// rawService returns the named service, appending it when missing, and
+// checks that it is of kind ("claude" or "codex").
+func rawService(raw *Config, name, kind string) (*ServiceConfig, error) {
+	for index := range raw.Services {
+		service := &raw.Services[index]
+		if service.Name != name {
+			continue
+		}
+		existing := strings.ToLower(service.Kind)
+		if existing == "" {
+			existing = strings.ToLower(service.Name)
+		}
+		if existing == "claude-code" {
+			existing = "claude"
+		}
+		if existing != kind {
+			return nil, fmt.Errorf("service %q is kind %q here, not %q", service.Name, existing, kind)
+		}
+		return service, nil
 	}
-	return names, nil
+	raw.Services = append(raw.Services, ServiceConfig{Name: name, Kind: kind})
+	return &raw.Services[len(raw.Services)-1], nil
 }
 
 func storeHubCredential(cfg Config, imported HubBundleService) error {
@@ -567,4 +632,246 @@ func newHubRelayHandler(hubURL string) (http.Handler, error) {
 			writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "subswapper hub at "+target.Host+" is unreachable")
 		},
 	}, nil
+}
+
+const (
+	hubAccountsPath = "/subswapper/hub/accounts"
+	hubSwitchPath   = "/subswapper/hub/switch"
+	// hubManageWindow covers an automatic switch, which probes every account.
+	hubManageWindow = 90 * time.Second
+	hubRequestLimit = 1 << 20
+)
+
+// HubAccountRequest adds or replaces an account on the hub. A Claude service
+// takes SetupToken; a Codex service takes AuthJSON, a ChatGPT login file.
+type HubAccountRequest struct {
+	Account    string          `json:"account"`
+	Email      string          `json:"email,omitempty"`
+	SetupToken string          `json:"setup_token,omitempty"`
+	AuthJSON   json.RawMessage `json:"auth_json,omitempty"`
+}
+
+type HubAccountResult struct {
+	Account string `json:"account"`
+	Email   string `json:"email,omitempty"`
+	Created bool   `json:"created"`
+}
+
+type HubSwitchResult struct {
+	Active string `json:"active"`
+}
+
+// serveHubManagement lets a client holding the service credential add,
+// remove, and select accounts on this machine. It reports whether it handled r.
+func serveHubManagement(w http.ResponseWriter, r *http.Request, cfg Config, service ServiceConfig, lookup ClaudeSetupTokenIdentityLookup) bool {
+	switch r.URL.Path {
+	case hubAccountsPath:
+		switch r.Method {
+		case http.MethodPost:
+			hubAddAccount(w, r, cfg, service, lookup)
+		case http.MethodDelete:
+			force := r.URL.Query().Get("force") == "1"
+			if err := UnregisterAccount(r.Context(), cfg, service.Name, r.URL.Query().Get("account"), force, false); err != nil {
+				writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return true
+			}
+			writeHubJSON(w, struct{}{})
+		default:
+			writeClaudeProxyError(w, http.StatusMethodNotAllowed, "invalid_request_error", "accounts accept POST or DELETE")
+		}
+	case hubSwitchPath:
+		if r.Method != http.MethodPost {
+			writeClaudeProxyError(w, http.StatusMethodNotAllowed, "invalid_request_error", "switch accepts POST only")
+			return true
+		}
+		var request struct {
+			Account string `json:"account"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, hubRequestLimit)).Decode(&request); err != nil {
+			writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", "switch request is malformed")
+			return true
+		}
+		active, err := switchServiceAccount(r.Context(), cfg, service.Name, request.Account)
+		if err != nil {
+			writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return true
+		}
+		writeHubJSON(w, HubSwitchResult{Active: active})
+	default:
+		return false
+	}
+	return true
+}
+
+func hubAddAccount(w http.ResponseWriter, r *http.Request, cfg Config, service ServiceConfig, lookup ClaudeSetupTokenIdentityLookup) {
+	var request HubAccountRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, hubRequestLimit)).Decode(&request); err != nil {
+		writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", "account request is malformed")
+		return
+	}
+	result := HubAccountResult{Account: request.Account, Email: request.Email}
+	var err error
+	switch {
+	case isClaudeService(service) && request.SetupToken != "":
+		result.Created, err = AddClaudeAccount(r.Context(), cfg, service.Name, request.Account, request.Email, request.SetupToken, lookup)
+	case isCodexService(service) && len(request.AuthJSON) != 0:
+		if result.Email == "" {
+			result.Email = CodexLoginEmail(request.AuthJSON)
+		}
+		result.Created, err = AddCodexAccount(cfg, service.Name, request.Account, request.Email, request.AuthJSON)
+	default:
+		err = fmt.Errorf("service %q needs a %s", service.Name, map[bool]string{true: "setup token", false: "ChatGPT login"}[isClaudeService(service)])
+	}
+	if err != nil {
+		writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	writeHubJSON(w, result)
+}
+
+// switchServiceAccount selects accountName, or the best account for "auto",
+// and returns the selected account.
+func switchServiceAccount(ctx context.Context, cfg Config, serviceName, accountName string) (string, error) {
+	if accountName == "auto" {
+		if _, err := SwitchBest(ctx, cfg, serviceName); err != nil {
+			return "", err
+		}
+	} else if err := SwitchAccount(cfg, serviceName, accountName); err != nil {
+		return "", err
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		return "", err
+	}
+	return state.Service(serviceName).ActiveAccount, nil
+}
+
+func writeHubJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+// hubCall sends one management request to the hub and decodes its answer.
+// The hub's error message is returned as the error.
+func hubCall(ctx context.Context, hubURL, credential, method, path string, body, out any) error {
+	origin, err := parseProxyUpstream(hubURL)
+	if err != nil {
+		return fmt.Errorf("hub_url: %w", err)
+	}
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(data)
+	}
+	ctx, cancel := context.WithTimeout(ctx, hubManageWindow)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, origin.String()+path, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	req.Header.Set("Content-Type", "application/json")
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		return fmt.Errorf("hub at %s did not answer", origin.Host)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, hubRequestLimit))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		var failure struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(data, &failure) == nil && failure.Error.Message != "" {
+			return fmt.Errorf("hub: %s", failure.Error.Message)
+		}
+		return fmt.Errorf("hub answered %s", resp.Status)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return errors.New("hub returned a malformed answer")
+	}
+	return nil
+}
+
+// HubAddAccount adds or replaces an account on the hub.
+func HubAddAccount(ctx context.Context, hubURL, credential string, request HubAccountRequest) (HubAccountResult, error) {
+	var result HubAccountResult
+	err := hubCall(ctx, hubURL, credential, http.MethodPost, hubAccountsPath, request, &result)
+	return result, err
+}
+
+// HubSwitch selects an account on the hub; "auto" picks the best one.
+func HubSwitch(ctx context.Context, hubURL, credential, account string) (HubSwitchResult, error) {
+	var result HubSwitchResult
+	err := hubCall(ctx, hubURL, credential, http.MethodPost, hubSwitchPath, map[string]string{"account": account}, &result)
+	return result, err
+}
+
+// HubRemoveAccount unregisters an account on the hub and deletes its token.
+func HubRemoveAccount(ctx context.Context, hubURL, credential, account string, force bool) error {
+	query := url.Values{"account": {account}}
+	if force {
+		query.Set("force", "1")
+	}
+	return hubCall(ctx, hubURL, credential, http.MethodDelete, hubAccountsPath+"?"+query.Encode(), nil, nil)
+}
+
+// HubHealthInfo is what a hub's health check reports.
+type HubHealthInfo struct {
+	Service string `json:"service"`
+	Version string `json:"version"`
+}
+
+// writeProxyHealth answers an authenticated health check.
+func writeProxyHealth(w http.ResponseWriter, service ServiceConfig) {
+	writeHubJSON(w, struct {
+		HubHealthInfo
+		Proxy string `json:"proxy"`
+	}{HubHealthInfo{Service: service.Name, Version: Version()}, "subswapper"})
+}
+
+// HubHealth checks that the hub at hubURL answers and accepts credential.
+func HubHealth(ctx context.Context, hubURL, credential string) (HubHealthInfo, error) {
+	origin, err := parseProxyUpstream(hubURL)
+	if err != nil {
+		return HubHealthInfo{}, fmt.Errorf("hub_url: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin.String()+claudeProxyHealthPath, nil)
+	if err != nil {
+		return HubHealthInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		return HubHealthInfo{}, fmt.Errorf("hub at %s did not answer", hubURL)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return HubHealthInfo{}, fmt.Errorf("hub at %s rejected this machine's credential", hubURL)
+	case resp.StatusCode != http.StatusOK:
+		return HubHealthInfo{}, fmt.Errorf("hub at %s answered %s", hubURL, resp.Status)
+	}
+	var health HubHealthInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&health); err != nil {
+		return HubHealthInfo{}, fmt.Errorf("hub at %s returned a malformed health check", hubURL)
+	}
+	return health, nil
 }

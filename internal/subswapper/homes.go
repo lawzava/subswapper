@@ -15,11 +15,6 @@ const (
 	AccountModeBundle = "bundle"
 )
 
-type HomeMigrationResult struct {
-	Copied  int
-	Skipped int
-}
-
 func isBuiltInKind(kind string) bool {
 	switch strings.ToLower(kind) {
 	case "claude", "claude-code", "codex":
@@ -167,62 +162,4 @@ func ResetAccountProbeState(cfg Config, serviceName, accountName string) error {
 	account.LastProbeError = ""
 	state.Service(serviceName).Accounts[accountName] = account
 	return SaveState(cfg.StatePath, state)
-}
-
-func MigrateAccountHomes(cfg Config) (HomeMigrationResult, error) {
-	lock, err := AcquireStateLock(context.Background(), cfg)
-	if err != nil {
-		return HomeMigrationResult{}, err
-	}
-	defer lock.Release()
-	state, err := LoadState(cfg.StatePath)
-	if err != nil {
-		return HomeMigrationResult{}, err
-	}
-	result := HomeMigrationResult{}
-	for _, service := range cfg.Services {
-		if !service.UsesAccountHomes() {
-			continue
-		}
-		legacyNames := map[string]string{}
-		if isClaudeService(service) {
-			legacyNames = map[string]string{
-				"credentials.json": ".credentials.json",
-				"claude.json":      ".config.json",
-			}
-		}
-		for accountName := range state.Service(service.Name).Accounts {
-			home := AccountDir(cfg, service.Name, accountName)
-			if err := os.MkdirAll(home, 0o700); err != nil {
-				return result, err
-			}
-			if err := os.Chmod(home, 0o700); err != nil {
-				return result, err
-			}
-			for legacyName, nativeName := range legacyNames {
-				source := filepath.Join(home, legacyName)
-				target := filepath.Join(home, nativeName)
-				if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
-					continue
-				} else if err != nil {
-					return result, err
-				}
-				if _, err := os.Stat(target); err == nil {
-					result.Skipped++
-					continue
-				} else if !errors.Is(err, os.ErrNotExist) {
-					return result, err
-				}
-				data, err := os.ReadFile(source)
-				if err != nil {
-					return result, err
-				}
-				if err := writeFileAtomic(target, data); err != nil {
-					return result, err
-				}
-				result.Copied++
-			}
-		}
-	}
-	return result, nil
 }

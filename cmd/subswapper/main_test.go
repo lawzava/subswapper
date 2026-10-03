@@ -38,11 +38,10 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	if err := run([]string{"help"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "Usage:") {
-		t.Fatalf("help output:\n%s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "home create") || !strings.Contains(stdout.String(), "home repair") || !strings.Contains(stdout.String(), "home run") {
-		t.Fatalf("help output lacks account-home commands:\n%s", stdout.String())
+	for _, want := range []string{"Set up:", "subswapper setup client <hub>", "subswapper add claude|codex", "subswapper doctor", "home run"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help output lacks %q:\n%s", want, stdout.String())
+		}
 	}
 	stdout.Reset()
 	if err := run([]string{"version"}, &stdout, &stderr); err != nil {
@@ -59,92 +58,17 @@ func TestRunHelpVersionAndMissingCommand(t *testing.T) {
 	}
 }
 
-func TestRunHomeRepairReportsConflictsWithoutContents(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows symlink creation depends on Developer Mode or elevated privileges")
-	}
+func TestRunHomePath(t *testing.T) {
 	dir := t.TempDir()
 	configPath := writeHomeModeConfig(t, dir, "claude")
+	var stdout, stderr bytes.Buffer
 	createHomeAccount(t, configPath, "claude", "work")
-	nativeClaude := filepath.Join(dir, "native-home", ".claude")
-	if err := os.MkdirAll(nativeClaude, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(nativeClaude, "CLAUDE.md"), []byte("native secret marker"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	home := filepath.Join(dir, "accounts", "claude", "work")
-	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte("account secret marker"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(nativeClaude, "settings.json"), []byte("native settings marker"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	err := run([]string{"home", "repair", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "1 conflict") {
-		t.Fatalf("repair error = %v", err)
-	}
-	combined := stdout.String() + stderr.String() + err.Error()
-	for _, want := range []string{"linked 1", "conflicts 1", "settings.json"} {
-		if !strings.Contains(combined, want) {
-			t.Fatalf("repair output lacks %q: %s", want, combined)
-		}
-	}
-	for _, secret := range []string{"native secret marker", "account secret marker", "native settings marker"} {
-		if strings.Contains(combined, secret) {
-			t.Fatalf("repair exposed file contents: %q", combined)
-		}
-	}
-}
-
-func TestRunHomeRepairDoesNotReportSuccessBeforeAnEarlyFailure(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeHomeModeConfig(t, dir, "claude")
-	createHomeAccount(t, configPath, "claude", "work")
-	home := filepath.Join(dir, "accounts", "claude", "work")
-	if err := os.Remove(home); err != nil {
-		t.Fatal(err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	err := run([]string{"home", "repair", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "inspect account home") {
-		t.Fatalf("repair error = %v", err)
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("repair reported success before failure: %q", stdout.String())
-	}
-}
-
-func TestRunHomeCreatePathAndEnv(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeHomeModeConfig(t, dir, "claude")
-	var stdout, stderr bytes.Buffer
-
-	if err := run([]string{"home", "create", "-config", configPath, "-service", "claude", "-account", "work", "-email", "work@example.com"}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
-	}
 	wantHome := filepath.Join(dir, "accounts", "claude", "work")
-	if !strings.Contains(stdout.String(), wantHome) {
-		t.Fatalf("create output = %q, want home %q", stdout.String(), wantHome)
-	}
-
-	stdout.Reset()
 	if err := run([]string{"home", "path", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(stdout.String()) != wantHome {
 		t.Fatalf("path output = %q, want %q", stdout.String(), wantHome)
-	}
-
-	stdout.Reset()
-	if err := run([]string{"home", "env", "-config", configPath, "-service", "claude", "-account", "work"}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.TrimSpace(stdout.String()); got != "export CLAUDE_CONFIG_DIR='"+wantHome+"'" {
-		t.Fatalf("env output = %q", got)
 	}
 }
 
@@ -152,10 +76,7 @@ func TestRunHomeCommandReceivesSelectedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	configPath := writeHomeModeConfig(t, dir, "codex")
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"home", "create", "-config", configPath, "-service", "codex", "-account", "personal"}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
-	}
-	stdout.Reset()
+	createHomeAccount(t, configPath, "codex", "personal")
 
 	if err := run([]string{"home", "run", "-config", configPath, "-service", "codex", "-account", "personal", "--", "sh", "-c", `printf %s "$CODEX_HOME"`}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
@@ -163,82 +84,6 @@ func TestRunHomeCommandReceivesSelectedEnvironment(t *testing.T) {
 	wantHome := filepath.Join(dir, "accounts", "codex", "personal")
 	if stdout.String() != wantHome {
 		t.Fatalf("run output = %q, want %q", stdout.String(), wantHome)
-	}
-}
-
-func TestRunHomeTokenSetStatusAndRemoveNeverExposeToken(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeHomeModeConfig(t, dir, "claude")
-	createHomeAccount(t, configPath, "claude", "work")
-	secret := "sk-ant-oat01-command-secret"
-
-	originalLookup := lookupClaudeSetupTokenIdentity
-	lookupClaudeSetupTokenIdentity = func(context.Context, string) (subswapper.ClaudeSetupTokenIdentity, error) {
-		return subswapper.ClaudeSetupTokenIdentity{}, nil
-	}
-	t.Cleanup(func() { lookupClaudeSetupTokenIdentity = originalLookup })
-
-	for _, test := range []struct {
-		name  string
-		args  []string
-		stdin string
-	}{
-		{
-			name:  "set",
-			args:  []string{"home", "token", "set", "-config", configPath, "-service", "claude", "-account", "work"},
-			stdin: secret + "\n",
-		},
-		{
-			name: "status",
-			args: []string{"home", "token", "status", "-config", configPath, "-service", "claude", "-account", "work"},
-		},
-		{
-			name: "remove",
-			args: []string{"home", "token", "remove", "-config", configPath, "-service", "claude", "-account", "work"},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			err := runWithInput(test.args, strings.NewReader(test.stdin), &stdout, &stderr)
-			combined := stdout.String() + stderr.String()
-			if err != nil {
-				combined += err.Error()
-				t.Fatalf("command failed: %v", err)
-			}
-			if strings.Contains(combined, secret) {
-				t.Fatalf("command exposed setup token: %q", combined)
-			}
-		})
-	}
-
-	for _, path := range []string{configPath, filepath.Join(dir, "state.json")} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if bytes.Contains(data, []byte(secret)) {
-			t.Fatalf("%s exposed setup token", filepath.Base(path))
-		}
-	}
-}
-
-func TestRunHomeTokenRejectsCommandArgument(t *testing.T) {
-	dir := t.TempDir()
-	configPath := writeHomeModeConfig(t, dir, "claude")
-	createHomeAccount(t, configPath, "claude", "work")
-	secret := "sk-ant-oat01-argument-secret"
-	var stdout, stderr bytes.Buffer
-	err := runWithInput(
-		[]string{"home", "token", "set", "-config", configPath, "-service", "claude", "-account", "work", secret},
-		strings.NewReader(""),
-		&stdout,
-		&stderr,
-	)
-	if err == nil {
-		t.Fatal("token argument was accepted")
-	}
-	if strings.Contains(stdout.String()+stderr.String()+err.Error(), secret) {
-		t.Fatalf("rejection exposed setup token: %v", err)
 	}
 }
 
@@ -598,7 +443,7 @@ func TestClaudeStatusLineRecordsUsageAndPreservesExistingCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, err := subswapper.ClaudeSetupTokenStatusForAccount(*cfg, "claude", "work")
+	_, status, err := subswapper.LoadClaudeSetupTokenWithStatus(*cfg, "claude", "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +497,7 @@ func TestClaudeStatusLineUsesSharedRuntimeSettingsAndSelectedAccountUsage(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, err := subswapper.ClaudeSetupTokenStatusForAccount(*cfg, "claude", "work")
+	_, status, err := subswapper.LoadClaudeSetupTokenWithStatus(*cfg, "claude", "work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,13 +550,11 @@ func TestClaudeStatusLineUsesSharedRuntimeSettingsAndSelectedAccountUsage(t *tes
 
 func createHomeAccount(t *testing.T, configPath, service, account string) {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
-	if err := runWithInput(
-		[]string{"home", "create", "-config", configPath, "-service", service, "-account", account},
-		strings.NewReader(""),
-		&stdout,
-		&stderr,
-	); err != nil {
+	cfg, err := subswapper.LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := subswapper.CreateAccountHome(*cfg, service, account, ""); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -764,9 +607,7 @@ func TestRemoveHomeAccountPreservesHomeUnlessDeleteRequested(t *testing.T) {
 			dir := t.TempDir()
 			configPath := writeHomeModeConfig(t, dir, "codex")
 			var stdout, stderr bytes.Buffer
-			if err := run([]string{"home", "create", "-config", configPath, "-service", "codex", "-account", "work"}, &stdout, &stderr); err != nil {
-				t.Fatal(err)
-			}
+			createHomeAccount(t, configPath, "codex", "work")
 			home := filepath.Join(dir, "accounts", "codex", "work")
 			marker := filepath.Join(home, "keep-me")
 			if err := os.WriteFile(marker, []byte("state"), 0o600); err != nil {
@@ -835,43 +676,6 @@ func writeSharedClaudeRuntimeConfig(t *testing.T, dir, sharedHome string) string
 		t.Fatal(err)
 	}
 	return path
-}
-
-func TestRunStatusWithCustomProbe(t *testing.T) {
-	dir := t.TempDir()
-	live := filepath.Join(dir, "active.json")
-	if err := os.WriteFile(live, []byte("credential"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := subswapper.Config{
-		BackupRoot: filepath.Join(dir, "backups"),
-		StatePath:  filepath.Join(dir, "state.json"),
-		Services: []subswapper.ServiceConfig{{
-			Name:         "svc",
-			Kind:         "custom",
-			Files:        []subswapper.ManagedFile{{Path: live, BackupName: "auth.json"}},
-			UsageCommand: []string{"sh", "-c", `echo '{"five_hour":{"pct":12},"weekly":{"pct":34}}'`},
-		}},
-	}
-	cfg.ApplyDefaults()
-	configPath := filepath.Join(dir, "config.json")
-	data, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := subswapper.CaptureAccount(cfg, "svc", "main", ""); err != nil {
-		t.Fatal(err)
-	}
-	var stdout, stderr bytes.Buffer
-	if err := run([]string{"status", "-config", configPath}, &stdout, &stderr); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(stdout.String(), "svc") || !strings.Contains(stdout.String(), "34%") {
-		t.Fatalf("status output:\n%s", stdout.String())
-	}
 }
 
 func TestMonitorLoopDeduplicatesEvents(t *testing.T) {

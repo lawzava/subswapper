@@ -223,11 +223,6 @@ func TestHubExportAndImportCommands(t *testing.T) {
 	if service, _ := cfg.Service("claude"); !service.HubClient() {
 		t.Fatalf("imported service = %#v", service)
 	}
-	// Account management stays on the hub.
-	err = run([]string{"home", "login", "-config", clientConfig, "-service", "claude"}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "on the hub") {
-		t.Fatalf("login on a hub client: err = %v", err)
-	}
 }
 
 func TestRunHomeClaudeUsesFixedClientRelayWhenServing(t *testing.T) {
