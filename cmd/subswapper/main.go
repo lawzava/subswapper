@@ -376,7 +376,7 @@ func runClaudeWithSetupToken(
 		}
 		environment, err = subswapper.BuildClaudeProxyLaunchEnvironment(os.Environ(), launchHome, token, service.ProxyListen, metadata, service.ProxyEnvScrub)
 	} else {
-		environment, err = subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata)
+		environment, err = subswapper.BuildClaudeLaunchEnvironment(os.Environ(), runtimeHome, token, metadata, service.ProxyEnvScrub)
 	}
 	if err != nil {
 		return errors.New("selected Claude account environment is unusable")

@@ -178,9 +178,11 @@ With `shared_runtime_home: "native"` (what `setup` writes) Claude keeps its
 own `~/.claude`: settings, plugins, MCP servers, transcripts, `--resume`, and
 memory are the same for every account and for plain `claude`.
 
-Proxy launches skip `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` unless the service sets
-`proxy_env_scrub: true`, because the scrub sandboxes every Bash command and
-masks `~/.gnupg` and `~/.ssh`.
+Claude launches, including the fixed-token fallback, skip
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` unless the service sets
+`proxy_env_scrub: true`. The scrub sandboxes every Bash command, masks
+`~/.gnupg` and `~/.ssh`, and creates empty stub files (`package.json`,
+`.env*`, lockfiles, shell rc files) in the working directory and `$HOME`.
 
 ### Codex
 

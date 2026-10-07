@@ -100,7 +100,7 @@ if [ "$1" = auth ] && [ "$2" = status ]; then
 fi
 printf 'token=%s scrub=%s config=%s account=%s api=%s refresh=%s bedrock=%s vertex=%s foundry=%s\n' \
   "$([ "$CLAUDE_CODE_OAUTH_TOKEN" = '`+secret+`' ] && printf yes || printf no)" \
-  "$CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" "$CLAUDE_CONFIG_DIR" "$SUBSWAPPER_ACCOUNT" \
+  "${CLAUDE_CODE_SUBPROCESS_ENV_SCRUB-unset}" "$CLAUDE_CONFIG_DIR" "$SUBSWAPPER_ACCOUNT" \
   "${ANTHROPIC_API_KEY-unset}" "${CLAUDE_CODE_OAUTH_REFRESH_TOKEN-unset}" \
   "${CLAUDE_CODE_USE_BEDROCK-unset}" "${CLAUDE_CODE_USE_VERTEX-unset}" "${CLAUDE_CODE_USE_FOUNDRY-unset}"
 printf 'args='
@@ -125,7 +125,7 @@ printf '<%s>' "$@"
 	wantHome := filepath.Join(dir, "accounts", "claude", "work")
 	got := stdout.String()
 	for _, want := range []string{
-		"token=yes", "scrub=1", "config=" + wantHome, "account=work",
+		"token=yes", "scrub=unset", "config=" + wantHome, "account=work",
 		"api=unset", "refresh=unset", "bedrock=unset", "vertex=unset", "foundry=unset",
 		"<--settings>", `"statusLine"`, "<hello>",
 	} {
@@ -135,6 +135,49 @@ printf '<%s>' "$@"
 	}
 	if strings.Contains(got+stderr.String(), secret) {
 		t.Fatalf("home run exposed setup token: %q", got+stderr.String())
+	}
+}
+
+func TestRunHomeClaudeFixedTokenScrubFollowsConfig(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeHomeModeConfig(t, dir, "claude")
+	createHomeAccount(t, configPath, "claude", "work")
+	storeTestSetupToken(t, configPath, "work", "sk-ant-oat01-launch-secret")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg subswapper.Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Services[0].ProxyEnvScrub = true
+	if data, err = json.Marshal(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeClaude := writeFakeClaude(t, dir, `
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  printf '{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}\n'
+  exit 0
+fi
+printf 'scrub=%s\n' "$CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
+`)
+
+	var stdout, stderr bytes.Buffer
+	err = runWithInput(
+		[]string{"home", "run", "-config", configPath, "-service", "claude", "-account", "work", "--", fakeClaude},
+		strings.NewReader(""),
+		&stdout,
+		&stderr,
+	)
+	if err != nil {
+		t.Fatalf("home run failed: %v; stderr=%s", err, stderr.String())
+	}
+	if got := stdout.String(); got != "scrub=1\n" {
+		t.Fatalf("home run output = %q, want scrub=1", got)
 	}
 }
 

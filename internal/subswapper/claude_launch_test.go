@@ -23,19 +23,18 @@ func TestBuildClaudeLaunchEnvironmentIsolatesSelectedAccount(t *testing.T) {
 	got, err := BuildClaudeLaunchEnvironment(base, "/accounts/claude/account-a", token, map[string]string{
 		"SUBSWAPPER_ACCOUNT": "account-a",
 		"SUBSWAPPER_SERVICE": "claude",
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	env := environmentMap(got)
 	want := map[string]string{
-		"PATH":                             "/usr/bin",
-		"LANG":                             "en_US.UTF-8",
-		"CLAUDE_CONFIG_DIR":                "/accounts/claude/account-a",
-		"CLAUDE_CODE_OAUTH_TOKEN":          token,
-		"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-		"SUBSWAPPER_ACCOUNT":               "account-a",
-		"SUBSWAPPER_SERVICE":               "claude",
+		"PATH":                    "/usr/bin",
+		"LANG":                    "en_US.UTF-8",
+		"CLAUDE_CONFIG_DIR":       "/accounts/claude/account-a",
+		"CLAUDE_CODE_OAUTH_TOKEN": token,
+		"SUBSWAPPER_ACCOUNT":      "account-a",
+		"SUBSWAPPER_SERVICE":      "claude",
 	}
 	if len(env) != len(want) {
 		t.Fatalf("environment = %#v, want %#v", env, want)
@@ -119,7 +118,7 @@ func TestBuildClaudeLaunchEnvironmentRemovesConflictingCredentials(t *testing.T)
 		base = append(base, key+"=conflicting")
 	}
 
-	got, err := BuildClaudeLaunchEnvironment(base, "/accounts/work", "selected-token", nil)
+	got, err := BuildClaudeLaunchEnvironment(base, "/accounts/work", "selected-token", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,9 +142,9 @@ func TestBuildClaudeLaunchEnvironmentRemovesConflictingCredentials(t *testing.T)
 
 // Claude Code sandboxes every Bash command when CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
 // is set and ignores dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh
-// and breaks signed commits. Through the proxy the process holds no real
-// token, so the scrub is opt-in there and stays mandatory for fixed tokens.
-func TestBuildClaudeProxyLaunchEnvironmentScrubIsOptIn(t *testing.T) {
+// and breaks signed commits. It also creates empty stub files in $HOME and the
+// working directory, so proxy and fixed-token launches both leave it opt-in.
+func TestBuildClaudeLaunchEnvironmentScrubIsOptIn(t *testing.T) {
 	base := []string{"PATH=/usr/bin", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1"}
 	for _, test := range []struct {
 		name  string
@@ -156,27 +155,24 @@ func TestBuildClaudeProxyLaunchEnvironmentScrubIsOptIn(t *testing.T) {
 		{name: "opt-in sets scrub", scrub: true, want: "1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := BuildClaudeProxyLaunchEnvironment(base, "/accounts/claude/a", "proxy-secret", "127.0.0.1:7878", nil, test.scrub)
+			proxy, err := BuildClaudeProxyLaunchEnvironment(base, "/accounts/claude/a", "proxy-secret", "127.0.0.1:7878", nil, test.scrub)
 			if err != nil {
 				t.Fatal(err)
 			}
-			env := environmentMap(got)
-			value, present := env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]
-			if present != (test.want != "") || value != test.want {
-				t.Fatalf("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = %q (present %v), want %q", value, present, test.want)
-			}
-			if env["ANTHROPIC_BASE_URL"] == "" || env["CLAUDE_CODE_OAUTH_TOKEN"] != "proxy-secret" {
+			if env := environmentMap(proxy); env["ANTHROPIC_BASE_URL"] == "" || env["CLAUDE_CODE_OAUTH_TOKEN"] != "proxy-secret" {
 				t.Fatalf("proxy routing lost: %#v", env)
 			}
+			fixed, err := BuildClaudeLaunchEnvironment(base, "/accounts/claude/a", "setup-token", nil, test.scrub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for launch, got := range map[string][]string{"proxy": proxy, "fixed-token": fixed} {
+				value, present := environmentMap(got)["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]
+				if present != (test.want != "") || value != test.want {
+					t.Fatalf("%s CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = %q (present %v), want %q", launch, value, present, test.want)
+				}
+			}
 		})
-	}
-	// A fixed-token launch still scrubs regardless of the inherited value.
-	got, err := BuildClaudeLaunchEnvironment([]string{"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0"}, "/accounts/claude/a", "setup-token", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if environmentMap(got)["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] != "1" {
-		t.Fatal("fixed-token launch must keep the subprocess env scrub")
 	}
 }
 
@@ -195,7 +191,7 @@ func TestBuildClaudeLaunchEnvironmentNeverIncludesTokenInErrors(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := BuildClaudeLaunchEnvironment(nil, test.configDir, test.token, test.metadata)
+			_, err := BuildClaudeLaunchEnvironment(nil, test.configDir, test.token, test.metadata, false)
 			if err == nil {
 				t.Fatal("expected error")
 			}

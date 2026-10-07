@@ -100,16 +100,21 @@ var claudeConflictingEnvironmentPrefixes = []string{
 
 // BuildClaudeLaunchEnvironment returns a new environment for one Claude
 // account. Metadata keys must use the SUBSWAPPER_ namespace, and their values
-// must not contain secrets.
-func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string) ([]string, error) {
-	return buildClaudeLaunchEnvironment(base, configDir, setupToken, metadata, false, true)
+// must not contain secrets. The subprocess env scrub is opt-in: Claude Code
+// already strips CLAUDE_CODE_OAUTH_TOKEN from Bash commands, and the scrub's
+// sandbox does not deny reads of the stored token files anyway.
+func BuildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string, envScrub bool) ([]string, error) {
+	return buildClaudeLaunchEnvironment(base, configDir, setupToken, metadata, false, envScrub)
 }
 
 // buildClaudeLaunchEnvironment sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB only when
 // envScrub is true. Claude Code treats that variable as a hard sandbox: every
 // Bash command runs confined and dangerouslyDisableSandbox is ignored, which
-// masks ~/.gnupg and ~/.ssh and breaks signed commits. An inherited value is
-// always dropped so the caller's decision is the only one that applies.
+// masks ~/.gnupg and ~/.ssh and breaks signed commits. At startup it also
+// creates empty bubblewrap mount targets (package.json, .env*, lockfiles,
+// shell rc files) in the working directory and $HOME, and appends a block to
+// .git/info/exclude. An inherited value is always dropped so the caller's
+// decision is the only one that applies.
 func buildClaudeLaunchEnvironment(base []string, configDir, setupToken string, metadata map[string]string, inheritConfigDir, envScrub bool) ([]string, error) {
 	if !inheritConfigDir && (strings.TrimSpace(configDir) == "" || strings.IndexByte(configDir, 0) >= 0) {
 		return nil, errors.New("claude account config directory is invalid")

@@ -67,10 +67,11 @@ type ServiceConfig struct {
 	// `hub connect` needs no file or SSH. Enable it only when every tailnet
 	// member may use these accounts.
 	HubEnroll bool `json:"hub_enroll,omitempty"`
-	// ProxyEnvScrub sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 on proxy launches.
+	// ProxyEnvScrub sets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 on every Claude
+	// launch, including the fixed-token fallback; the name predates that.
 	// Off by default: Claude Code then sandboxes every Bash command and ignores
 	// dangerouslyDisableSandbox, which masks ~/.gnupg and ~/.ssh and breaks
-	// signed commits. Fixed-token launches always scrub.
+	// signed commits, and it creates empty stub files in $HOME and the cwd.
 	ProxyEnvScrub bool          `json:"proxy_env_scrub,omitempty"`
 	Files         []ManagedFile `json:"files,omitempty"`
 	UsageCommand  []string      `json:"usage_command,omitempty"`
