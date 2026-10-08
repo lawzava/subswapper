@@ -486,9 +486,9 @@ func TestFetchHubBundle(t *testing.T) {
 func TestHubAddressDefaultsToClaudePort(t *testing.T) {
 	for input, want := range map[string]string{
 		"100.64.0.1":             "http://100.64.0.1:7878",
-		"hub-host:7879":              "http://hub-host:7879",
+		"hub-host:7879":          "http://hub-host:7879",
 		"http://100.64.0.1:7878": "http://100.64.0.1:7878",
-		"https://hub.example":       "https://hub.example",
+		"https://hub.example":    "https://hub.example",
 	} {
 		got, err := hubBundleURL(input)
 		if err != nil || got != want+hubBundlePath {
