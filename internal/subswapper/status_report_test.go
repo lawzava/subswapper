@@ -12,7 +12,7 @@ func statusReportFixture(now time.Time) []ServiceStatus {
 	fiveHour := 15.0
 	return []ServiceStatus{
 		{
-			Service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://100.67.68.117:7878"},
+			Service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://100.64.0.1:7878"},
 			Accounts: []AccountStatus{
 				{
 					Service: "claude",
@@ -69,7 +69,7 @@ func TestBuildStatusReport(t *testing.T) {
 		t.Fatalf("report = %s", data)
 	}
 	claude := decoded.Services[0]
-	if claude.Name != "claude" || claude.Kind != "claude" || claude.Hub != "http://100.67.68.117:7878" || claude.Selected != "foxy2" || len(claude.Accounts) != 2 {
+	if claude.Name != "claude" || claude.Kind != "claude" || claude.Hub != "http://100.64.0.1:7878" || claude.Selected != "foxy2" || len(claude.Accounts) != 2 {
 		t.Fatalf("claude = %s", data)
 	}
 	foxy := claude.Accounts[0]

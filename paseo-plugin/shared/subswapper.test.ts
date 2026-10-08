@@ -9,7 +9,7 @@ const sample = {
     {
       name: "claude",
       kind: "claude",
-      hub: "http://100.67.68.117:7878",
+      hub: "http://100.64.0.1:7878",
       selected: "h2",
       accounts: [
         {
@@ -27,14 +27,14 @@ const sample = {
         { name: "main", selected: false, ready: false, state: "usage unavailable" },
       ],
     },
-    { name: "codex", kind: "codex", note: "hub at http://100.67.68.117:7879 unavailable", accounts: [] },
+    { name: "codex", kind: "codex", note: "hub at http://100.64.0.1:7879 unavailable", accounts: [] },
   ],
 };
 
 test("the plugin accepts subswapper status -json", () => {
   const report = reportSchema.parse(sample);
   assert.equal(report.services[0].accounts[0].weekly?.used_percent, 90);
-  assert.equal(report.services[1].note, "hub at http://100.67.68.117:7879 unavailable");
+  assert.equal(report.services[1].note, "hub at http://100.64.0.1:7879 unavailable");
 });
 
 test("the plugin rejects a report without accounts", () => {

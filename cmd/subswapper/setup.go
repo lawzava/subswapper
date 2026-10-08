@@ -173,7 +173,7 @@ func runSetupClient(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if len(positional) != 1 {
-		return errors.New("usage: subswapper setup client <hub address, e.g. 100.67.68.117>")
+		return errors.New("usage: subswapper setup client <hub address, e.g. 100.64.0.1>")
 	}
 	bundle, err := subswapper.FetchHubBundle(context.Background(), positional[0])
 	if err != nil {

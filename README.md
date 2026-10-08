@@ -63,7 +63,7 @@ subswapper add claude work
 subswapper add codex personal
 
 # on every other machine
-subswapper setup client 100.67.68.117   # the hub's Tailscale IP
+subswapper setup client 100.64.0.1   # the hub's Tailscale IP
 subswapper claude
 ```
 
@@ -82,8 +82,8 @@ SERVICE    ACCOUNT    SELECTED 5H                     WEEKLY                  FA
 claude     foxy2               38% reset Oct03 17:30  90% reset Oct04 07:00   3% reset Oct04 07:00    90%      2m       ready
 claude     h2         yes      41% reset Oct03 17:50  12% reset Oct08 15:00   0% reset Oct08 15:00    41%      <1m      ready
 codex      f2         yes      -                      1% reset Oct10 00:21    -                       1%       4m       ready
-claude: accounts on the hub at http://100.67.68.117:7878
-codex: accounts on the hub at http://100.67.68.117:7879
+claude: accounts on the hub at http://100.64.0.1:7878
+codex: accounts on the hub at http://100.64.0.1:7879
 ```
 
 `FABLE5` is the weekly window for Claude's Fable models. `SCORE` is an

@@ -19,22 +19,22 @@ func TestHubConfigValidation(t *testing.T) {
 		service ServiceConfig
 		wantErr string
 	}{
-		{name: "tailnet IPv4 hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "100.67.68.117:7878"}},
+		{name: "tailnet IPv4 hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "100.64.0.1:7878"}},
 		{name: "tailnet IPv6 hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "[fd7a:115c:a1e0::1]:7878"}},
 		{name: "loopback hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "127.0.0.2:7878"}},
 		{name: "wildcard hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "0.0.0.0:7878"}, wantErr: "Tailscale"},
 		{name: "LAN hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "192.168.1.5:7878"}, wantErr: "Tailscale"},
-		{name: "hostname hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "box-box:7878"}, wantErr: "Tailscale"},
-		{name: "hub without local proxy", service: ServiceConfig{Name: "claude", Kind: "claude", HubListen: "100.67.68.117:7878"}, wantErr: "requires proxy_listen"},
-		{name: "native client", service: ServiceConfig{Name: "codex", Kind: "codex", HubURL: "http://box-box:7879", SharedRuntimeHome: NativeRuntimeHome}},
-		{name: "shared home client", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://100.67.68.117:7878", SharedRuntimeHome: "/srv/claude"}},
-		{name: "client without runtime home", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878"}, wantErr: "shared_runtime_home"},
-		{name: "client with fixed relay", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878"}},
-		{name: "client relay off loopback", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "100.67.68.117:7878"}, wantErr: "loopback"},
-		{name: "client with hub listener", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878", HubListen: "100.67.68.117:7878"}, wantErr: "hub_url replaces"},
-		{name: "client with upstream", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878", ProxyUpstream: "https://api.anthropic.com"}, wantErr: "hub_url replaces"},
-		{name: "client with path", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878/v1", SharedRuntimeHome: NativeRuntimeHome}, wantErr: "hub_url"},
-		{name: "bundle client", service: ServiceConfig{Name: "claude", Kind: "claude", AccountMode: AccountModeBundle, HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome}, wantErr: "account_mode"},
+		{name: "hostname hub", service: ServiceConfig{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "hub-host:7878"}, wantErr: "Tailscale"},
+		{name: "hub without local proxy", service: ServiceConfig{Name: "claude", Kind: "claude", HubListen: "100.64.0.1:7878"}, wantErr: "requires proxy_listen"},
+		{name: "native client", service: ServiceConfig{Name: "codex", Kind: "codex", HubURL: "http://hub-host:7879", SharedRuntimeHome: NativeRuntimeHome}},
+		{name: "shared home client", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://100.64.0.1:7878", SharedRuntimeHome: "/srv/claude"}},
+		{name: "client without runtime home", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878"}, wantErr: "shared_runtime_home"},
+		{name: "client with fixed relay", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878"}},
+		{name: "client relay off loopback", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "100.64.0.1:7878"}, wantErr: "loopback"},
+		{name: "client with hub listener", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878", HubListen: "100.64.0.1:7878"}, wantErr: "hub_url replaces"},
+		{name: "client with upstream", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome, ProxyListen: "127.0.0.1:7878", ProxyUpstream: "https://api.anthropic.com"}, wantErr: "hub_url replaces"},
+		{name: "client with path", service: ServiceConfig{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878/v1", SharedRuntimeHome: NativeRuntimeHome}, wantErr: "hub_url"},
+		{name: "bundle client", service: ServiceConfig{Name: "claude", Kind: "claude", AccountMode: AccountModeBundle, HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome}, wantErr: "account_mode"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := Config{Services: []ServiceConfig{test.service}}
@@ -54,7 +54,7 @@ func TestHubConfigValidation(t *testing.T) {
 }
 
 func TestHubClientIsNotALocalProxy(t *testing.T) {
-	service := ServiceConfig{Name: "claude", Kind: "claude", AccountMode: AccountModeHome, HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome}
+	service := ServiceConfig{Name: "claude", Kind: "claude", AccountMode: AccountModeHome, HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome}
 	if !service.HubClient() || service.ProxyEnabled() || service.HubRelayEnabled() {
 		t.Fatalf("HubClient = %v, ProxyEnabled = %v, HubRelayEnabled = %v", service.HubClient(), service.ProxyEnabled(), service.HubRelayEnabled())
 	}
@@ -109,7 +109,7 @@ func TestHubReimportKeepsClientRelay(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`{"state_path":"`+filepath.Join(dir, "state.json")+`","services":[{"name":"claude","kind":"claude","proxy_listen":"127.0.0.1:7878","hub_url":"http://old-hub:7878","shared_runtime_home":"native"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}}}
+	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}}}
 	if _, err := ImportHubBundle(configPath, bundle); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestHubReimportKeepsClientRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if service, _ := cfg.Service("claude"); service.HubURL != "http://box-box:7878" || service.ProxyListen != "127.0.0.1:7878" {
+	if service, _ := cfg.Service("claude"); service.HubURL != "http://hub-host:7878" || service.ProxyListen != "127.0.0.1:7878" {
 		t.Fatalf("reimported service = %#v", service)
 	}
 }
@@ -172,8 +172,8 @@ func TestHubBundleRoundTripConfiguresClient(t *testing.T) {
 		BackupRoot: filepath.Join(hubDir, "accounts"),
 		StatePath:  filepath.Join(hubDir, "state.json"),
 		Services: []ServiceConfig{
-			{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "100.67.68.117:7878", SharedRuntimeHome: NativeRuntimeHome},
-			{Name: "codex", Kind: "codex", ProxyListen: "127.0.0.1:7879", HubListen: "100.67.68.117:7879", SharedRuntimeHome: NativeRuntimeHome},
+			{Name: "claude", Kind: "claude", ProxyListen: "127.0.0.1:7878", HubListen: "100.64.0.1:7878", SharedRuntimeHome: NativeRuntimeHome},
+			{Name: "codex", Kind: "codex", ProxyListen: "127.0.0.1:7879", HubListen: "100.64.0.1:7879", SharedRuntimeHome: NativeRuntimeHome},
 			{Name: "local", Kind: "claude", ProxyListen: "127.0.0.1:7880"},
 		},
 	}
@@ -181,7 +181,7 @@ func TestHubBundleRoundTripConfiguresClient(t *testing.T) {
 	if err := hubCfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	bundle, err := ExportHubBundle(hubCfg, "", "box-box")
+	bundle, err := ExportHubBundle(hubCfg, "", "hub-host")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +197,8 @@ func TestHubBundleRoundTripConfiguresClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]HubBundleService{
-		"claude": {Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: secret},
-		"codex":  {Name: "codex", Kind: "codex", HubURL: "http://box-box:7879", Secret: placeholder.Token},
+		"claude": {Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: secret},
+		"codex":  {Name: "codex", Kind: "codex", HubURL: "http://hub-host:7879", Secret: placeholder.Token},
 	}
 	for _, service := range bundle.Services {
 		if service != want[service.Name] {
@@ -231,11 +231,11 @@ func TestHubBundleRoundTripConfiguresClient(t *testing.T) {
 		t.Fatalf("monitor interval lost: %v", clientCfg.Monitor.Interval)
 	}
 	codex, _ := clientCfg.Service("codex")
-	if !codex.HubClient() || codex.HubURL != "http://box-box:7879" || codex.DisplayName != "Codex here" || !codex.UsesNativeRuntimeHome() {
+	if !codex.HubClient() || codex.HubURL != "http://hub-host:7879" || codex.DisplayName != "Codex here" || !codex.UsesNativeRuntimeHome() {
 		t.Fatalf("client codex service = %#v", codex)
 	}
 	claude, _ := clientCfg.Service("claude")
-	if !claude.HubClient() || claude.HubURL != "http://box-box:7878" {
+	if !claude.HubClient() || claude.HubURL != "http://hub-host:7878" {
 		t.Fatalf("client claude service = %#v", claude)
 	}
 	gotSecret, err := LoadHubClaudeSecret(*clientCfg, "claude")
@@ -272,7 +272,7 @@ func TestHubImportCreatesMissingConfig(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
 	configPath := filepath.Join(dir, "config", "subswapper", "config.json")
-	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}}}
+	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}}}
 	if _, err := ImportHubBundle(configPath, bundle); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestHubImportCreatesMissingConfig(t *testing.T) {
 
 func TestHubImportRejectsMalformedBundles(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	valid := HubBundleService{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}
+	valid := HubBundleService{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: "sk-ant-oat01-" + strings.Repeat("ab", 32)}
 	for _, test := range []struct {
 		name   string
 		bundle HubBundle
@@ -297,7 +297,7 @@ func TestHubImportRejectsMalformedBundles(t *testing.T) {
 		{name: "claude secret", bundle: HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: valid.HubURL, Secret: "real-token"}}}},
 		{name: "codex placeholder", bundle: HubBundle{Version: 1, Services: []HubBundleService{{Name: "codex", Kind: "codex", HubURL: valid.HubURL, Secret: "not-a-jwt"}}}},
 		{name: "kind", bundle: HubBundle{Version: 1, Services: []HubBundleService{{Name: "x", Kind: "other", HubURL: valid.HubURL, Secret: valid.Secret}}}},
-		{name: "url", bundle: HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "ftp://box-box", Secret: valid.Secret}}}},
+		{name: "url", bundle: HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "ftp://hub-host", Secret: valid.Secret}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := ImportHubBundle(configPath, test.bundle); err == nil {
@@ -311,7 +311,7 @@ func TestHubImportRejectsMalformedBundles(t *testing.T) {
 }
 
 func TestHubClientCredentialIsNeverCreated(t *testing.T) {
-	cfg := Config{StatePath: filepath.Join(t.TempDir(), "state.json"), Services: []ServiceConfig{{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", SharedRuntimeHome: NativeRuntimeHome}}}
+	cfg := Config{StatePath: filepath.Join(t.TempDir(), "state.json"), Services: []ServiceConfig{{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", SharedRuntimeHome: NativeRuntimeHome}}}
 	cfg.ApplyDefaults()
 	if _, err := LoadHubClaudeSecret(cfg, "claude"); err == nil || !strings.Contains(err.Error(), "hub import") {
 		t.Fatalf("missing secret: err = %v", err)
@@ -397,13 +397,13 @@ func TestHubRelayReachesClaudeProxyHealth(t *testing.T) {
 func TestHubEnrollServesBundleWithoutCredential(t *testing.T) {
 	upstream := newProxyUpstream(t)
 	cfg, _ := setupProxyAccounts(t, upstream.server.URL)
-	cfg.Services[0].HubListen = "100.67.68.117:7878"
+	cfg.Services[0].HubListen = "100.64.0.1:7878"
 	proxy, err := NewClaudeProxy(cfg, "claude", func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	fetch := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "http://box-box:7878"+hubBundlePath, nil)
+		req := httptest.NewRequest(http.MethodGet, "http://hub-host:7878"+hubBundlePath, nil)
 		recorder := httptest.NewRecorder()
 		proxy.ServeHTTP(recorder, req)
 		return recorder
@@ -430,7 +430,7 @@ func TestHubEnrollServesBundleWithoutCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The client reaches the hub by the host it dialed.
-	want := HubBundleService{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: secret}
+	want := HubBundleService{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: secret}
 	if len(bundle.Services) != 1 || bundle.Services[0] != want {
 		t.Fatalf("bundle = %#v, want %#v", bundle.Services, want)
 	}
@@ -438,16 +438,16 @@ func TestHubEnrollServesBundleWithoutCredential(t *testing.T) {
 
 func TestCodexHubEnrollServesBundle(t *testing.T) {
 	cfg, _ := setupCodexProxyAccounts(t, "https://chatgpt.com")
-	cfg.Services[0].HubListen = "100.67.68.117:7879"
+	cfg.Services[0].HubListen = "100.64.0.1:7879"
 	cfg.Services[0].HubEnroll = true
 	proxy, err := NewCodexProxy(cfg, "codex", func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodGet, "http://100.67.68.117:7879"+hubBundlePath, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://100.64.0.1:7879"+hubBundlePath, nil)
 	recorder := httptest.NewRecorder()
 	proxy.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"hub_url":"http://100.67.68.117:7879"`) {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"hub_url":"http://100.64.0.1:7879"`) {
 		t.Fatalf("codex bundle: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -461,7 +461,7 @@ func TestHubEnrollRequiresHubListen(t *testing.T) {
 }
 
 func TestFetchHubBundle(t *testing.T) {
-	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://box-box:7878", Secret: "sk-ant-oat01-x"}}}
+	bundle := HubBundle{Version: 1, Services: []HubBundleService{{Name: "claude", Kind: "claude", HubURL: "http://hub-host:7878", Secret: "sk-ant-oat01-x"}}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != hubBundlePath {
 			http.NotFound(w, r)
@@ -485,9 +485,9 @@ func TestFetchHubBundle(t *testing.T) {
 
 func TestHubAddressDefaultsToClaudePort(t *testing.T) {
 	for input, want := range map[string]string{
-		"100.67.68.117":             "http://100.67.68.117:7878",
-		"box-box:7879":              "http://box-box:7879",
-		"http://100.67.68.117:7878": "http://100.67.68.117:7878",
+		"100.64.0.1":             "http://100.64.0.1:7878",
+		"hub-host:7879":              "http://hub-host:7879",
+		"http://100.64.0.1:7878": "http://100.64.0.1:7878",
 		"https://hub.example":       "https://hub.example",
 	} {
 		got, err := hubBundleURL(input)
@@ -495,7 +495,7 @@ func TestHubAddressDefaultsToClaudePort(t *testing.T) {
 			t.Fatalf("hubBundleURL(%q) = %q, %v; want %q", input, got, err, want+hubBundlePath)
 		}
 	}
-	if _, err := hubBundleURL("http://box-box:7878/path"); err == nil {
+	if _, err := hubBundleURL("http://hub-host:7878/path"); err == nil {
 		t.Fatal("URL with a path accepted")
 	}
 }
@@ -566,8 +566,8 @@ func TestFetchHubStatus(t *testing.T) {
 }
 
 func TestRenderStatusShowsServiceNote(t *testing.T) {
-	out := RenderStatus([]ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Note: "hub at box-box unreachable"}}, nil, time.Now())
-	if !strings.Contains(out, "hub at box-box unreachable") || strings.Contains(out, "no registered accounts") {
+	out := RenderStatus([]ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Note: "hub at hub-host unreachable"}}, nil, time.Now())
+	if !strings.Contains(out, "hub at hub-host unreachable") || strings.Contains(out, "no registered accounts") {
 		t.Fatalf("render = %s", out)
 	}
 }
@@ -596,7 +596,7 @@ func TestConfigureHubWritesHubServices(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"state_path":"`+filepath.Join(dir, "state.json")+`","monitor":{"interval":"1m"},"services":[{"name":"claude","kind":"claude","proxy_listen":"127.0.0.1:9000"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ConfigureHub(path, "100.67.68.117", true); err != nil {
+	if err := ConfigureHub(path, "100.64.0.1", true); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadConfig(path)
@@ -605,10 +605,10 @@ func TestConfigureHubWritesHubServices(t *testing.T) {
 	}
 	claude, _ := cfg.Service("claude")
 	codex, _ := cfg.Service("codex")
-	if claude.ProxyListen != "127.0.0.1:9000" || claude.HubListen != "100.67.68.117:9000" || !claude.HubEnroll || !claude.UsesNativeRuntimeHome() {
+	if claude.ProxyListen != "127.0.0.1:9000" || claude.HubListen != "100.64.0.1:9000" || !claude.HubEnroll || !claude.UsesNativeRuntimeHome() {
 		t.Fatalf("claude = %#v; an existing proxy port is kept", claude)
 	}
-	if codex.ProxyListen != "127.0.0.1:7879" || codex.HubListen != "100.67.68.117:7879" || !codex.HubEnroll {
+	if codex.ProxyListen != "127.0.0.1:7879" || codex.HubListen != "100.64.0.1:7879" || !codex.HubEnroll {
 		t.Fatalf("codex = %#v", codex)
 	}
 	if cfg.Monitor.Interval.Duration != time.Minute {
@@ -619,10 +619,10 @@ func TestConfigureHubWritesHubServices(t *testing.T) {
 	}
 
 	client := filepath.Join(dir, "client.json")
-	if err := os.WriteFile(client, []byte(`{"services":[{"name":"claude","kind":"claude","hub_url":"http://box-box:7878","shared_runtime_home":"native"}]}`), 0o600); err != nil {
+	if err := os.WriteFile(client, []byte(`{"services":[{"name":"claude","kind":"claude","hub_url":"http://hub-host:7878","shared_runtime_home":"native"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ConfigureHub(client, "100.67.68.117", false); err == nil || !strings.Contains(err.Error(), "hub client") {
+	if err := ConfigureHub(client, "100.64.0.1", false); err == nil || !strings.Contains(err.Error(), "hub client") {
 		t.Fatalf("hub setup over a client: %v", err)
 	}
 }

@@ -180,7 +180,7 @@ func TestHubExportAndImportCommands(t *testing.T) {
 		"state_path":  filepath.Join(hubDir, "state.json"),
 		"services": []any{map[string]any{
 			"name": "claude", "kind": "claude", "proxy_listen": "127.0.0.1:7878",
-			"hub_listen": "100.67.68.117:7878", "shared_runtime_home": "native",
+			"hub_listen": "100.64.0.1:7878", "shared_runtime_home": "native",
 		}},
 	}
 	data, err := json.Marshal(config)
@@ -192,7 +192,7 @@ func TestHubExportAndImportCommands(t *testing.T) {
 	}
 	bundlePath := filepath.Join(hubDir, "hub.json")
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"hub", "export", "-config", hubConfig, "-host", "box-box", "-out", bundlePath}, &stdout, &stderr); err != nil {
+	if err := run([]string{"hub", "export", "-config", hubConfig, "-host", "hub-host", "-out", bundlePath}, &stdout, &stderr); err != nil {
 		t.Fatalf("hub export failed: %v", err)
 	}
 	info, err := os.Stat(bundlePath)
@@ -213,7 +213,7 @@ func TestHubExportAndImportCommands(t *testing.T) {
 	if err := run([]string{"hub", "import", "-config", clientConfig, "-in", bundlePath}, &stdout, &stderr); err != nil {
 		t.Fatalf("hub import failed: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "claude now uses the hub at http://box-box:7878") {
+	if !strings.Contains(stdout.String(), "claude now uses the hub at http://hub-host:7878") {
 		t.Fatalf("hub import output = %q", stdout.String())
 	}
 	cfg, err := subswapper.LoadConfig(clientConfig)

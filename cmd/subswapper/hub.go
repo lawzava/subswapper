@@ -88,7 +88,7 @@ func runHub(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return err
 		}
 		if fs.NArg() != 1 {
-			return errors.New("usage: subswapper hub connect [-config path] <hub address, e.g. 100.67.68.117>")
+			return errors.New("usage: subswapper hub connect [-config path] <hub address, e.g. 100.64.0.1>")
 		}
 		bundle, err := subswapper.FetchHubBundle(context.Background(), fs.Arg(0))
 		if err != nil {

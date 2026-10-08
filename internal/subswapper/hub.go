@@ -259,8 +259,8 @@ func FetchHubStatus(ctx context.Context, hubURL, credential string) ([]ServiceSt
 	return results, nil
 }
 
-// hubBundleURL turns a hub address such as 100.67.68.117, box-box:7879, or
-// http://box-box:7878 into its enrollment URL.
+// hubBundleURL turns a hub address such as 100.64.0.1, hub-host:7879, or
+// http://hub-host:7878 into its enrollment URL.
 func hubBundleURL(address string) (string, error) {
 	raw := strings.TrimSpace(address)
 	if !strings.Contains(raw, "://") {
