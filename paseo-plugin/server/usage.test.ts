@@ -76,8 +76,8 @@ test("the selected-account card reports the account subswapper routes to now", (
     status: "available",
     planLabel: "foxy2",
     windows: [
-      { id: "five_hour", label: "5-hour", shortLabel: "5h", summary: true, usedPct: 72, remainingPct: 28, resetsAt: "2026-10-13T11:00:00Z", tone: "warning" },
-      { id: "weekly", label: "Weekly", shortLabel: "wk · foxy2", summary: true, usedPct: 6, remainingPct: 94, resetsAt: "2026-10-18T04:00:00Z", tone: "ok" },
+      { id: "five_hour", label: "5-hour", shortLabel: "", summary: true, usedPct: 72, remainingPct: 28, resetsAt: "2026-10-13T11:00:00Z", tone: "warning" },
+      { id: "weekly", label: "Weekly", shortLabel: "foxy2", summary: true, usedPct: 6, remainingPct: 94, resetsAt: "2026-10-18T04:00:00Z", tone: "ok" },
       // A reset in the past means the window restarted; subswapper already reports it as 0%.
       { id: "fable_weekly", label: "Fable weekly", shortLabel: "Fable", usedPct: 0, remainingPct: 100, resetsAt: null, tone: "ok" },
     ],
@@ -90,8 +90,8 @@ test("the selected-account card reports the account subswapper routes to now", (
   const codex = usageReport(report, { service: "codex" }, now);
   assert.equal(codex.status, "available");
   if (codex.status === "available") {
-    // The sidebar shows short labels after the percentages, so the last one names the account.
-    assert.deepEqual(codex.windows.map((window) => [window.id, window.shortLabel, window.tone]), [["weekly", "wk · main", "danger"]]);
+    // The sidebar fits only short labels, so the last summary window names the account.
+    assert.deepEqual(codex.windows.map((window) => [window.id, window.shortLabel, window.tone]), [["weekly", "main", "danger"]]);
     assert.deepEqual(codex.details?.at(-1), { id: "updated", label: "Updated", value: "just now" });
   }
 });
