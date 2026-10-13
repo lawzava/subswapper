@@ -11,6 +11,7 @@
     "client/",
     "server/",
     "shared/",
+    "icons/",
     "!**/*.test.ts"
   ],
   "scripts": {
@@ -18,7 +19,7 @@
     "test": "node --test shared/*.test.ts server/*.test.ts"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.10.3",
+    "@getpaseo/plugin": "0.11.2",
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^24.19.1",
     "@types/react": "~19.2.0",

@@ -5,7 +5,7 @@ import { launchConfigurationSchema, type LaunchConfiguration } from "../shared/s
 type ConfigApi = Pick<PluginHandlerContext["paseo"], "config">;
 
 // The fields this plugin reads; Paseo validates the rest.
-const paseoProviderSchema = z.object({
+export const paseoProviderSchema = z.object({
   extends: z.string().optional(),
   command: z.array(z.string()).optional(),
   env: z.record(z.string(), z.string()).optional(),

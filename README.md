@@ -140,8 +140,10 @@ The [Paseo plugin](paseo-plugin/README.md) shows every account's usage in the
 workspace header and on a **Subscriptions** screen, switches accounts from
 the header menu or the Command Center, and adds accounts: **Add account** opens
 a terminal in the workspace that runs `subswapper add`, or takes a Claude setup
-token directly. Turn on **Settings → Plugins → Enable
-plugins** on the daemon, then:
+token directly. On Paseo 0.11 and later it also fills Paseo's usage cards and
+sidebar bars with the account each session's proxy uses, and keeps Paseo's
+builtin Codex card from reporting the proxy placeholder as a rejected login.
+Turn on **Settings → Plugins → Enable plugins** on the daemon, then:
 
 ```sh
 paseo plugin install lawzava/subswapper:paseo-plugin

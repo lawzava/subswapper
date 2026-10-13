@@ -19,6 +19,18 @@ accounts from inside Paseo.
   then sees the real Codex version and turns on Auto-review and Goals, while
   subswapper still picks the account. Reload existing Codex sessions after
   connecting. Needs a subswapper version with `launch-config`.
+- **Usage cards and sidebar bars** (Paseo 0.11 and later): `Claude
+  (Subswapper)` and `Codex (Subswapper)` cards for each service's selected
+  account, plus one per account on the Usage screen. A session's card follows
+  the account the proxy serves it now. The selected account's five-hour and
+  weekly windows go to the sidebar summary.
+- Sessions whose provider launches subswapper get `SUBSWAPPER_SERVICE` in
+  their environment. Codex sessions also get `OPENAI_BASE_URL` set to OpenAI's
+  default, which stops Paseo's builtin Codex card from sending subswapper's
+  proxy placeholder to ChatGPT and reporting `Login rejected (HTTP 401)`.
+  Reload sessions that were open before the plugin was updated. Paseo's Usage
+  screen still shows that builtin card for `~/.codex/auth.json`, because the
+  builtin source reads that file for every daemon.
 
 The plugin runs `subswapper status -json` and `subswapper switch` on the
 daemon host, so it works the same on a standalone machine, a hub, and a hub
