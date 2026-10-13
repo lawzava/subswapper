@@ -20,10 +20,10 @@ accounts from inside Paseo.
   subswapper still picks the account. Reload existing Codex sessions after
   connecting. Needs a subswapper version with `launch-config`.
 - **Usage cards and sidebar bars** (Paseo 0.11 and later): `Claude
-  (Subswapper)` and `Codex (Subswapper)` cards for each service's selected
-  account, plus one per account on the Usage screen. A session's card follows
-  the account the proxy serves it now. The selected account's five-hour and
-  weekly windows go to the sidebar summary.
+  (Subswapper)` and `Codex (Subswapper)` cards, one per service, showing the
+  account the proxy uses now. Its five-hour and weekly windows go to the
+  sidebar summary. The Subscriptions screen lists every account; Paseo pins
+  sidebar windows per source, so per-account cards would repeat there.
 - Sessions whose provider launches subswapper get `SUBSWAPPER_SERVICE` in
   their environment. Codex sessions also get `OPENAI_BASE_URL` set to OpenAI's
   default, which stops Paseo's builtin Codex card from sending subswapper's

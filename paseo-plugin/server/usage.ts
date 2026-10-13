@@ -5,46 +5,28 @@ import type { AccountReport, ServiceReport, StatusReport } from "../shared/subsw
 
 export type ProviderKind = "claude" | "codex";
 
-export const usageInputSchema = z.object({
-  service: z.string().min(1),
-  // Absent for the card that follows the service's selected account.
-  account: z.string().min(1).optional(),
-}).strict();
+export const usageInputSchema = z.object({ service: z.string().min(1) }).strict();
 
 export type UsageInput = z.infer<typeof usageInputSchema>;
 
-const harness = "Subswapper";
-
-function accountKey(...parts: string[]): string {
-  return parts.join(".").replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128);
-}
-
 function selectedCard(service: ServiceReport): UsageAccount {
   const label = service.name === service.kind ? "Selected account" : `${service.name} selected account`;
-  return { key: accountKey(service.name), label, harness, input: { service: service.name } };
+  const key = service.name.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128);
+  return { key, label, harness: "Subswapper", input: { service: service.name } };
 }
 
-function accountCard(service: ServiceReport, account: AccountReport): UsageAccount {
-  const name = service.name === service.kind ? account.name : `${service.name} ${account.name}`;
-  return {
-    key: accountKey(service.name, account.name),
-    label: account.email ? `${name} · ${account.email}` : name,
-    harness,
-    input: { service: service.name, account: account.name },
-  };
-}
-
-// usageAccounts lists the usage cards for one provider kind. The global scope
-// gets a card per service that follows its selected account, plus one per
-// account. A session gets only the card of the service it launches through,
-// because the proxy sends its requests to that service's selected account.
+// usageAccounts lists one usage card per service of a provider kind, following
+// the account the proxy sends requests to. Paseo pins sidebar windows by
+// source and window rather than by card, so a card per account would repeat
+// in the sidebar; the Subscriptions screen lists every account instead. A
+// session gets only the card of the service it launches through.
 export function usageAccounts(report: StatusReport, kind: ProviderKind, scope: UsageScope): UsageAccount[] {
   const services = report.services.filter((service) => service.kind === kind);
   if (scope.kind === "session") {
     const service = scope.provider === kind ? services.find((candidate) => candidate.name === scope.env.SUBSWAPPER_SERVICE) : undefined;
     return service ? [selectedCard(service)] : [];
   }
-  return services.flatMap((service) => [selectedCard(service), ...service.accounts.map((account) => accountCard(service, account))]);
+  return services.map(selectedCard);
 }
 
 const windowNames = [
@@ -62,7 +44,7 @@ function tone(usedPct: number): UsageWindow["tone"] {
   return usedPct >= 70 ? "warning" : "ok";
 }
 
-function windows(account: AccountReport, summary: boolean, now: number): UsageWindow[] {
+function windows(account: AccountReport, now: number): UsageWindow[] {
   return windowNames.flatMap((name) => {
     const window = account[name.id];
     if (!window) {
@@ -73,7 +55,7 @@ function windows(account: AccountReport, summary: boolean, now: number): UsageWi
       id: name.id,
       label: name.label,
       shortLabel: name.shortLabel,
-      ...(summary && name.summary ? { summary: true } : {}),
+      ...(name.summary ? { summary: true } : {}),
       usedPct: window.used_percent,
       remainingPct: Math.max(0, 100 - window.used_percent),
       resetsAt,
@@ -82,12 +64,11 @@ function windows(account: AccountReport, summary: boolean, now: number): UsageWi
   });
 }
 
-function details(account: AccountReport, selected: boolean, now: number): UsageDetail[] {
-  const rows: UsageDetail[] = [];
-  if (selected) {
-    rows.push({ id: "account", label: "Account", value: account.email ? `${account.name} · ${account.email}` : account.name });
-  }
-  rows.push({ id: "state", label: "State", value: account.state, tone: account.ready ? "ok" : "warning" });
+function details(account: AccountReport, now: number): UsageDetail[] {
+  const rows: UsageDetail[] = [
+    { id: "account", label: "Account", value: account.email ? `${account.name} · ${account.email}` : account.name },
+    { id: "state", label: "State", value: account.state, tone: account.ready ? "ok" : "warning" },
+  ];
   const updated = relativeTime(account.updated_at, now);
   if (updated) {
     rows.push({ id: "updated", label: "Updated", value: updated === "now" ? "just now" : `${updated} ago` });
@@ -95,25 +76,18 @@ function details(account: AccountReport, selected: boolean, now: number): UsageD
   return rows;
 }
 
-// usageReport turns one card's slice of `subswapper status -json` into a
-// Paseo usage report.
+// usageReport turns a service's selected account in `subswapper status -json`
+// into a Paseo usage report.
 export function usageReport(report: StatusReport, input: UsageInput, now: number): UsageReport {
   const service = report.services.find((candidate) => candidate.name === input.service);
   if (!service) {
     return { status: "error", error: `subswapper has no ${input.service} service` };
   }
-  const following = input.account === undefined;
-  const account = service.accounts.find((candidate) => candidate.name === (input.account ?? service.selected));
+  const account = service.accounts.find((candidate) => candidate.name === service.selected);
   if (!account) {
-    const missing = following ? `${service.name} has no selected account` : `${service.name} has no account ${input.account}`;
-    return { status: "error", error: service.note ?? missing };
+    return { status: "error", error: service.note ?? `${service.name} has no selected account` };
   }
-  return {
-    status: "available",
-    ...(following ? { planLabel: account.name } : {}),
-    windows: windows(account, following, now),
-    details: details(account, following, now),
-  };
+  return { status: "available", planLabel: account.name, windows: windows(account, now), details: details(account, now) };
 }
 
 // cachedReader shares one status read across the cards Paseo fetches

@@ -49,15 +49,14 @@ const report: StatusReport = {
   ],
 };
 
-test("global discovery lists each service's selected account and every account", () => {
+test("global discovery lists one card per service, following its selected account", () => {
+  // Paseo pins sidebar windows by source and window, so a card per account
+  // would repeat in the sidebar; the Subscriptions screen lists accounts.
   assert.deepEqual(usageAccounts(report, "claude", { kind: "global" }), [
     { key: "claude", label: "Selected account", harness: "Subswapper", input: { service: "claude" } },
-    { key: "claude.foxy2", label: "foxy2 · work@example.com", harness: "Subswapper", input: { service: "claude", account: "foxy2" } },
-    { key: "claude.main", label: "main", harness: "Subswapper", input: { service: "claude", account: "main" } },
   ]);
   assert.deepEqual(usageAccounts(report, "codex", { kind: "global" }).map((account) => [account.key, account.label]), [
     ["codex", "Selected account"],
-    ["codex.main", "main"],
     ["work", "work selected account"],
   ]);
 });
@@ -96,19 +95,25 @@ test("the selected-account card reports the account subswapper routes to now", (
   }
 });
 
-test("an account card shows that account without claiming the summary", () => {
-  assert.deepEqual(usageReport(report, { service: "claude", account: "main" }, now), {
+test("a selected account that cannot take requests says so", () => {
+  const unready = structuredClone(report);
+  unready.services[0].selected = "main";
+  assert.deepEqual(usageReport(unready, { service: "claude" }, now), {
     status: "available",
+    planLabel: "main",
     windows: [],
-    details: [{ id: "state", label: "State", value: "usage unavailable", tone: "warning" }],
+    details: [
+      { id: "account", label: "Account", value: "main" },
+      { id: "state", label: "State", value: "usage unavailable", tone: "warning" },
+    ],
   });
-  const foxy = usageReport(report, { service: "claude", account: "foxy2" }, now);
-  assert.ok(foxy.status === "available" && foxy.windows.every((window) => window.summary === undefined));
 });
 
-test("missing services and accounts are errors, with the service note when there is one", () => {
+test("missing services and selections are errors, with the service note when there is one", () => {
   assert.deepEqual(usageReport(report, { service: "work" }, now), { status: "error", error: "hub at http://100.64.0.1:7880 unavailable" });
-  assert.deepEqual(usageReport(report, { service: "codex", account: "gone" }, now), { status: "error", error: "codex has no account gone" });
+  const unselected = structuredClone(report);
+  delete unselected.services[1].selected;
+  assert.deepEqual(usageReport(unselected, { service: "codex" }, now), { status: "error", error: "codex has no selected account" });
   assert.deepEqual(usageReport(report, { service: "gone" }, now), { status: "error", error: "subswapper has no gone service" });
 });
 
