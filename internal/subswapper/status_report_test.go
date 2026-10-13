@@ -31,7 +31,9 @@ func statusReportFixture(now time.Time) []ServiceStatus {
 }
 
 func TestBuildStatusReport(t *testing.T) {
-	now := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+	// LimitWindow.Ratio compares resets with the wall clock, so a fixed date
+	// would turn into an expired window once that date passes.
+	now := time.Now().UTC().Truncate(time.Second)
 	report := BuildStatusReport(statusReportFixture(now), now)
 	data, err := json.Marshal(report)
 	if err != nil {
