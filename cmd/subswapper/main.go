@@ -32,7 +32,13 @@ const monitorCycleTimeout = 2 * time.Minute
 var claudeAuthStatusTimeout = 15 * time.Second
 
 func main() {
-	if err := runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+	dispatch := runWithInput
+	if name := subswapper.ProviderShimName(os.Args[0]); name != "" {
+		dispatch = func(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			return runProviderShim(name, args, stdin, stdout, stderr)
+		}
+	}
+	if err := dispatch(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
@@ -69,6 +75,8 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return runInit(args[1:], stdout)
 	case "home":
 		return runHome(args[1:], stdin, stdout, stderr)
+	case "launch-config":
+		return runLaunchConfig(args[1:], stdout, stderr)
 	case "claude-statusline":
 		return runClaudeStatusLine(stdin, stdout)
 	case "remove", "rm":
@@ -1119,6 +1127,7 @@ Run:
   subswapper home run -service claude|codex [-account <name>] [-- command args...]
   subswapper home path -service claude|codex [-account <name>]
   subswapper home proxy-auth -service codex
+  subswapper launch-config -service claude|codex  link a provider shim for integrations such as Paseo
   subswapper delegate -service claude|codex -cwd /path -model MODEL -effort LEVEL -intent read-only|workspace-write (-task TEXT | -task-file PATH) [-timeout 10m]
 
 Services and hub:

@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import { accountLoad, percent, relativeTime, windowText } from "../shared/format";
-import { statusRpc, switchRpc, type AccountReport, type ServiceReport } from "../shared/subswapper";
+import { configureCodexRpc, statusRpc, switchRpc, type AccountReport, type ServiceReport } from "../shared/subswapper";
 import { AddAccountForm } from "./add-account";
 import { statusQueryKey } from "./keys";
 
@@ -13,6 +13,7 @@ const refreshMs = 60_000;
 export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
   const readStatus = useRpc(statusRpc);
   const switchAccount = useRpc(switchRpc);
+  const configureCodex = useRpc(configureCodexRpc);
   const queryClient = useQueryClient();
   const status = useQuery({
     queryKey: statusQueryKey,
@@ -23,6 +24,7 @@ export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
     mutationFn: switchAccount,
     onSettled: () => queryClient.invalidateQueries({ queryKey: statusQueryKey }),
   });
+  const connecting = useMutation({ mutationFn: configureCodex });
   const styles = useMemo(
     () => ({
       screen: { flex: 1, backgroundColor: theme.colors.surface0 },
@@ -98,6 +100,8 @@ export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
       {status.data?.error ? <Text style={styles.danger}>{status.data.error}</Text> : null}
       {switching.error ? <Text style={styles.danger}>{String(switching.error.message ?? switching.error)}</Text> : null}
       {switching.data ? <Text style={styles.muted}>{switching.data.message}</Text> : null}
+      {connecting.error ? <Text style={styles.danger}>{connecting.error.message}</Text> : null}
+      {connecting.data ? <Text style={styles.muted}>{connecting.data.message}</Text> : null}
       {report?.services.map((service) => (
         <View key={service.name} style={styles.service}>
           <View style={styles.row}>
@@ -106,6 +110,17 @@ export function SubscriptionsSurface({ theme, layout }: PluginSurfaceProps) {
           </View>
           {service.hub ? <Text style={styles.muted}>accounts on the hub at {service.hub}</Text> : null}
           {service.note ? <Text style={styles.warning}>{service.note}</Text> : null}
+          {service.kind === "codex" ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Connect Codex to Subswapper"
+              disabled={connecting.isPending}
+              style={styles.button}
+              onPress={() => connecting.mutate({ service: service.name })}
+            >
+              <Text style={styles.buttonText}>{connecting.isPending ? "Connecting…" : "Connect Codex to Subswapper"}</Text>
+            </Pressable>
+          ) : null}
           {service.accounts.map((account) => (
             <AccountRow key={account.name} service={service} account={account} />
           ))}

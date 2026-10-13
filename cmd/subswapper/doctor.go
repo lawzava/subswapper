@@ -198,7 +198,7 @@ func doctorPaseo(ctx context.Context, d *doctorReport) {
 		d.warn("paseo: ~/.paseo/config.json is not valid JSON")
 		return
 	}
-	providers := map[string]string{}
+	providers := map[string]paseoProvider{}
 	collectPaseoProviders(config, "", providers)
 	names := make([]string, 0, len(providers))
 	for name := range providers {
@@ -206,7 +206,22 @@ func doctorPaseo(ctx context.Context, d *doctorReport) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		binary := providers[name]
+		provider := providers[name]
+		binary := provider.binary
+		shim := subswapper.ProviderShimName(binary) != ""
+		if shim {
+			target, err := filepath.EvalSymlinks(binary)
+			if err != nil {
+				d.fail("paseo: provider %s runs %s, which does not exist; rerun `subswapper launch-config`", name, binary)
+				continue
+			}
+			if subswapper.ProviderShimName(target) != "" {
+				continue // a provider CLI that only lives under a subswapper path
+			}
+			binary = target
+		} else if provider.codex {
+			d.warn("paseo: provider %s runs %s, so Paseo reads subswapper's version instead of Codex's and turns off Auto-review and Goals; use Connect Codex in the Subswapper plugin, or set its command to the path from `subswapper launch-config -service codex`", name, binary)
+		}
 		if _, err := os.Stat(binary); err != nil {
 			d.fail("paseo: provider %s runs %s, which does not exist", name, binary)
 			continue
@@ -221,19 +236,24 @@ func doctorPaseo(ctx context.Context, d *doctorReport) {
 		case fields[1] != subswapper.Version():
 			d.warn("paseo: provider %s runs subswapper %s from %s; this is %s", name, fields[1], binary, subswapper.Version())
 		default:
-			d.ok("paseo: provider %s runs this subswapper (%s)", name, binary)
+			d.ok("paseo: provider %s runs this subswapper (%s)", name, provider.binary)
 		}
 	}
 }
 
+type paseoProvider struct {
+	binary string
+	codex  bool
+}
+
 // collectPaseoProviders finds objects whose "command" array runs subswapper
-// and records the binary under the key that holds the object.
-func collectPaseoProviders(node any, key string, found map[string]string) {
+// and records them under the key that holds the object.
+func collectPaseoProviders(node any, key string, found map[string]paseoProvider) {
 	switch value := node.(type) {
 	case map[string]any:
 		if command, ok := value["command"].([]any); ok && len(command) > 0 {
 			if binary, ok := command[0].(string); ok && strings.Contains(binary, "subswapper") {
-				found[key] = binary
+				found[key] = paseoProvider{binary: binary, codex: key == "codex" || value["extends"] == "codex"}
 			}
 		}
 		for child, next := range value {

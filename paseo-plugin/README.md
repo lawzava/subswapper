@@ -14,6 +14,11 @@ accounts from inside Paseo.
   already have without it appearing in a terminal.
 - Command Center items to open the screen and to switch every service to its
   best account.
+- **Connect Codex to Subswapper** on the Subscriptions screen points every
+  Codex provider that launches subswapper at a `codex` shim, or adds one. Paseo
+  then sees the real Codex version and turns on Auto-review and Goals, while
+  subswapper still picks the account. Reload existing Codex sessions after
+  connecting. Needs a subswapper version with `launch-config`.
 
 The plugin runs `subswapper status -json` and `subswapper switch` on the
 daemon host, so it works the same on a standalone machine, a hub, and a hub

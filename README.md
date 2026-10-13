@@ -106,6 +106,7 @@ on Linux). Flags may follow positional arguments.
 | `status [-json]` (alias `list`) | Show every account with usage windows, score, and state. `-json` prints the report the Paseo plugin reads. |
 | `claude [args...]`, `codex [args...]` | Launch the provider through subswapper. Same as `home run -service <name> -- <name> [args...]`. |
 | `home run -service <name> [-account <name>] [-- command...]` | Launch any command the way `claude` and `codex` are launched. |
+| `launch-config -service <name>` | Link a provider shim and print the command and environment an integration such as Paseo should run, as JSON. No credentials. |
 | `home path -service <name> [-account <name>]` | Print an account's home directory. |
 | `home proxy-auth -service codex` | Move a real login out of the Codex runtime home and install the proxy placeholder (backup kept). |
 | `monitor [-interval 5m] [-once] [-no-auto] [-verbose] [-proxy]` | Probe usage on a loop and switch automatically. `-proxy` also serves the proxies. |
@@ -147,8 +148,20 @@ paseo plugin install lawzava/subswapper:paseo-plugin
 ```
 
 Point Paseo's providers at `subswapper claude` and `subswapper codex` (or
-`subswapper home run -service <name> -- <cli>`). `doctor` checks that every
-Paseo provider runs an existing subswapper binary of the current version.
+`subswapper home run -service <name> -- <cli>`). For Codex, use the plugin's
+**Connect Codex to Subswapper** button instead. Paseo turns on Auto-review and
+`/goal` only when `<command> --version` reports a recent Codex, and a wrapper
+command reports subswapper's version. The button runs `launch-config`, which
+links a shim named `codex` to subswapper in subswapper's data directory
+(`~/.local/share/subswapper/bin` on Linux). The shim answers `--version` from
+the real Codex and runs everything else as `subswapper codex`. The button then
+points every Codex provider that launches subswapper at the shim, or adds a
+`Codex (Subswapper)` provider, so existing provider IDs and sessions keep
+working. Reload existing Codex sessions after connecting. Shims need symlinks,
+which Windows allows only in Developer Mode or an elevated shell.
+
+`doctor` checks that every Paseo provider runs an existing subswapper binary of
+the current version, and warns about Codex providers that hide Codex's version.
 
 ## How it works
 

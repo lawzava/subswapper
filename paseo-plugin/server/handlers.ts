@@ -1,7 +1,13 @@
 import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
-import { addTokenRpc, reportSchema, signinRpc, statusRpc, switchRpc } from "../shared/subswapper";
+import { addTokenRpc, configureCodexRpc, launchConfigurationSchema, reportSchema, signinRpc, statusRpc, switchRpc } from "../shared/subswapper";
 import { addArgs, findSubswapper, runSubswapper, switchArgs } from "./cli";
+import { configureCodexProvider } from "./configure";
+
+export async function configureCodex({ service }: RpcInput<typeof configureCodexRpc>, { paseo }: PluginHandlerContext) {
+  const output = await runSubswapper(["launch-config", "-service", service]);
+  return configureCodexProvider(paseo, service, launchConfigurationSchema.parse(JSON.parse(output)));
+}
 
 export async function readStatus(_input: RpcInput<typeof statusRpc>) {
   try {

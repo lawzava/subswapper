@@ -56,6 +56,24 @@ export const switchRpc = defineRpc({
 
 const providerSchema = z.enum(["claude", "codex"]);
 
+// Mirrors `subswapper launch-config`: a provider shim plus the config and
+// service it serves. It never carries credentials.
+export const launchConfigurationSchema = z.object({
+  command: z.array(z.string().min(1)).length(1),
+  env: z.object({
+    SUBSWAPPER_CONFIG_PATH: z.string().min(1),
+    SUBSWAPPER_SERVICE: nameSchema,
+  }).strict(),
+}).strict();
+
+export type LaunchConfiguration = z.infer<typeof launchConfigurationSchema>;
+
+export const configureCodexRpc = defineRpc({
+  name: "subswapper.configure-codex",
+  input: z.object({ service: nameSchema.default("codex") }),
+  output: z.object({ message: z.string() }),
+});
+
 // signinRpc opens a workspace terminal that runs `subswapper add`, so the
 // provider's interactive sign-in happens inside Paseo.
 export const signinRpc = defineRpc({
