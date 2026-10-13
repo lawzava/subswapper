@@ -131,6 +131,12 @@ proxy configuration, and proxy-down fallback all remain in `home run`. A configu
 but unavailable proxy retains the existing account-login fallback and warning.
 The plugin does not guarantee proxy availability or create another account manager.
 
+`-fast` is optional, off by default, and Codex-only. It adds
+`-c service_tier="priority"`, the tier Codex's model catalog names Fast, which
+consumes subscription usage faster. With `-service claude`, `-fast` is
+rejected: Claude fast mode bills extra usage that subscriptions do not cover.
+The model decides whether the tier applies; Codex omits an unsupported tier.
+
 ## Permissions and scope
 
 The coordinating harness must already have authority for delegation, disclosure

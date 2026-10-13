@@ -63,6 +63,8 @@ effort selected by the caller. Quote task text as a single shell argument using
 safe shell quoting. Never interpolate untrusted task text into shell code.
 `-config PATH` and `-account NAME` are optional existing Subswapper selectors;
 account choice normally stays with Subswapper.
+Add `-fast` only for `-service codex` when the caller asked for Codex's fast
+tier; it is rejected for Claude, whose fast mode bills extra usage.
 When the caller supplies a file containing the child instructions, use
 `-task-file /absolute/path/to/prompt.md` instead of `-task` to pass its contents
 unchanged. Asking the child to review that file changes the task; use that wording

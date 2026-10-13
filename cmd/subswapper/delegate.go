@@ -63,9 +63,10 @@ func runDelegate(args []string, stdout, stderr io.Writer) error {
 	task := fs.String("task", "", "bounded task text")
 	taskFile := fs.String("task-file", "", "file containing the exact task instructions")
 	timeout := fs.Duration("timeout", 10*time.Minute, "positive execution deadline")
+	fast := fs.Bool("fast", false, "request Codex's fast service tier (codex only)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			_, err := fmt.Fprintln(stdout, "Usage: subswapper delegate -service claude|codex -cwd /absolute/path -model MODEL -effort LEVEL -intent read-only|workspace-write (-task TEXT | -task-file PATH) [-timeout 10m] [-config PATH] [-account NAME]")
+			_, err := fmt.Fprintln(stdout, "Usage: subswapper delegate -service claude|codex -cwd /absolute/path -model MODEL -effort LEVEL -intent read-only|workspace-write (-task TEXT | -task-file PATH) [-fast] [-timeout 10m] [-config PATH] [-account NAME]")
 			return err
 		}
 		return errors.New("invalid delegate options")
@@ -75,6 +76,10 @@ func runDelegate(args []string, stdout, stderr io.Writer) error {
 	}
 	if *service != "claude" && *service != "codex" {
 		return errors.New("delegate requires -service claude or codex")
+	}
+	if *fast && *service != "codex" {
+		// Claude fast mode bills extra usage; subscriptions do not cover it.
+		return errors.New("-fast is Codex-only")
 	}
 	if !filepath.IsAbs(*cwd) {
 		return errors.New("delegate requires an absolute -cwd")
@@ -144,7 +149,7 @@ func runDelegate(args []string, stdout, stderr io.Writer) error {
 		// still permit the explicitly requested workspace intent.
 		homeArgs = append(homeArgs, "-c", "projects."+strconv.Quote(*cwd)+`.trust_level="untrusted"`)
 	}
-	homeArgs = append(homeArgs, delegateProviderArgs(*service, *model, *effort, *intent)...)
+	homeArgs = append(homeArgs, delegateProviderArgs(*service, *model, *effort, *intent, *fast)...)
 	cmd := exec.Command(executable, homeArgs...)
 	cmd.Dir = *cwd
 	cmd.Env = append(os.Environ(), delegateMarker+"=1")
@@ -191,18 +196,22 @@ func readDelegateTaskFile(path string) (string, error) {
 	return string(data), nil
 }
 
-func delegateProviderArgs(service, model, effort, intent string) []string {
+func delegateProviderArgs(service, model, effort, intent string, fast bool) []string {
 	if service == "codex" {
 		// Keep every config override at root level. Mixing root and exec -c
 		// options can discard the proxy settings in Codex 0.153.3.
-		return []string{
+		args := []string{
 			"-c", "model_reasoning_effort=" + strconv.Quote(effort), "-c", `approval_policy="never"`,
 			"-c", "features.hooks=false", "-c", "features.plugins=false", "-c", "features.apps=false", "-c", "mcp_servers={}",
 			"-c", "sandbox_workspace_write.writable_roots=[]", "-c", "sandbox_workspace_write.network_access=false",
 			"-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true", "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-			"exec", "--model", model, "--sandbox", intent, "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
-			"--ephemeral", "--color", "never", "-",
 		}
+		if fast {
+			// Codex's model catalog names the "priority" service tier "Fast".
+			args = append(args, "-c", `service_tier="priority"`)
+		}
+		return append(args, "exec", "--model", model, "--sandbox", intent, "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
+			"--ephemeral", "--color", "never", "-")
 	}
 	tools, mode := "Read,Glob,Grep", "dontAsk"
 	if intent == "workspace-write" {

@@ -140,6 +140,23 @@ exit 23
 					t.Fatalf("missing write policy: %s", got)
 				}
 			})
+			t.Run("fast", func(t *testing.T) {
+				fast := `arg=<service_tier="priority">`
+				if strings.Contains(out.String(), fast) || strings.Contains(out.String(), "fastMode") || strings.Contains(out.String(), "service_tier") {
+					t.Fatalf("fast mode requested without -fast: %s", out.String())
+				}
+				got, err := exec.Command(binary, append(append([]string(nil), base...), "-fast")...).CombinedOutput()
+				if provider == "claude" {
+					// Claude fast mode bills extra usage outside the subscription.
+					if err == nil || !strings.Contains(string(got), "Codex-only") || strings.Contains(string(got), "arg=<") {
+						t.Fatalf("claude -fast must fail before launching the provider: %v %s", err, got)
+					}
+					return
+				}
+				if !strings.Contains(string(got), fast) {
+					t.Fatalf("missing %s: %s", fast, got)
+				}
+			})
 			t.Run("no-recursion", func(t *testing.T) {
 				cmd := exec.Command(binary, base...)
 				cmd.Env = append(os.Environ(), "DELEGATED_BY_SUBSWAPPER=1")
@@ -268,7 +285,7 @@ func TestDelegateRejectsUnsafeArguments(t *testing.T) {
 }
 
 func TestDelegateCodexPolicy(t *testing.T) {
-	args := strings.Join(delegateProviderArgs("codex", "synthetic", "high", "workspace-write"), "\n")
+	args := strings.Join(delegateProviderArgs("codex", "synthetic", "high", "workspace-write", false), "\n")
 	for _, want := range []string{`features.hooks=false`, `features.plugins=false`, `features.apps=false`, `mcp_servers={}`, `sandbox_workspace_write.writable_roots=[]`, `sandbox_workspace_write.network_access=false`, `sandbox_workspace_write.exclude_tmpdir_env_var=true`, `sandbox_workspace_write.exclude_slash_tmp=true`} {
 		if !strings.Contains(args, want) {
 			t.Errorf("missing policy %s", want)
@@ -277,17 +294,19 @@ func TestDelegateCodexPolicy(t *testing.T) {
 }
 
 func TestDelegateCodexKeepsConfigBeforeExec(t *testing.T) {
-	args := delegateProviderArgs("codex", "synthetic", "high", "read-only")
-	inExec := false
-	for _, arg := range args {
-		if arg == "exec" {
-			inExec = true
+	for _, fast := range []bool{false, true} {
+		args := delegateProviderArgs("codex", "synthetic", "high", "read-only", fast)
+		inExec := false
+		for _, arg := range args {
+			if arg == "exec" {
+				inExec = true
+			}
+			if inExec && arg == "-c" {
+				t.Fatal("exec-level config can discard the root proxy overrides in Codex 0.153.3")
+			}
 		}
-		if inExec && arg == "-c" {
-			t.Fatal("exec-level config can discard the root proxy overrides in Codex 0.153.3")
+		if !inExec {
+			t.Fatal("missing exec subcommand")
 		}
-	}
-	if !inExec {
-		t.Fatal("missing exec subcommand")
 	}
 }
