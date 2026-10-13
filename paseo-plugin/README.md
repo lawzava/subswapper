@@ -22,8 +22,9 @@ accounts from inside Paseo.
 - **Usage cards and sidebar bars** (Paseo 0.11 and later): `Claude
   (Subswapper)` and `Codex (Subswapper)` cards, one per service, showing the
   account the proxy uses now. Its five-hour and weekly windows go to the
-  sidebar summary. The Subscriptions screen lists every account; Paseo pins
-  sidebar windows per source, so per-account cards would repeat there.
+  sidebar summary, labeled with the account name, e.g. `14% 5h 6% wk · foxy2`.
+  The Subscriptions screen lists every account; Paseo pins sidebar windows per
+  source, so per-account cards would repeat there.
 - Sessions whose provider launches subswapper get `SUBSWAPPER_SERVICE` in
   their environment. Codex sessions also get `OPENAI_BASE_URL` set to OpenAI's
   default, which stops Paseo's builtin Codex card from sending subswapper's

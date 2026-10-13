@@ -44,8 +44,11 @@ function tone(usedPct: number): UsageWindow["tone"] {
   return usedPct >= 70 ? "warning" : "ok";
 }
 
+// windows names the account in the short label of the last sidebar window,
+// because the sidebar shows only an icon, percentages, and short labels, and
+// the card's account label is fixed when Paseo discovers the card.
 function windows(account: AccountReport, now: number): UsageWindow[] {
-  return windowNames.flatMap((name) => {
+  const result = windowNames.flatMap((name): UsageWindow[] => {
     const window = account[name.id];
     if (!window) {
       return [];
@@ -62,6 +65,11 @@ function windows(account: AccountReport, now: number): UsageWindow[] {
       tone: tone(window.used_percent),
     }];
   });
+  const last = result.findLast((window) => window.summary);
+  if (last) {
+    last.shortLabel = `${last.shortLabel} · ${account.name}`;
+  }
+  return result;
 }
 
 function details(account: AccountReport, now: number): UsageDetail[] {
