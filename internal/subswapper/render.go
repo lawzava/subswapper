@@ -33,7 +33,7 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 				account.Service,
 				account.Account.Name,
 				active,
-				formatWindow(account.Account.Usage.FiveHour),
+				formatFiveHour(account.Account.Usage, isClaudeService(result.Service)),
 				formatWindow(account.Account.Usage.Weekly),
 				formatWindow(account.Account.Usage.FableWeekly),
 				score,
@@ -87,6 +87,15 @@ func monitorIssueReason(account AccountStatus) string {
 		return ""
 	}
 	return account.Reason
+}
+
+// formatFiveHour tells a Claude account that has weekly data but no 5-hour
+// window (verified Ultra) apart from one whose usage is unknown.
+func formatFiveHour(usage UsageSnapshot, claude bool) string {
+	if _, ok := usage.FiveHour.Ratio(); !ok && claude && usage.HasCoreLimits() {
+		return "no limit"
+	}
+	return formatWindow(usage.FiveHour)
 }
 
 func formatWindow(window LimitWindow) string {

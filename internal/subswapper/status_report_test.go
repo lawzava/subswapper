@@ -111,3 +111,32 @@ func TestRenderStatusShowsUsageAge(t *testing.T) {
 		t.Fatalf("formatAge(zero) = %q", got)
 	}
 }
+
+func TestRenderStatusShowsNoFiveHourLimitForClaudeWeeklyOnlyAccount(t *testing.T) {
+	now := time.Now()
+	weekly := 40.0
+	results := []ServiceStatus{{
+		Service: ServiceConfig{Name: "claude", Kind: "claude"},
+		Accounts: []AccountStatus{{
+			Service: "claude",
+			Account: AccountState{Name: "ultra", Usage: UsageSnapshot{
+				Weekly: LimitWindow{Pct: &weekly, ResetsAt: now.Add(48 * time.Hour)}, ObservedAt: now,
+			}},
+			Selectable: true, Score: 0.4, Reason: "ready",
+		}, {
+			Service: "claude", Account: AccountState{Name: "broken"}, Reason: "usage unavailable",
+		}},
+	}}
+	for _, line := range strings.Split(RenderStatus(results, nil, now), "\n") {
+		switch {
+		case strings.Contains(line, "ultra") && !strings.Contains(line, "no limit"):
+			t.Fatalf("weekly-only row does not read as having no 5-hour limit: %q", line)
+		case strings.Contains(line, "broken") && strings.Contains(line, "no limit"):
+			t.Fatalf("account without data reads as unlimited: %q", line)
+		}
+	}
+	report := BuildStatusReport(results, now)
+	if account := report.Services[0].Accounts[0]; account.FiveHour != nil || account.Weekly == nil {
+		t.Fatalf("report account = %#v", account)
+	}
+}

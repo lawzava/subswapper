@@ -123,3 +123,28 @@ func weeklyResetStatusForTest(name string, fiveHourPct, weeklyPct float64, weekl
 	status.Account.Usage.Weekly.ResetsAt = weeklyReset
 	return status
 }
+
+func TestBestAccountOrdersWeeklyOnlyAccountsByWeeklyDrain(t *testing.T) {
+	now := time.Now()
+	weeklyOnly := func(name string, weeklyPct float64, weeklyReset time.Time) AccountStatus {
+		usage := UsageSnapshot{Weekly: LimitWindow{Pct: PtrFloat64(weeklyPct), ResetsAt: weeklyReset}}
+		return AccountStatus{Account: AccountState{Name: name, Usage: usage}, Selectable: true, Score: usage.Score()}
+	}
+	accounts := []AccountStatus{
+		weeklyOnly("later", 36, now.Add(72*time.Hour)),
+		weeklyOnly("soon", 49, now.Add(9*time.Hour)),
+	}
+	best, ok := BestAccount(accounts, defaultAutoSwitchThreshold)
+	if !ok || best.Account.Name != "soon" {
+		t.Fatalf("best = %q, want soon", best.Account.Name)
+	}
+	// Mixed with an account that still has a five-hour window.
+	mixed := []AccountStatus{weeklyResetStatusForTest("max", 5, 36, now.Add(72*time.Hour)), accounts[1]}
+	if best, ok = BestAccount(mixed, defaultAutoSwitchThreshold); !ok || best.Account.Name != "soon" {
+		t.Fatalf("mixed best = %q, want soon", best.Account.Name)
+	}
+	hot := weeklyOnly("hot", 95, now.Add(2*time.Hour))
+	if best, ok = BestAccount([]AccountStatus{hot, accounts[0]}, defaultAutoSwitchThreshold); !ok || best.Account.Name != "later" {
+		t.Fatalf("best = %q, want later because hot is past the threshold", best.Account.Name)
+	}
+}

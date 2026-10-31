@@ -750,3 +750,164 @@ func TestClaudeProxyKeepsMonitorSwitchMadeDuringRequest(t *testing.T) {
 		t.Fatalf("a finished request reverted the monitor's switch: active = %q", service.ActiveAccount)
 	}
 }
+
+// weeklyOnlyHeaders is what a verified Ultra account returns once Anthropic
+// drops the 5-hour limit: the weekly window with no 5h-* headers.
+func weeklyOnlyHeaders(status string, weekly float64, weeklyReset time.Time) http.Header {
+	header := http.Header{}
+	header.Set("anthropic-ratelimit-unified-status", status)
+	header.Set("anthropic-ratelimit-unified-7d-utilization", strconv.FormatFloat(weekly, 'f', -1, 64))
+	header.Set("anthropic-ratelimit-unified-7d-reset", strconv.FormatInt(weeklyReset.Unix(), 10))
+	return header
+}
+
+func TestParseClaudeRateLimitHeadersWithoutFiveHourWindow(t *testing.T) {
+	// Ratio compares resets with the wall clock, so the fixture must stay current.
+	observed := time.Now().UTC().Truncate(time.Second)
+	weeklyReset := observed.Add(3 * 24 * time.Hour)
+	header := weeklyOnlyHeaders("allowed", 0.3, weeklyReset)
+
+	observation := parseClaudeRateLimitHeaders(header, observed)
+	if !observation.HasUsage || observation.Rejected {
+		t.Fatalf("observation = %#v", observation)
+	}
+	usage := observation.Usage
+	if usage.FiveHour != (LimitWindow{}) || *usage.Weekly.Pct != 30 || !usage.Weekly.ResetsAt.Equal(weeklyReset) ||
+		usage.Source != claudeUsageSourceProxy {
+		t.Fatalf("usage = %#v", usage)
+	}
+
+	// A 5-hour window that is present but unparseable is still not trusted.
+	for name, set := range map[string]map[string]string{
+		"utilization only": {"5h-utilization": "0.4"},
+		"reset only":       {"5h-reset": strconv.FormatInt(observed.Add(time.Hour).Unix(), 10)},
+		"bad utilization":  {"5h-utilization": "abc", "5h-reset": strconv.FormatInt(observed.Add(time.Hour).Unix(), 10)},
+	} {
+		partial := header.Clone()
+		for key, value := range set {
+			partial.Set("anthropic-ratelimit-unified-"+key, value)
+		}
+		if got := parseClaudeRateLimitHeaders(partial, observed); got.HasUsage {
+			t.Fatalf("%s: malformed 5h window produced usage %#v", name, got.Usage)
+		}
+	}
+}
+
+func TestParseClaudeRateLimitHeadersRejectedWithoutFiveHourWindow(t *testing.T) {
+	// Ratio compares resets with the wall clock, so the fixture must stay current.
+	observed := time.Now().UTC().Truncate(time.Second)
+	weeklyReset := observed.Add(3 * 24 * time.Hour)
+	unix := func(at time.Time) string { return strconv.FormatInt(at.Unix(), 10) }
+	for _, test := range []struct {
+		name          string
+		claim         string
+		overallReset  string
+		weeklyPct     float64
+		wantFiveHour  bool
+		wantReset     time.Time
+		wantWeeklyPct float64
+	}{
+		{name: "five_hour claim uses overall reset", claim: "five_hour", overallReset: unix(observed.Add(2 * time.Hour)),
+			weeklyPct: 0.3, wantFiveHour: true, wantReset: observed.Add(2 * time.Hour), wantWeeklyPct: 30},
+		{name: "unknown claim uses overall reset", overallReset: unix(observed.Add(30 * time.Minute)),
+			weeklyPct: 0.3, wantFiveHour: true, wantReset: observed.Add(30 * time.Minute), wantWeeklyPct: 30},
+		{name: "no overall reset holds one hour", claim: "five_hour",
+			weeklyPct: 0.3, wantFiveHour: true, wantReset: observed.Add(time.Hour), wantWeeklyPct: 30},
+		{name: "past overall reset holds one hour", claim: "five_hour", overallReset: unix(observed.Add(-time.Minute)),
+			weeklyPct: 0.3, wantFiveHour: true, wantReset: observed.Add(time.Hour), wantWeeklyPct: 30},
+		{name: "weekly-ish unknown claim falls back to the weekly reset", claim: "seven_day_sonnet",
+			weeklyPct: 0.3, wantFiveHour: true, wantReset: weeklyReset, wantWeeklyPct: 30},
+		{name: "weekly claim marks the weekly window", claim: "seven_day", weeklyPct: 0.3, wantWeeklyPct: 100},
+		{name: "unknown claim with exhausted weekly adds nothing", weeklyPct: 1, wantWeeklyPct: 100},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := weeklyOnlyHeaders("rejected", test.weeklyPct, weeklyReset)
+			if test.claim != "" {
+				header.Set("anthropic-ratelimit-unified-representative-claim", test.claim)
+			}
+			if test.overallReset != "" {
+				header.Set("anthropic-ratelimit-unified-reset", test.overallReset)
+			}
+			observation := parseClaudeRateLimitHeaders(header, observed)
+			if !observation.HasUsage || !observation.Rejected || !observation.Usage.Exhausted() {
+				t.Fatalf("observation = %#v", observation)
+			}
+			usage := observation.Usage
+			if *usage.Weekly.Pct != test.wantWeeklyPct {
+				t.Fatalf("weekly = %v, want %v", *usage.Weekly.Pct, test.wantWeeklyPct)
+			}
+			if !test.wantFiveHour {
+				if usage.FiveHour != (LimitWindow{}) {
+					t.Fatalf("five-hour window synthesized: %#v", usage.FiveHour)
+				}
+				return
+			}
+			// A full window without a reset would stay exhausted forever.
+			if usage.FiveHour.Pct == nil || *usage.FiveHour.Pct != 100 || !usage.FiveHour.ResetsAt.Equal(test.wantReset) {
+				t.Fatalf("five-hour = %#v, want 100%% resetting %s", usage.FiveHour, test.wantReset)
+			}
+		})
+	}
+}
+
+func TestClaudeProxyWeeklyOnlyResponseReplacesFiveHourSample(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, proxy := setupProxyAccounts(t, upstream.server.URL)
+	weeklyOnly := false
+	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
+		if weeklyOnly {
+			for key, values := range weeklyOnlyHeaders("allowed", 0.2, time.Now().Add(3*24*time.Hour)) {
+				w.Header()[key] = values
+			}
+		} else {
+			rateLimitHeaders(w, 0.9, 0.2, "allowed")
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{}`); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	weeklyOnly = true
+	if recorder := proxyRequest(t, proxy, proxy.secret, `{}`); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := state.Service("claude").Accounts["a"].ProxyUsage
+	if usage.FiveHour != (LimitWindow{}) || usage.Weekly.Pct == nil || *usage.Weekly.Pct != 20 {
+		t.Fatalf("old five-hour sample was carried forward: %#v", usage)
+	}
+	if usage.Score() != 0.2 {
+		t.Fatalf("score = %v, want the weekly window", usage.Score())
+	}
+}
+
+func TestClaudeProxyUsageWithoutFiveHourWindowIsSelectable(t *testing.T) {
+	cfg, account := setupTokenUsageAccount(t)
+	server := setupTokenUsageServer(t, http.StatusForbidden, `{"error":"missing user:profile"}`)
+	useClaudeUsageServer(t, server.URL)
+
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := state.Service("claude").Accounts[account]
+	stored.ProxyUsage = UsageSnapshot{
+		Weekly:        LimitWindow{Pct: PtrFloat64(35), ResetsAt: time.Now().Add(24 * time.Hour)},
+		ObservedAt:    time.Now().UTC().Add(-time.Hour),
+		Source:        claudeUsageSourceProxy,
+		TokenRevision: stored.SetupTokenRevision,
+	}
+	state.Service("claude").Accounts[account] = stored
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+
+	status := collectSetupTokenAccount(t, cfg, account)
+	if !status.Selectable || status.Reason != "ready" || status.Score != 0.35 {
+		t.Fatalf("status = %#v", status)
+	}
+}

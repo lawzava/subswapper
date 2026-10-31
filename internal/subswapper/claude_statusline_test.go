@@ -246,3 +246,23 @@ func TestClaudeStatusLineSampleRoutingUsage(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeStatusLineWithoutFiveHourWindow(t *testing.T) {
+	observedAt := time.Unix(1_000, 0).UTC()
+	for _, input := range []string{
+		`{"rate_limits":{"seven_day":{"used_percentage":20,"resets_at":3000}}}`,
+		`{"rate_limits":{"five_hour":null,"seven_day":{"used_percentage":20,"resets_at":3000}}}`,
+	} {
+		sample, err := ParseClaudeStatusLine([]byte(input), observedAt, "revision-1")
+		if err != nil {
+			t.Fatalf("%s: %v", input, err)
+		}
+		if sample.Usage.FiveHour != (LimitWindow{}) || sample.Usage.Weekly.Pct == nil || *sample.Usage.Weekly.Pct != 20 {
+			t.Fatalf("%s: usage = %#v", input, sample.Usage)
+		}
+		usage, ok := sample.RoutingUsage(observedAt.Add(time.Second), "revision-1", 30*time.Second)
+		if !ok || !usage.HasCoreLimits() || usage.FiveHour != (LimitWindow{}) {
+			t.Fatalf("%s: routing usage = %#v, %v", input, usage, ok)
+		}
+	}
+}

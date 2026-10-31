@@ -47,21 +47,19 @@ func ParseClaudeStatusLine(input []byte, observedAt time.Time, tokenRevision str
 	if err := json.Unmarshal(input, &payload); err != nil {
 		return ClaudeStatusLineSample{}, errors.New("claude status-line usage is malformed")
 	}
-	if payload.RateLimits == nil || payload.RateLimits.FiveHour == nil || payload.RateLimits.SevenDay == nil {
+	if payload.RateLimits == nil || payload.RateLimits.SevenDay == nil {
 		return ClaudeStatusLineSample{}, errors.New("claude status-line usage is unavailable")
 	}
-	if !validClaudeStatusLineWindow(*payload.RateLimits.FiveHour, observedAt) ||
+	// A missing or null five_hour means the account has no 5-hour limit; one
+	// that is present must still be valid.
+	fiveHourWindow := payload.RateLimits.FiveHour
+	if (fiveHourWindow != nil && !validClaudeStatusLineWindow(*fiveHourWindow, observedAt)) ||
 		!validClaudeStatusLineWindow(*payload.RateLimits.SevenDay, observedAt) {
 		return ClaudeStatusLineSample{}, errors.New("claude status-line usage is invalid")
 	}
 
-	fiveHour := *payload.RateLimits.FiveHour.UsedPercentage
 	sevenDay := *payload.RateLimits.SevenDay.UsedPercentage
 	usage := UsageSnapshot{
-		FiveHour: LimitWindow{
-			Pct:      PtrFloat64(fiveHour),
-			ResetsAt: time.Unix(*payload.RateLimits.FiveHour.ResetsAt, 0).UTC(),
-		},
 		Weekly: LimitWindow{
 			Pct:      PtrFloat64(sevenDay),
 			ResetsAt: time.Unix(*payload.RateLimits.SevenDay.ResetsAt, 0).UTC(),
@@ -69,6 +67,12 @@ func ParseClaudeStatusLine(input []byte, observedAt time.Time, tokenRevision str
 		ObservedAt:    observedAt,
 		Source:        claudeUsageSourceStatusLine,
 		TokenRevision: tokenRevision,
+	}
+	if fiveHourWindow != nil {
+		usage.FiveHour = LimitWindow{
+			Pct:      PtrFloat64(*fiveHourWindow.UsedPercentage),
+			ResetsAt: time.Unix(*fiveHourWindow.ResetsAt, 0).UTC(),
+		}
 	}
 	return ClaudeStatusLineSample{
 		Usage:         usage,
@@ -100,13 +104,19 @@ func (sample ClaudeStatusLineSample) RoutingUsage(now time.Time, tokenRevision s
 	if !sample.Usage.ObservedAt.Equal(sample.ObservedAt) ||
 		sample.Usage.Source != claudeUsageSourceStatusLine ||
 		sample.Usage.TokenRevision != tokenRevision ||
-		!validClaudeRoutingWindow(sample.Usage.FiveHour, now) ||
+		!validClaudeOptionalRoutingWindow(sample.Usage.FiveHour, now) ||
 		!validClaudeRoutingWindow(sample.Usage.Weekly, now) {
 		return UsageSnapshot{}, false
 	}
 	usage := sample.Usage
 	usage.FableWeekly = LimitWindow{}
 	return usage, true
+}
+
+// validClaudeOptionalRoutingWindow accepts an absent window, which is how an
+// account without a 5-hour limit reports it, but not a half-filled one.
+func validClaudeOptionalRoutingWindow(window LimitWindow, now time.Time) bool {
+	return window == (LimitWindow{}) || validClaudeRoutingWindow(window, now)
 }
 
 func validClaudeRoutingWindow(window LimitWindow, now time.Time) bool {

@@ -31,15 +31,19 @@ func TestUsageSnapshotScoresAvailableWindows(t *testing.T) {
 	}
 }
 
-func TestCustomUsageCommandStillRequiresCoreWindows(t *testing.T) {
+// The weekly window is the one every subscription has; the 5-hour window is
+// optional (verified Claude Ultra accounts have none).
+func TestCustomUsageCommandRequiresWeeklyWindow(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{BackupRoot: filepath.Join(dir, "backups"), StatePath: filepath.Join(dir, "state.json")}
-	service := ServiceConfig{
-		Name:         "svc",
-		Kind:         "custom",
-		UsageCommand: []string{"sh", "-c", `echo '{"weekly":{"pct":20}}'`},
+	run := func(output string) (UsageSnapshot, error) {
+		service := ServiceConfig{Name: "svc", Kind: "custom", UsageCommand: []string{"sh", "-c", "echo '" + output + "'"}}
+		return runUsageCommand(testContext(t), cfg, service, AccountState{Name: "a"})
 	}
-	_, err := runUsageCommand(testContext(t), cfg, service, AccountState{Name: "a"})
+	if usage, err := run(`{"weekly":{"pct":20}}`); err != nil || usage.Weekly.Pct == nil {
+		t.Fatalf("weekly-only output rejected: %v", err)
+	}
+	_, err := run(`{"five_hour":{"pct":20}}`)
 	if err == nil || !strings.Contains(err.Error(), "missing limits") {
 		t.Fatalf("expected missing core limits error, got %v", err)
 	}

@@ -138,7 +138,7 @@ func trustedClaudeSetupTokenUsage(usage UsageSnapshot, now time.Time, tokenRevis
 		now.Sub(usage.ObservedAt) >= inactiveUsageTTL || !usage.HasCoreLimits() {
 		return false
 	}
-	return validClaudeRoutingWindow(usage.FiveHour, now) && validClaudeRoutingWindow(usage.Weekly, now)
+	return validClaudeOptionalRoutingWindow(usage.FiveHour, now) && validClaudeRoutingWindow(usage.Weekly, now)
 }
 
 func trustedClaudeStatusLineUsage(usage UsageSnapshot, now time.Time, tokenRevision string) bool {

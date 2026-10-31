@@ -60,7 +60,7 @@ func fetchClaudeUsageWithSetupToken(ctx context.Context, token string) (UsageSna
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	if !validClaudeRoutingWindow(usage.FiveHour, now) || !validClaudeRoutingWindow(usage.Weekly, now) {
+	if !validClaudeOptionalRoutingWindow(usage.FiveHour, now) || !validClaudeRoutingWindow(usage.Weekly, now) {
 		return UsageSnapshot{}, errSetupTokenUsageUnavailable
 	}
 	if usage.FableWeekly.Pct != nil && !validClaudeRoutingWindow(usage.FableWeekly, now) {

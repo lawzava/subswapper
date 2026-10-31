@@ -294,3 +294,47 @@ func collectSetupTokenAccount(t *testing.T, cfg Config, account string) AccountS
 	}
 	return result.Accounts[0]
 }
+
+func TestClaudeSetupTokenDirectUsageWithoutFiveHourWindowIsSelectable(t *testing.T) {
+	for _, body := range []string{
+		`{"seven_day":{"utilization":34,"resets_at":"2030-01-02T00:00:00Z"}}`,
+		`{"five_hour":null,"seven_day":{"utilization":34,"resets_at":"2030-01-02T00:00:00Z"}}`,
+	} {
+		cfg, account := setupTokenUsageAccount(t)
+		server := setupTokenUsageServer(t, http.StatusOK, body)
+		useClaudeUsageServer(t, server.URL)
+
+		status := collectSetupTokenAccount(t, cfg, account)
+		if !status.Selectable || status.Reason != "ready" || status.Score != 0.34 {
+			t.Fatalf("body %s: status = %#v", body, status)
+		}
+		if status.Account.Usage.FiveHour != (LimitWindow{}) {
+			t.Fatalf("body %s: five-hour = %#v", body, status.Account.Usage.FiveHour)
+		}
+	}
+}
+
+func TestClaudeSetupTokenStatusLineUsageWithoutFiveHourWindowIsTrusted(t *testing.T) {
+	cfg, account := setupTokenUsageAccount(t)
+	server := setupTokenUsageServer(t, http.StatusForbidden, `{"error":"missing user:profile"}`)
+	useClaudeUsageServer(t, server.URL)
+
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := state.Service("claude").Accounts[account]
+	stored.Usage = UsageSnapshot{
+		Weekly:        LimitWindow{Pct: PtrFloat64(35), ResetsAt: time.Now().Add(24 * time.Hour)},
+		ObservedAt:    time.Now().UTC().Add(-time.Minute),
+		Source:        claudeUsageSourceStatusLine,
+		TokenRevision: stored.SetupTokenRevision,
+	}
+	state.Service("claude").Accounts[account] = stored
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	if status := collectSetupTokenAccount(t, cfg, account); !status.Selectable {
+		t.Fatalf("status = %#v", status)
+	}
+}

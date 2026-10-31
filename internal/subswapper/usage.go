@@ -338,10 +338,11 @@ func (u UsageSnapshot) HasAnyLimit() bool {
 	return len(u.ratios()) > 0
 }
 
+// HasCoreLimits reports the weekly window, the one limit every subscription
+// keeps. The 5-hour window is optional: verified Ultra accounts have none.
 func (u UsageSnapshot) HasCoreLimits() bool {
-	_, hasFiveHour := u.FiveHour.Ratio()
 	_, hasWeekly := u.Weekly.Ratio()
-	return hasFiveHour && hasWeekly
+	return hasWeekly
 }
 
 func (u UsageSnapshot) Exhausted() bool {

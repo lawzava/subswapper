@@ -130,3 +130,30 @@ func TestLookupClaudeSetupTokenIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestUsageSnapshotCoreLimitsNeedOnlyTheWeeklyWindow(t *testing.T) {
+	weekly := LimitWindow{Pct: PtrFloat64(10)}
+	fiveHour := LimitWindow{Pct: PtrFloat64(10)}
+	if !(UsageSnapshot{Weekly: weekly}).HasCoreLimits() || !(UsageSnapshot{FiveHour: fiveHour, Weekly: weekly}).HasCoreLimits() {
+		t.Fatal("a weekly window must be enough")
+	}
+	if (UsageSnapshot{FiveHour: fiveHour}).HasCoreLimits() || (UsageSnapshot{}).HasCoreLimits() {
+		t.Fatal("no weekly window must not count as core limits")
+	}
+}
+
+func TestFetchClaudeUsageWithSetupTokenStillValidatesAPresentFiveHourWindow(t *testing.T) {
+	// Only an absent five-hour window is optional; a present one with no
+	// reset time is as untrusted as before.
+	body := `{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":34,"resets_at":"2030-07-05T03:59:59Z"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	oldURL := claudeUsageURL
+	claudeUsageURL = server.URL
+	t.Cleanup(func() { claudeUsageURL = oldURL })
+	if _, err := fetchClaudeUsageWithSetupToken(context.Background(), "setup-secret"); !errors.Is(err, errSetupTokenUsageUnavailable) {
+		t.Fatalf("error = %v, want setup-token usage unavailable", err)
+	}
+}

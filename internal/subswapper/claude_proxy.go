@@ -518,7 +518,9 @@ func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claud
 	}
 	fiveHour, fiveHourOK := parseClaudeRateLimitWindow(header, "5h")
 	weekly, weeklyOK := parseClaudeRateLimitWindow(header, "7d")
-	if fiveHourOK && weeklyOK {
+	// Accounts without a 5-hour limit send no 5h headers at all. A 5-hour
+	// window that is present but unparseable stays untrusted, as before.
+	if weeklyOK && (fiveHourOK || !hasClaudeRateLimitWindowHeaders(header, "5h")) {
 		observation.HasUsage = true
 		observation.Usage = UsageSnapshot{
 			FiveHour:   fiveHour,
@@ -530,7 +532,7 @@ func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claud
 			observation.Usage.FableWeekly = fable
 		}
 		if observation.Rejected {
-			markClaudeRejectedWindow(&observation.Usage, header.Get(claudeRateLimitHeaderBase+"representative-claim"))
+			markClaudeRejectedWindow(&observation.Usage, header, observedAt)
 		}
 	}
 	return observation
@@ -540,9 +542,10 @@ func parseClaudeRateLimitHeaders(header http.Header, observedAt time.Time) claud
 // as the binding claim. The utilization headers can still read below 100%
 // on a rejected response, and an account that stays "ready" at 91% would be
 // retried and rejected on every request.
-func markClaudeRejectedWindow(usage *UsageSnapshot, claim string) {
+func markClaudeRejectedWindow(usage *UsageSnapshot, header http.Header, observedAt time.Time) {
 	full := PtrFloat64(100)
-	switch strings.ToLower(strings.TrimSpace(claim)) {
+	claim := strings.ToLower(strings.TrimSpace(header.Get(claudeRateLimitHeaderBase + "representative-claim")))
+	switch claim {
 	case "seven_day":
 		usage.Weekly.Pct = full
 	case "seven_day_overage_included", "seven_day_oi":
@@ -552,15 +555,43 @@ func markClaudeRejectedWindow(usage *UsageSnapshot, claim string) {
 			usage.Weekly.Pct = full
 		}
 	case "five_hour":
-		usage.FiveHour.Pct = full
+		markClaudeFiveHourRejected(usage, header, observedAt, claim)
 	default:
 		if usage.Exhausted() {
 			return
 		}
 		// Unknown claim: the five-hour window resets soonest, so a wrong
 		// guess costs the least.
-		usage.FiveHour.Pct = full
+		markClaudeFiveHourRejected(usage, header, observedAt, claim)
 	}
+}
+
+// markClaudeFiveHourRejected fills the five-hour window. An account without
+// one (verified Ultra) is held through a synthesized window instead: a full
+// window with no reset time would never clear, because LimitWindow.Ratio
+// only zeroes a window once its reset passes. The hold ends at the overall
+// reset Anthropic reports for the rejection, else at the weekly reset when
+// the claim names a weekly window, else after an hour, a short hold that the
+// next response corrects.
+func markClaudeFiveHourRejected(usage *UsageSnapshot, header http.Header, observedAt time.Time, claim string) {
+	full := PtrFloat64(100)
+	if usage.FiveHour.Pct != nil {
+		usage.FiveHour.Pct = full
+		return
+	}
+	resetsAt := observedAt.Add(time.Hour)
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(header.Get(claudeRateLimitHeaderBase+"reset")), 10, 64); err == nil &&
+		seconds > 0 && time.Unix(seconds, 0).After(observedAt) {
+		resetsAt = time.Unix(seconds, 0).UTC()
+	} else if strings.HasPrefix(claim, "seven_day") && usage.Weekly.ResetsAt.After(observedAt) {
+		resetsAt = usage.Weekly.ResetsAt
+	}
+	usage.FiveHour = LimitWindow{Pct: full, ResetsAt: resetsAt}
+}
+
+func hasClaudeRateLimitWindowHeaders(header http.Header, name string) bool {
+	return strings.TrimSpace(header.Get(claudeRateLimitHeaderBase+name+"-utilization")) != "" ||
+		strings.TrimSpace(header.Get(claudeRateLimitHeaderBase+name+"-reset")) != ""
 }
 
 func parseClaudeRateLimitWindow(header http.Header, name string) (LimitWindow, bool) {
@@ -658,7 +689,7 @@ func trustedClaudeProxyUsage(usage UsageSnapshot, revision string) bool {
 	return usage.Source == claudeUsageSourceProxy &&
 		usage.TokenRevision != "" && usage.TokenRevision == revision &&
 		!usage.ObservedAt.IsZero() && usage.HasCoreLimits() &&
-		!usage.FiveHour.ResetsAt.IsZero() && !usage.Weekly.ResetsAt.IsZero()
+		(usage.FiveHour == (LimitWindow{}) || !usage.FiveHour.ResetsAt.IsZero()) && !usage.Weekly.ResetsAt.IsZero()
 }
 
 // recordClaudeProxyObservation stores what one real response revealed about
