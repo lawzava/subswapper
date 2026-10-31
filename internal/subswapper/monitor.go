@@ -51,6 +51,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 		return CycleResult{Errors: []error{err}}
 	}
 	cycle := CycleResult{Results: results}
+	var switched []historySwitch
 	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return CycleResult{Errors: []error{err}}
@@ -84,6 +85,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 			if !shouldAutoSwitch(cfg.Monitor, *result, best, serviceState.LastSwitchedAt, now) {
 				continue
 			}
+			switched = append(switched, historySwitch{result.Service, serviceState.ActiveAccount, best.Account.Name})
 			selectAccount(state, result.Service, best.Account.Name, now)
 			markActive(result, best.Account.Name)
 			cycle.Switches = append(cycle.Switches, SwitchEvent{Service: result.Service.Name, Account: best.Account.Name})
@@ -91,7 +93,10 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 	}
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		cycle.Errors = append(cycle.Errors, err)
+	} else {
+		recordSwitches(cfg, switched, HistorySwitchAuto)
 	}
+	recordUsageSamples(cfg, time.Now(), cycle.Results)
 	return cycle
 }
 
@@ -112,6 +117,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 	mergeProbeState(state, probed)
 	all := serviceName == "all"
 	var switches []SwitchEvent
+	var switched []historySwitch
 	var errs []error
 	matched := false
 	actionable := false
@@ -155,6 +161,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 		if best.Active {
 			continue
 		}
+		switched = append(switched, historySwitch{service, serviceState.ActiveAccount, best.Account.Name})
 		selectAccount(state, service, best.Account.Name, time.Now().UTC())
 		switches = append(switches, SwitchEvent{Service: service.Name, Account: best.Account.Name})
 	}
@@ -166,6 +173,8 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 	}
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		errs = append(errs, err)
+	} else {
+		recordSwitches(cfg, switched, HistorySwitchBest)
 	}
 	return switches, errors.Join(errs...)
 }
@@ -273,5 +282,19 @@ func activeAccountStatus(result ServiceStatus) (AccountStatus, bool) {
 func markActive(result *ServiceStatus, accountName string) {
 	for index := range result.Accounts {
 		result.Accounts[index].Active = result.Accounts[index].Account.Name == accountName
+	}
+}
+
+// historySwitch is a switch awaiting its history record, which is written only
+// once the new selection is saved.
+type historySwitch struct {
+	service  ServiceConfig
+	from, to string
+}
+
+func recordSwitches(cfg Config, switched []historySwitch, reason string) {
+	now := time.Now()
+	for _, event := range switched {
+		recordUsageSwitch(cfg, now, event.service, event.from, event.to, reason)
 	}
 }

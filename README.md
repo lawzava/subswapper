@@ -104,6 +104,7 @@ on Linux). Flags may follow positional arguments.
 | `remove claude\|codex <name> [-force] [-delete-home]` | Unregister an account and delete its Claude setup token. `-force` removes the selected account. |
 | `switch claude\|codex\|all [name\|auto]` | Select an account; `auto` (the default) picks the best one. |
 | `status [-json]` (alias `list`) | Show every account with usage windows, score, and state. `-json` prints the report the Paseo plugin reads. |
+| `usage-report [-service <name>] [-since 672h] [-json]` | Judge from the usage history whether an account pool is too small or too large: per-account weekly peaks and unused quota, time near the switch threshold, pool exhaustion, and a `short`, `balanced`, or `surplus` verdict. Run it on the hub; the monitor writes `usage-history.jsonl` next to the state file and keeps 120 days. |
 | `claude [args...]`, `codex [args...]` | Launch the provider through subswapper. Same as `home run -service <name> -- <name> [args...]`. |
 | `home run -service <name> [-account <name>] [-- command...]` | Launch any command the way `claude` and `codex` are launched. |
 | `launch-config -service <name>` | Link a provider shim and print the command and environment an integration such as Paseo should run, as JSON. No credentials. |
@@ -352,6 +353,7 @@ Defaults on Linux (macOS and Windows use their native config and data folders):
 
 - config: `~/.config/subswapper/config.json`
 - state: `~/.local/share/subswapper/state.json`
+- usage history (hub only): `~/.local/share/subswapper/usage-history.jsonl`
 - account homes: `~/.local/share/subswapper/accounts/`
 - Claude setup tokens, proxy secret, and Codex placeholder:
   `~/.local/share/subswapper/tokens/`

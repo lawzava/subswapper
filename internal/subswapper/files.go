@@ -36,11 +36,16 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 	if _, ok := state.Account(service.Name, accountName); !ok {
 		return fmt.Errorf("account %q not found for service %q", accountName, service.Name)
 	}
-	if state.Service(service.Name).ActiveAccount == accountName {
+	previous := state.Service(service.Name).ActiveAccount
+	if previous == accountName {
 		return nil
 	}
 	selectAccount(state, service, accountName, time.Now().UTC())
-	return SaveState(cfg.StatePath, state)
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		return err
+	}
+	recordSwitches(cfg, []historySwitch{{service, previous, accountName}}, HistorySwitchManual)
+	return nil
 }
 
 // selectAccount makes accountName the route for new requests. Running

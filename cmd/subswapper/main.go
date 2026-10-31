@@ -81,6 +81,8 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return runClaudeStatusLine(stdin, stdout)
 	case "remove", "rm":
 		return runRemove(args[1:], stdout)
+	case "usage-report":
+		return runUsageReport(args[1:], stdout)
 	case "status", "list":
 		return runStatus(args[1:], stdout)
 	case "switch":
@@ -1120,6 +1122,7 @@ Accounts:
   subswapper remove claude|codex <name> [-force] [-delete-home]
   subswapper switch claude|codex|all [name|auto]
   subswapper status [-json]
+  subswapper usage-report [-service name] [-since 672h] [-json]
 
 Run:
   subswapper claude [args...]            Claude Code through subswapper
