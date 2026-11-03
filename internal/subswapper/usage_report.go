@@ -225,7 +225,7 @@ func buildAccountCapacity(name string, samples []UsageHistoryRecord, start, end 
 		}
 		hit := sample.FiveHour != nil && sample.FiveHour.Pct >= 100
 		contiguous := !previousEnd.IsZero() && !sample.Time.After(previousEnd)
-		if hit && !(hitting && contiguous) {
+		if hit && (!hitting || !contiguous) {
 			account.FiveHourHits++
 		}
 		hitting = hit
@@ -313,7 +313,7 @@ func poolExhaustion(byAccount map[string][]UsageHistoryRecord, until time.Time) 
 		exhausted := known > 0 && selectable == 0
 		if exhausted {
 			total += d
-			if !(previousExhausted && !at.After(previousEnd)) {
+			if !previousExhausted || at.After(previousEnd) {
 				episodes++
 			}
 		}
