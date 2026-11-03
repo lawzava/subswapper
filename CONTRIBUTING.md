@@ -5,16 +5,16 @@ improvements are all welcome.
 
 ## Getting started
 
-You need Go 1.26 or newer. Then:
+You need Go 1.26.10 or newer. Then:
 
 ```sh
 git clone https://github.com/lawzava/subswapper.git
 cd subswapper
-go test ./...
+go run ./internal/tools/check -tier=fast
 ```
 
-There are no dependencies beyond the Go standard library, and the goal is to
-keep it that way.
+Keep dependencies minimal and avoid adding new ones. The Go module currently
+uses `github.com/creack/pty`, `golang.org/x/term`, and indirectly `golang.org/x/sys`.
 
 ## Development workflow
 
@@ -23,11 +23,19 @@ keep it that way.
 3. Make sure the checks that CI runs pass locally:
 
    ```sh
-   gofmt -l .        # must print nothing
-   go vet ./...
-   go test ./...
-   GOOS=windows GOARCH=amd64 go build ./...   # CI also cross-compiles
+   go run ./internal/tools/check -tier=fast  # while iterating
+   go run ./internal/tools/check -tier=full  # before completion
+   go run ./internal/tools/check -list       # tiers, steps and prerequisites
    ```
+
+   The full tier matches CI's OS split: coverage and race tests run on Linux
+   and macOS; lint, vulnerability checks, Windows cross-compilation and the
+   Paseo plugin checks run on Linux. Install the plugin dependencies first
+   with `npm ci --no-audit --no-fund` in `paseo-plugin/`. Missing
+   `golangci-lint`, `govulncheck` or `npm` prints `SKIPPED` locally; CI uses
+   `-ci` to make missing tools fatal. CI pins golangci-lint v2.12.2 and
+   govulncheck v1.5.0. The gate runs all selected steps, then fails if any
+   failed. Fix failures and report skips before calling a change verified.
 
 4. Open a pull request with a clear description of the problem and the fix.
 

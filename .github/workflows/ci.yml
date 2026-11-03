@@ -20,41 +20,31 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: gofmt
-        run: test -z "$(gofmt -l .)"
-      - name: go vet
-        run: go vet ./...
-      - name: go test with coverage
-        run: go test -coverprofile=coverage.out -count=1 ./...
-      - name: go test race detector
-        run: go test -race -count=1 ./...
-      - name: golangci-lint
+      - name: install golangci-lint
         if: runner.os == 'Linux'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
-      - name: govulncheck
+          install-only: true
+      - name: install govulncheck
         if: runner.os == 'Linux'
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
-          govulncheck ./...
-      - name: cross-compile windows
-        if: runner.os == 'Linux'
-        run: GOOS=windows GOARCH=amd64 go build ./...
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+      - name: full Go gate
+        run: go run ./internal/tools/check -tier=full -scope=go -ci
 
   paseo-plugin:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: paseo-plugin
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: install
+        working-directory: paseo-plugin
         run: npm ci --no-audit --no-fund
-      - name: typecheck
-        run: npm run typecheck
-      - name: test
-        run: npm test
+      - name: full plugin gate
+        run: go run ./internal/tools/check -tier=full -scope=plugin -ci

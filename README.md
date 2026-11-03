@@ -28,7 +28,7 @@ Tailscale.
 
 ## Installation
 
-Requires Go 1.26.6 or newer.
+Requires Go 1.26.10 or newer.
 
 ```sh
 go install github.com/lawzava/subswapper/cmd/subswapper@latest
