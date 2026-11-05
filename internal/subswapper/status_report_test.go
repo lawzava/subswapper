@@ -16,14 +16,14 @@ func statusReportFixture(now time.Time) []ServiceStatus {
 			Accounts: []AccountStatus{
 				{
 					Service: "claude",
-					Account: AccountState{Name: "foxy2", Email: "f@example.com", Usage: UsageSnapshot{
+					Account: AccountState{Name: "acct-a", Email: "f@example.com", Usage: UsageSnapshot{
 						FiveHour:   LimitWindow{Pct: &fiveHour, ResetsAt: now.Add(4 * time.Hour)},
 						Weekly:     LimitWindow{Pct: &weekly, ResetsAt: now.Add(48 * time.Hour)},
 						ObservedAt: now.Add(-3 * time.Minute),
 					}},
 					Active: true, Selectable: true, Score: 0.86, Reason: "ready",
 				},
-				{Service: "claude", Account: AccountState{Name: "h2"}, Reason: "usage unavailable"},
+				{Service: "claude", Account: AccountState{Name: "acct-b"}, Reason: "usage unavailable"},
 			},
 		},
 		{Service: ServiceConfig{Name: "codex", Kind: "codex"}, Note: "hub at x unavailable"},
@@ -71,18 +71,18 @@ func TestBuildStatusReport(t *testing.T) {
 		t.Fatalf("report = %s", data)
 	}
 	claude := decoded.Services[0]
-	if claude.Name != "claude" || claude.Kind != "claude" || claude.Hub != "http://100.64.0.1:7878" || claude.Selected != "foxy2" || len(claude.Accounts) != 2 {
+	if claude.Name != "claude" || claude.Kind != "claude" || claude.Hub != "http://100.64.0.1:7878" || claude.Selected != "acct-a" || len(claude.Accounts) != 2 {
 		t.Fatalf("claude = %s", data)
 	}
-	foxy := claude.Accounts[0]
-	if !foxy.Selected || !foxy.Ready || foxy.Score == nil || *foxy.Score != 86 || foxy.State != "ready" ||
-		foxy.Weekly == nil || foxy.Weekly.UsedPercent != 86 || !foxy.Weekly.ResetsAt.Equal(now.Add(48*time.Hour)) ||
-		foxy.FiveHour == nil || foxy.FableWeekly != nil || !foxy.UpdatedAt.Equal(now.Add(-3*time.Minute)) {
-		t.Fatalf("foxy2 = %s", data)
+	acctA := claude.Accounts[0]
+	if !acctA.Selected || !acctA.Ready || acctA.Score == nil || *acctA.Score != 86 || acctA.State != "ready" ||
+		acctA.Weekly == nil || acctA.Weekly.UsedPercent != 86 || !acctA.Weekly.ResetsAt.Equal(now.Add(48*time.Hour)) ||
+		acctA.FiveHour == nil || acctA.FableWeekly != nil || !acctA.UpdatedAt.Equal(now.Add(-3*time.Minute)) {
+		t.Fatalf("acct-a = %s", data)
 	}
-	h2 := claude.Accounts[1]
-	if h2.Ready || h2.Score != nil || h2.Weekly != nil || !h2.UpdatedAt.IsZero() || h2.State != "usage unavailable" {
-		t.Fatalf("h2 = %s", data)
+	acctB := claude.Accounts[1]
+	if acctB.Ready || acctB.Score != nil || acctB.Weekly != nil || !acctB.UpdatedAt.IsZero() || acctB.State != "usage unavailable" {
+		t.Fatalf("acct-b = %s", data)
 	}
 	if codex := decoded.Services[1]; codex.Note != "hub at x unavailable" || codex.Accounts == nil {
 		t.Fatalf("codex = %s; accounts must be an empty list, not null", data)
@@ -96,8 +96,8 @@ func TestRenderStatusShowsUsageAge(t *testing.T) {
 		t.Fatalf("no UPDATED column:\n%s", out)
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "foxy2") && !strings.Contains(line, " 3m ") {
-			t.Fatalf("foxy2 row lacks its 3m age: %q", line)
+		if strings.Contains(line, "acct-a") && !strings.Contains(line, " 3m ") {
+			t.Fatalf("acct-a row lacks its 3m age: %q", line)
 		}
 	}
 	for age, want := range map[time.Duration]string{

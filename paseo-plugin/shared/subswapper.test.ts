@@ -10,10 +10,10 @@ const sample = {
       name: "claude",
       kind: "claude",
       hub: "http://100.64.0.1:7878",
-      selected: "h2",
+      selected: "acct-b",
       accounts: [
         {
-          name: "foxy2",
+          name: "acct-a",
           email: "work@example.com",
           selected: false,
           ready: true,
