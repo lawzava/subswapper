@@ -79,11 +79,11 @@ subswapper status 2026-10-03T13:36:58+03:00
 
 SERVICE    ACCOUNT    SELECTED 5H                     WEEKLY                  FABLE5                  SCORE    UPDATED  STATE
 -------    -------    -------- --                     ------                  ------                  -----    -------  -----
-claude     foxy2               38% reset Oct03 17:30  90% reset Oct04 07:00   3% reset Oct04 07:00    90%      2m       ready
-claude     h2         yes      41% reset Oct03 17:50  12% reset Oct08 15:00   0% reset Oct08 15:00    41%      <1m      ready
-codex      f2         yes      -                      1% reset Oct10 00:21    -                       1%       4m       ready
-claude: accounts on the hub at http://100.64.0.1:7878
-codex: accounts on the hub at http://100.64.0.1:7879
+claude     acct-a              38% reset Oct03 17:30  90% reset Oct04 07:00   3% reset Oct04 07:00    90%      2m       ready
+claude     acct-b     yes      41% reset Oct03 17:50  12% reset Oct08 15:00   0% reset Oct08 15:00    41%      <1m      ready
+codex      acct-c     yes      -                      1% reset Oct10 00:21    -                       1%       4m       ready
+claude: accounts on the hub at <hub>
+codex: accounts on the hub at <hub>
 ```
 
 `FABLE5` is the weekly window for Claude's Fable models. `SCORE` is an

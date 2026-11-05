@@ -12,10 +12,10 @@ const report: StatusReport = {
       name: "claude",
       kind: "claude",
       hub: "http://100.64.0.1:7878",
-      selected: "foxy2",
+      selected: "acct-a",
       accounts: [
         {
-          name: "foxy2",
+          name: "acct-a",
           email: "work@example.com",
           selected: true,
           ready: true,
@@ -74,15 +74,15 @@ test("session discovery follows the service the session launches through", () =>
 test("the selected-account card reports the account subswapper routes to now", () => {
   assert.deepEqual(usageReport(report, { service: "claude" }, now), {
     status: "available",
-    planLabel: "foxy2",
+    planLabel: "acct-a",
     windows: [
       { id: "five_hour", label: "5-hour", shortLabel: "", summary: true, usedPct: 72, remainingPct: 28, resetsAt: "2026-10-13T11:00:00Z", tone: "warning" },
-      { id: "weekly", label: "Weekly", shortLabel: "foxy2", summary: true, usedPct: 6, remainingPct: 94, resetsAt: "2026-10-18T04:00:00Z", tone: "ok" },
+      { id: "weekly", label: "Weekly", shortLabel: "acct-a", summary: true, usedPct: 6, remainingPct: 94, resetsAt: "2026-10-18T04:00:00Z", tone: "ok" },
       // A reset in the past means the window restarted; subswapper already reports it as 0%.
       { id: "fable_weekly", label: "Fable weekly", shortLabel: "Fable", usedPct: 0, remainingPct: 100, resetsAt: null, tone: "ok" },
     ],
     details: [
-      { id: "account", label: "Account", value: "foxy2 · work@example.com" },
+      { id: "account", label: "Account", value: "acct-a · work@example.com" },
       { id: "state", label: "State", value: "ready", tone: "ok" },
       { id: "updated", label: "Updated", value: "3m ago" },
     ],
