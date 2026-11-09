@@ -179,7 +179,15 @@ func runSteps(steps []step, strict bool, out io.Writer) error {
 		}
 		cmd := exec.Command(tool, s.command[1:]...)
 		cmd.Dir = s.dir
-		cmd.Env = append(os.Environ(), s.env...)
+		// Ambient routing, credentials and live-test flags must never reach checks.
+		// Explicit step fixtures remain intentional, including version probes.
+		cmd.Env = []string{}
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "SUBSWAPPER_") {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+		cmd.Env = append(cmd.Env, s.env...)
 		cmd.Stdout, cmd.Stderr = out, out
 		var stdout bytes.Buffer
 		if s.cleanOutput {
