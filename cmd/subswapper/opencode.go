@@ -51,17 +51,22 @@ func doctorOpenCode(ctx context.Context, d *doctorReport, cfg subswapper.Config,
 	data, err := os.ReadFile(filepath.Join(plugin, "package.json"))
 	_, entryErr := os.Stat(filepath.Join(plugin, "index.ts"))
 	_, helperErr := os.Stat(filepath.Join(plugin, "private-group.ts"))
-	if !filepath.IsAbs(plugin) || err != nil || entryErr != nil || helperErr != nil || json.Unmarshal(data, &pkg) != nil || pkg.Name != "subswapper-opencode" || pkg.Version != "0.1.0" || pkg.Dependencies["@opencode/plugin"] != "2.2.6" {
-		d.fail("opencode: plugin version missing or unsupported; install subswapper-opencode 0.1.0 with SDK 2.2.6")
+	_, catalogErr := os.Stat(filepath.Join(plugin, "catalog.ts"))
+	if !filepath.IsAbs(plugin) || err != nil || entryErr != nil || helperErr != nil || json.Unmarshal(data, &pkg) != nil || pkg.Name != "subswapper-opencode" || (pkg.Version != "0.1.0" && pkg.Version != "0.2.0") || (pkg.Version == "0.2.0" && catalogErr != nil) || pkg.Dependencies["@opencode/plugin"] != "2.2.6" {
+		d.fail("opencode: plugin version missing or unsupported; install subswapper-opencode 0.2.0 (or 0.1.0) with SDK 2.2.6")
 		return
 	}
-	d.ok("opencode: plugin version 0.1.0 present (SDK 2.2.6); runtime loading not verified")
+	d.ok("opencode: plugin version %s present (SDK 2.2.6); runtime loading not verified", pkg.Version)
 	route, err := subswapper.OpenCodeCodexRoute(cfg, service)
 	if err != nil {
 		d.fail("opencode: %v", err)
 		return
 	}
-	d.ok("opencode: exact Responses route %s/backend-api/codex/responses; HTTP only, summary compaction", route.Origin)
+	if pkg.Version == "0.1.0" {
+		d.ok("opencode: exact Responses route %s/backend-api/codex/responses; HTTP only, summary compaction", route.Origin)
+	} else {
+		d.ok("opencode: backend route %s/backend-api/codex; HTTP/WebSocket bridge, native compaction; backend model/image support not verified", route.Origin)
+	}
 	placeholder, err := subswapper.LoadExistingCodexProxyPlaceholder(cfg, service)
 	if err != nil {
 		d.fail("opencode: %v; start the configured proxy to provision its placeholder", err)
