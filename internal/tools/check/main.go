@@ -78,7 +78,8 @@ Run all steps even after a failure; any failure makes the gate exit nonzero.
 Missing optional tools print SKIPPED (nonfatal locally, fatal with -ci).
 OS-excluded steps print NOT RUN; the gate fails if no steps ran.
 Optional tool versions are printed before their checks.
-Install plugin dependencies first: npm ci --no-audit --no-fund in paseo-plugin/.
+Install plugin dependencies first: npm ci --no-audit --no-fund in paseo-plugin/
+and plugins/opencode/ (Node 24+).
 The gate does not install tools or dependencies. Coverage uses a temporary file
 removed on exit. Command output streams; the final summary counts each result.
 Full steps (Linux only: lint, vuln, windows, plugin-typecheck, plugin-test):`)
@@ -119,6 +120,8 @@ func selectSteps(o options, goos, coverage string) []step {
 		steps = append(steps,
 			step{name: "plugin-typecheck", command: []string{"npm", "run", "typecheck"}, versionArgs: []string{"--version"}, dir: "paseo-plugin", optional: true, onlyOS: "linux"},
 			step{name: "plugin-test", command: []string{"npm", "test"}, versionArgs: []string{"--version"}, dir: "paseo-plugin", optional: true, onlyOS: "linux"},
+			step{name: "opencode-typecheck", command: []string{"npm", "run", "typecheck"}, versionArgs: []string{"--version"}, dir: "plugins/opencode", optional: true, onlyOS: "linux"},
+			step{name: "opencode-test", command: []string{"npm", "test"}, versionArgs: []string{"--version"}, dir: "plugins/opencode", optional: true, onlyOS: "linux"},
 		)
 	}
 	for i := range steps {

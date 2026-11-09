@@ -40,6 +40,8 @@ func (d *doctorReport) fail(format string, args ...any) {
 func runDoctor(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath, "config file")
+	opencodePlugin := fs.String("opencode-plugin", "", "check only OpenCode using this installed plugin directory (read-only)")
+	opencodeService := fs.String("opencode-service", "codex", "Codex service for the OpenCode check")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,6 +54,13 @@ func runDoctor(args []string, stdout io.Writer) error {
 	d.ok("config %s (subswapper %s)", *configPath, subswapper.Version())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if *opencodePlugin != "" {
+		doctorOpenCode(ctx, d, *cfg, *opencodePlugin, *opencodeService)
+		if d.failures > 0 {
+			return fmt.Errorf("doctor found %d problem(s)", d.failures)
+		}
+		return nil
+	}
 	state, err := subswapper.LoadState(cfg.StatePath)
 	if err != nil {
 		d.fail("state %s: %v", cfg.StatePath, err)
@@ -135,7 +144,7 @@ func doctorLocalService(d *doctorReport, cfg subswapper.Config, state *subswappe
 			secret, err := subswapper.LoadOrCreateClaudeProxySecret(cfg, service.Name)
 			credential, reachable = secret, err == nil && subswapper.ClaudeProxyReachable(service, secret)
 		} else {
-			placeholder, err := subswapper.LoadOrCreateCodexProxyPlaceholder(cfg, service.Name)
+			placeholder, err := subswapper.LoadExistingCodexProxyPlaceholder(cfg, service.Name)
 			credential, reachable = placeholder.Token, err == nil && subswapper.CodexProxyReachable(service, placeholder)
 		}
 		if reachable {

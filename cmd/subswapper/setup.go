@@ -17,7 +17,7 @@ import (
 
 func runSetup(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: subswapper setup local | setup hub [-enroll] | setup client <hub address>")
+		return errors.New("usage: subswapper setup local | setup hub [-enroll] | setup client <hub address> | setup opencode -plugin <directory>")
 	}
 	switch args[0] {
 	case "local":
@@ -26,8 +26,10 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		return runSetupHub(args[1:], true, stdout, stderr)
 	case "client":
 		return runSetupClient(args[1:], stdout, stderr)
+	case "opencode":
+		return runSetupOpenCode(args[1:], stdout)
 	default:
-		return errors.New("usage: subswapper setup local | setup hub [-enroll] | setup client <hub address>")
+		return errors.New("usage: subswapper setup local | setup hub [-enroll] | setup client <hub address> | setup opencode -plugin <directory>")
 	}
 }
 

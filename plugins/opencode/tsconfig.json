@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2024", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noEmit": true, "skipLibCheck": true, "allowImportingTsExtensions": true,
+    "types": ["node"], "lib": ["ES2024", "DOM", "DOM.Iterable"]
+  },
+  "include": ["*.ts"]
+}

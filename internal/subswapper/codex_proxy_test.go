@@ -377,7 +377,7 @@ func readAllString(r *http.Request) (string, error) {
 	}
 }
 
-func TestCodexProxyRelaysUsageLimitWithoutRetrying(t *testing.T) {
+func TestCodexProxyRetriesUsageLimitBeforeSendingBytes(t *testing.T) {
 	log := &codexCallLog{}
 	// Exhaustion is meaningful only before the window resets.
 	resetAt := time.Now().Add(24 * time.Hour).Unix()
@@ -405,10 +405,10 @@ func TestCodexProxyRelaysUsageLimitWithoutRetrying(t *testing.T) {
 	cfg, proxy := setupCodexProxyAccounts(t, upstream.URL)
 
 	recorder := codexProxyRequest(t, proxy, proxy.placeholder.Token, `{"model":"gpt"}`)
-	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "usage_limit_reached") {
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"type":"message"}` {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if responses := log.responses(); len(responses) != 1 || responses[0].Authorization != "Bearer chatgpt-token-a" {
+	if responses := log.responses(); len(responses) != 2 || responses[0].Authorization != "Bearer chatgpt-token-a" || responses[1].Authorization != "Bearer chatgpt-token-b" || responses[0].Body != responses[1].Body {
 		t.Fatalf("upstream responses calls = %#v", responses)
 	}
 	state, err := LoadState(cfg.StatePath)
@@ -416,8 +416,8 @@ func TestCodexProxyRelaysUsageLimitWithoutRetrying(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := state.Service("codex")
-	if service.ActiveAccount != "a" || !service.LastSwitchedAt.IsZero() {
-		t.Fatalf("a usage limit changed the route: %#v", service)
+	if service.ActiveAccount != "b" || service.LastSwitchedAt.IsZero() {
+		t.Fatalf("a quota fallback did not select b: %#v", service)
 	}
 	if usage := service.Accounts["a"].ProxyUsage; !usage.Exhausted() || usage.Weekly.ResetsAt.Unix() != resetAt {
 		t.Fatalf("account a usage = %#v", usage)
