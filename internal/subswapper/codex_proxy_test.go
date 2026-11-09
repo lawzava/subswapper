@@ -1,8 +1,12 @@
 package subswapper
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +17,143 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCodexProxyWebSocketSelectedIdentityAndDuplex(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == codexProxyUsagePath {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer chatgpt-token-a" || codexAccountHeader(r) != "acct-a" || r.URL.RequestURI() != "/backend-api/codex/responses?test=1" {
+			t.Error("WebSocket route did not use the selected identity and original path")
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nready")
+		_ = rw.Flush()
+		data := make([]byte, 4)
+		if _, err := io.ReadFull(rw, data); err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = conn.Write(data)
+	}))
+	t.Cleanup(upstream.Close)
+	_, proxy := setupCodexProxyAccounts(t, upstream.URL)
+	server := httptest.NewServer(proxy)
+	t.Cleanup(server.Close)
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = fmt.Fprintf(conn, "GET /backend-api/codex/responses?test=1 HTTP/1.1\r\nHost: synthetic\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer %s\r\n\r\n", proxy.placeholder.Token)
+	rw := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(rw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d", resp.StatusCode)
+	}
+	data := make([]byte, 5)
+	if _, err := io.ReadFull(rw, data); err != nil || string(data) != "ready" {
+		t.Fatalf("initial duplex bytes = %q, %v", data, err)
+	}
+	_, _ = conn.Write([]byte("ping"))
+	if _, err := io.ReadFull(rw, data[:4]); err != nil || string(data[:4]) != "ping" {
+		t.Fatalf("echo = %q, %v", data[:4], err)
+	}
+}
+
+func TestCodexProxyServeCancelClosesWebSocket(t *testing.T) {
+	upstreamDone := make(chan error, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == codexProxyUsagePath {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstreamDone <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nready")
+		_ = rw.Flush()
+		_, err = rw.ReadByte()
+		upstreamDone <- err
+	}))
+	t.Cleanup(upstream.Close)
+	_, proxy := setupCodexProxyAccounts(t, upstream.URL)
+	proxy.service.ProxyListen = freeLoopbackAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	var serveErr error
+	go func() { serveErr = proxy.Serve(ctx); close(serveDone) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-serveDone:
+		case <-time.After(5 * time.Second):
+			t.Error("synthetic proxy did not stop during cleanup")
+		}
+	})
+
+	var conn net.Conn
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		conn, err = net.DialTimeout("tcp", proxy.service.ProxyListen, 100*time.Millisecond)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("synthetic proxy never became reachable")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "GET /backend-api/codex/responses HTTP/1.1\r\nHost: synthetic\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer %s\r\n\r\n", proxy.placeholder.Token); err != nil {
+		t.Fatal("synthetic upgrade request could not be sent")
+	}
+	rw := bufio.NewReader(conn)
+	response, err := http.ReadResponse(rw, nil)
+	if err != nil || response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatal("synthetic WebSocket upgrade failed")
+	}
+	ready := make([]byte, 5)
+	if _, err := io.ReadFull(rw, ready); err != nil || string(ready) != "ready" {
+		t.Fatal("synthetic upstream did not establish the tunnel")
+	}
+	cancel()
+	select {
+	case <-serveDone:
+		if serveErr != nil {
+			t.Fatal("synthetic proxy returned a shutdown error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after cancellation")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := rw.ReadByte(); err != io.EOF {
+		t.Fatal("Serve cancellation must close the client tunnel without waiting for a read deadline")
+	}
+	select {
+	case err := <-upstreamDone:
+		if err != io.EOF {
+			t.Fatal("Serve cancellation must close the upstream tunnel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream WebSocket handler did not return after Serve cancellation")
+	}
+}
 
 func codexProxyTestConfig(dir, upstreamURL string) Config {
 	cfg := Config{
@@ -297,7 +438,8 @@ func TestCodexProxySwapsIdentityAndPassesAnonymousCallsThrough(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	recorder = httptest.NewRecorder()
 	proxy.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusNotImplemented {
+	// A backend that does not upgrade can still return an ordinary HTTP reply.
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("websocket status = %d", recorder.Code)
 	}
 }

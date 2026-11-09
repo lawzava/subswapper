@@ -385,9 +385,20 @@ func NewCodexProxy(cfg Config, serviceName string, logf func(format string, args
 }
 
 // Serve listens on proxy_listen, and on hub_listen when set, until ctx is
-// cancelled. Streaming responses get a short grace period before shutdown.
+// cancelled. HTTP streams get a short grace period; WebSockets close on cancel.
 func (p *CodexProxy) Serve(ctx context.Context) error {
-	return serveProxy(ctx, p, proxyListenAddresses(p.service)...)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			// Shutdown does not close hijacked connections. Link only upgrade
+			// requests so ordinary HTTP streams keep their shutdown grace period.
+			requestCtx, cancel := context.WithCancel(r.Context())
+			stop := context.AfterFunc(ctx, cancel)
+			defer func() { stop(); cancel() }()
+			r = r.WithContext(requestCtx)
+		}
+		p.ServeHTTP(w, r)
+	})
+	return serveProxy(ctx, handler, proxyListenAddresses(p.service)...)
 }
 
 func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -427,9 +438,10 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		writeClaudeProxyError(w, http.StatusNotImplemented, "invalid_request_error",
-			"subswapper codex proxy relays HTTP only; proxied launches set supports_websockets=false")
-		return
+		if r.Method != http.MethodGet {
+			writeClaudeProxyError(w, http.StatusBadRequest, "invalid_request_error", "WebSocket upgrades require GET")
+			return
+		}
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, claudeProxyRequestBodyLimit+1))
 	if err != nil {
@@ -514,6 +526,10 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.relayWorkspaceDiscovery(w, resp, route)
 			return
 		}
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			p.relayWebSocket(w, r, resp)
+			return
+		}
 		relayClaudeProxyResponse(w, resp)
 		return
 	}
@@ -546,6 +562,10 @@ func (p *CodexProxy) forward(r *http.Request, route codexProxyRoute, body []byte
 	req.Header.Del("Authorization")
 	req.Header.Del(codexProxyAccountHeader)
 	req.Header.Set("Authorization", "Bearer "+route.Token)
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+	}
 	if route.AccountID != "" {
 		req.Header.Set(codexProxyAccountHeader, route.AccountID)
 	}
@@ -555,6 +575,57 @@ func (p *CodexProxy) forward(r *http.Request, route codexProxyRoute, body []byte
 	}
 	req.Host = p.upstream.Host
 	return p.client.Do(req)
+}
+
+// A successful upgrade pins this socket to the account selected at handshake.
+// Never replay frames or switch accounts after the upstream accepted it.
+func (p *CodexProxy) relayWebSocket(w http.ResponseWriter, r *http.Request, resp *http.Response) {
+	defer func() { _ = resp.Body.Close() }()
+	backend, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
+		writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "invalid upstream WebSocket upgrade")
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeClaudeProxyError(w, http.StatusBadGateway, "api_error", "WebSocket transport unavailable")
+		return
+	}
+	client, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer func() { _ = client.Close() }()
+	headers := cloneClaudeProxyHeaders(resp.Header)
+	headers.Del("Authorization")
+	headers.Del(codexProxyAccountHeader)
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Upgrade", "websocket")
+	if _, err := buffered.WriteString("HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
+		return
+	}
+	if err := headers.Write(buffered); err != nil {
+		return
+	}
+	if _, err := buffered.WriteString("\r\n"); err != nil {
+		return
+	}
+	if err := buffered.Flush(); err != nil {
+		return
+	}
+	done := make(chan struct{}, 2)
+	var copies sync.WaitGroup
+	copies.Add(2)
+	go func() { defer copies.Done(); _, _ = io.Copy(backend, buffered); done <- struct{}{} }()
+	go func() { defer copies.Done(); _, _ = io.Copy(client, backend); done <- struct{}{} }()
+	select {
+	case <-done:
+	case <-r.Context().Done():
+	}
+	_ = client.Close()
+	_ = backend.Close()
+	// Both copy loops must exit before this handler returns.
+	copies.Wait()
 }
 
 // relayWorkspaceDiscovery presents the routed account's workspace as the
