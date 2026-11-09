@@ -31,7 +31,9 @@ uses `github.com/creack/pty`, `golang.org/x/term`, and indirectly `golang.org/x/
    The full tier matches CI's OS split: coverage and race tests run on Linux
    and macOS; lint, vulnerability checks, Windows cross-compilation and the
    Paseo plugin checks run on Linux. Install the plugin dependencies first
-   with `npm ci --no-audit --no-fund` in `paseo-plugin/`. Missing
+   with `npm ci --no-audit --no-fund` in `paseo-plugin/` and
+   `npm ci --ignore-scripts --no-audit --no-fund` in `plugins/opencode/`
+   (Node 24 or newer). Missing
    `golangci-lint`, `govulncheck` or `npm` prints `SKIPPED` locally; CI uses
    `-ci` to make missing tools fatal. CI pins golangci-lint v2.12.2 and
    govulncheck v1.5.0. The gate runs all selected steps, then fails if any

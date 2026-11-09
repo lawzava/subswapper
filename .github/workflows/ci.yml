@@ -46,5 +46,8 @@ jobs:
       - name: install
         working-directory: paseo-plugin
         run: npm ci --no-audit --no-fund
+      - name: install OpenCode plugin dependencies
+        working-directory: plugins/opencode
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: full plugin gate
         run: go run ./internal/tools/check -tier=full -scope=plugin -ci

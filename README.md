@@ -23,6 +23,8 @@ Tailscale.
 - **Hub across machines**: accounts live on one machine, only that machine
   refreshes tokens, and every client's API traffic leaves from its network.
 - **Paseo plugin**: usage in every workspace header and one-click switching.
+- **OpenCode plugin**: built-in `openai` models through the Codex HTTP proxy,
+  without direct OpenCode ChatGPT OAuth. See [setup and limits](plugins/opencode/README.md).
 - **Safe by design**: cross-process locking, `0600` credentials under `0700`
   directories, atomic writes, and launches that fail closed when a hub is down.
 
@@ -99,7 +101,9 @@ on Linux). Flags may follow positional arguments.
 | `setup local` | Configure the Claude and Codex proxies and install the systemd user services for one machine. `-no-service` writes the config only. |
 | `setup hub [-enroll] [-tailscale-ip IP]` | Like `setup local`, and also serve the proxies on this machine's Tailscale IP. `-enroll` lets any tailnet member join with `setup client`. |
 | `setup client <hub>` | Use a hub's accounts from this machine. Needs `-enroll` on the hub; otherwise use `hub export` and `hub import`. |
+| `setup opencode -plugin <absolute directory>` | Print a standalone OpenCode 2.2.6 server config snippet with canonical `plugins` objects. Read-only; preserve existing entries when adding it. |
 | `doctor` | Check the config, proxies, hub connection, Codex placeholder, accounts, monitor, and Paseo providers. Prints a fix for each problem. |
+| `doctor -opencode-plugin <absolute directory>` | Run only read-only OpenCode package, route, placeholder, authenticated proxy, and cached selected-account checks. |
 | `add claude\|codex <name> [-email label] [-device] [-paste]` | Sign in and register an account, or replace an existing account's login. `-device` uses Codex device-code sign-in for machines without a browser. `-paste` skips `claude setup-token` and asks for a token you already have. |
 | `remove claude\|codex <name> [-force] [-delete-home]` | Unregister an account and delete its Claude setup token. `-force` removes the selected account. |
 | `switch claude\|codex\|all [name\|auto]` | Select an account; `auto` (the default) picks the best one. |
@@ -218,6 +222,13 @@ and `home proxy-auth -service codex` repairs it.
 
 When a 429 names `usage_limit_reached` or `rate_limit_reached`, the proxy reads
 that account's reset time from `wham/usage` and ranks it last until then.
+`usage_not_included` is also a quota rejection. For Codex only, these quota
+responses retry the same buffered request with the next usable account before
+sending any client response bytes. Each account is attempted at most once.
+A 401 retains the existing rejected-token fallback and backoff. Other 429s
+remain transient throttles and reach the client unchanged, including the full
+body. Exhausting the route list returns the final rejection unchanged.
+Claude's no-quota-replay policy above does not change.
 
 ### Hub
 

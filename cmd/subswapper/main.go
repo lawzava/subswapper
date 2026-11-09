@@ -1113,6 +1113,7 @@ Codex, and your machines. All commands accept -config <path>.
 
 Set up:
   subswapper setup local                 one machine
+  subswapper setup opencode -plugin DIR  print a read-only OpenCode config snippet
   subswapper setup hub [-enroll]         this machine holds the accounts for others
   subswapper setup client <hub>          use a hub's accounts from this machine
   subswapper doctor                      check the setup and print fixes

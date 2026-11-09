@@ -394,7 +394,7 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if serveHubBundle(w, r, p.cfg, p.service) {
 		return
 	}
-	if r.Header.Get("Authorization") == "" {
+	if r.Header.Get("Authorization") == "" && r.URL.Path != codexProxyReadinessPath {
 		// Codex sends some backend calls (plugin MCP, connectivity) without
 		// credentials. They carry no identity to swap, so relay them as-is.
 		p.passThrough(w, r)
@@ -405,7 +405,22 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == claudeProxyHealthPath {
-		writeProxyHealth(w, p.service)
+		writeHubJSON(w, struct {
+			HubHealthInfo
+			Proxy        string   `json:"proxy"`
+			Capabilities []string `json:"capabilities"`
+		}{HubHealthInfo{Service: p.service.Name, Version: Version()}, "subswapper", []string{codexProxyReadinessCapability}})
+		return
+	}
+	if r.URL.Path == codexProxyReadinessPath {
+		if r.Method != http.MethodGet {
+			writeClaudeProxyError(w, http.StatusMethodNotAllowed, "invalid_request_error", "readiness accepts GET only")
+			return
+		}
+		writeHubJSON(w, struct {
+			Service string `json:"service"`
+			Ready   bool   `json:"selected_ready"`
+		}{p.service.Name, codexSelectedReady(p.cfg, p.service)})
 		return
 	}
 	if serveHubStatus(w, r, p.cfg) || serveHubManagement(w, r, p.cfg, p.service, nil) {
@@ -436,9 +451,12 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same policy as the Claude proxy: only a rejected token moves the
-	// request to the next account, and a rate limit is relayed unchanged.
+	// Each route is attempted at most once, before writing any client bytes.
+	// Only Codex quota rejections and rejected tokens permit replay.
 	for index, route := range routes {
+		if r.Context().Err() != nil {
+			return
+		}
 		resp, err := p.forward(r, route, body)
 		if err != nil {
 			if r.Context().Err() != nil {
@@ -452,12 +470,16 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rejected := resp.StatusCode == http.StatusTooManyRequests
 		quotaRejected := false
 		if rejected {
-			errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, codexProxyErrorBodyLimit))
-			_ = resp.Body.Close()
-			resp.Body = io.NopCloser(bytes.NewReader(errorBody))
-			quotaRejected = codexQuotaRejected(errorBody)
+			errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, codexProxyErrorBodyLimit))
+			// Classify a bounded prefix, but relay the complete original body
+			// for a transient throttle or the final rejected account.
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(errorBody), resp.Body), resp.Body}
+			quotaRejected = readErr == nil && codexQuotaRejected(errorBody)
 		}
-		retry := unauthorized && index < len(routes)-1
+		retry := (unauthorized || quotaRejected) && index < len(routes)-1
 		// Only a fallback that served the request takes over the route. The
 		// route that was selected at dispatch must not reclaim it, or a long
 		// response would undo a switch made while it streamed.
@@ -473,8 +495,12 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := recordCodexProxyObservation(p.cfg, p.service, route, usage, unauthorized, switchTo); err != nil {
 			p.logf("codex proxy: record state for %s: %v", route.Account, err)
 		}
+		if r.Context().Err() != nil {
+			_ = resp.Body.Close()
+			return
+		}
 		if retry {
-			p.logf("codex proxy: token rejected for %s; retrying with %s", route.Account, routes[index+1].Account)
+			p.logf("codex proxy: account rejected (%d) for %s; retrying with %s", resp.StatusCode, route.Account, routes[index+1].Account)
 			_ = resp.Body.Close()
 			continue
 		}

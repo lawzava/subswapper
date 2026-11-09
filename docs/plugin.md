@@ -1,5 +1,9 @@
 # Optional Claude Code and Codex CLI plugin
 
+For built-in OpenCode `openai` models, use the separate
+[OpenCode server plugin](../plugins/opencode/README.md). The CLI plugin below
+does not change OpenCode provider routing.
+
 The Subswapper plugin routes separate Claude Code and Codex processes, including
 same-provider probes, through account-aware launchers. Its shared skill retains
 the name `cross-provider` for compatibility. Use `subswapper delegate` for bounded

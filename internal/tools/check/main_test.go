@@ -45,10 +45,10 @@ func TestStepSelection(t *testing.T) {
 	}{
 		{"fast Linux", "fast", "all", "linux", []string{"gofmt", "vet", "test"}},
 		{"fast macOS", "fast", "go", "darwin", []string{"gofmt", "vet", "test"}},
-		{"full Linux", "full", "all", "linux", []string{"gofmt", "vet", "coverage", "race", "lint", "vuln", "windows", "plugin-typecheck", "plugin-test"}},
+		{"full Linux", "full", "all", "linux", []string{"gofmt", "vet", "coverage", "race", "lint", "vuln", "windows", "plugin-typecheck", "plugin-test", "opencode-typecheck", "opencode-test"}},
 		{"full macOS", "full", "all", "darwin", []string{"gofmt", "vet", "coverage", "race"}},
 		{"CI Go Linux", "full", "go", "linux", []string{"gofmt", "vet", "coverage", "race", "lint", "vuln", "windows"}},
-		{"CI plugin", "full", "plugin", "linux", []string{"plugin-typecheck", "plugin-test"}},
+		{"CI plugin", "full", "plugin", "linux", []string{"plugin-typecheck", "plugin-test", "opencode-typecheck", "opencode-test"}},
 		{"CI plugin macOS", "full", "plugin", "darwin", nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,6 +74,7 @@ func TestFullCommands(t *testing.T) {
 		{"go", "test", "-race", "-count=1", "./..."},
 		{"golangci-lint", "run"}, {"govulncheck", "./..."},
 		{"go", "build", "./..."}, {"npm", "run", "typecheck"}, {"npm", "test"},
+		{"npm", "run", "typecheck"}, {"npm", "test"},
 	}
 	for i, s := range steps {
 		if !reflect.DeepEqual(s.command, want[i]) {
@@ -94,7 +95,10 @@ func TestFullCommands(t *testing.T) {
 		if !reflect.DeepEqual(s.versionArgs, versionArgs) {
 			t.Errorf("%s version arguments = %v, want %v", s.name, s.versionArgs, versionArgs)
 		}
-		if i >= 7 && s.dir != "paseo-plugin" {
+		if i >= 7 && i < 9 && s.dir != "paseo-plugin" {
+			t.Errorf("%s directory = %q", s.name, s.dir)
+		}
+		if i >= 9 && s.dir != "plugins/opencode" {
 			t.Errorf("%s directory = %q", s.name, s.dir)
 		}
 	}
@@ -157,12 +161,12 @@ func TestOSExclusions(t *testing.T) {
 	if err := runSteps(steps, false, &out); err == nil {
 		t.Error("an OS-excluded-only selection must fail without running tools")
 	}
-	for _, name := range []string{"lint", "vuln", "windows", "plugin-typecheck", "plugin-test"} {
+	for _, name := range []string{"lint", "vuln", "windows", "plugin-typecheck", "plugin-test", "opencode-typecheck", "opencode-test"} {
 		if text := "NOT RUN " + name + " (linux-only)"; !strings.Contains(out.String(), text) {
 			t.Errorf("missing %q in %q", text, out.String())
 		}
 	}
-	if !strings.Contains(out.String(), "ran=0 passed=0 failed=0 skipped=0 not-run=5") {
+	if !strings.Contains(out.String(), "ran=0 passed=0 failed=0 skipped=0 not-run=7") {
 		t.Errorf("unexpected summary: %s", out.String())
 	}
 }
