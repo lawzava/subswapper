@@ -214,6 +214,30 @@ func TestToolVersionFailure(t *testing.T) {
 	}
 }
 
+func TestRunStepsIsolatesInheritedSubswapperEnvironment(t *testing.T) {
+	for key, value := range map[string]string{
+		"SUBSWAPPER_CODEX_PLACEHOLDER": "/synthetic/inherited-placeholder.json",
+		"SUBSWAPPER_CODEX_PROXY_URL":   "http://127.0.0.1:1",
+		"SUBSWAPPER_ARBITRARY":         "synthetic-inherited-value",
+		"SUBSWAPPER_LIVE_TEST":         "1",
+		"CHECK_TEST_RETAIN":            "synthetic-retained-value",
+	} {
+		t.Setenv(key, value)
+	}
+	s := processStep(t, "isolated environment", "environment")
+	s.env = append(s.env, "SUBSWAPPER_TEST_FIXTURE=synthetic-explicit-value")
+	s.versionArgs = []string{"-test.run=^TestStepProcess$"}
+	var out bytes.Buffer
+	err := runSteps([]step{s}, false, &out)
+	// Never include captured child output or inherited values in diagnostics.
+	if err != nil {
+		t.Fatal("child environment was not isolated")
+	}
+	if strings.Count(out.String(), "synthetic environment isolated\n") != 2 {
+		t.Fatal("both version and check processes must use the isolated environment")
+	}
+}
+
 func TestStepProcess(t *testing.T) {
 	switch os.Getenv("CHECK_TEST_PROCESS") {
 	case "pass":
@@ -225,6 +249,17 @@ func TestStepProcess(t *testing.T) {
 		os.Exit(1)
 	case "args":
 		_, _ = os.Stdout.WriteString(strings.Join(os.Args[1:], " ") + "\n")
+		os.Exit(0)
+	case "environment":
+		for _, entry := range os.Environ() {
+			if strings.HasPrefix(entry, "SUBSWAPPER_") && entry != "SUBSWAPPER_TEST_FIXTURE=synthetic-explicit-value" {
+				os.Exit(1)
+			}
+		}
+		if os.Getenv("SUBSWAPPER_TEST_FIXTURE") != "synthetic-explicit-value" || os.Getenv("CHECK_TEST_RETAIN") != "synthetic-retained-value" {
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.WriteString("synthetic environment isolated\n")
 		os.Exit(0)
 	}
 }

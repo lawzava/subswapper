@@ -129,6 +129,22 @@ func TestDoctorOpenCodeIsReadOnlyAndChecksPackagePlaceholderHealthReadiness(t *t
 	check("selected account", false)
 	ready.Store(true)
 	check("selected account ready", true)
+	check("HTTP only, summary compaction", true)
+	if err := os.WriteFile(filepath.Join(plugin, "package.json"), []byte(`{"name":"subswapper-opencode","version":"0.2.0","dependencies":{"@opencode/plugin":"2.2.6"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugin, "catalog.ts"), []byte("export {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("plugin version 0.2.0 present", true)
+	check("HTTP/WebSocket bridge, native compaction", true)
+	if err := os.Remove(filepath.Join(plugin, "catalog.ts")); err != nil {
+		t.Fatal(err)
+	}
+	check("plugin version", false)
+	if err := os.WriteFile(filepath.Join(plugin, "catalog.ts"), []byte("export {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(filepath.Join(plugin, "private-group.ts")); err != nil {
 		t.Fatal(err)
 	}
