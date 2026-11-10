@@ -617,7 +617,7 @@ func TestParseClaudeRateLimitHeaders(t *testing.T) {
 	}
 }
 
-func TestClaudeProxyUsageMakesSetupTokenAccountsSelectableWithoutProbes(t *testing.T) {
+func TestClaudeProxyUsageKeepsSetupTokenAccountsSelectableWhenProbeUnavailable(t *testing.T) {
 	cfg, account := setupTokenUsageAccount(t)
 	selectProxyTestAccount(t, cfg, account)
 	server := setupTokenUsageServer(t, http.StatusForbidden, `{"error":"missing user:profile"}`)
@@ -641,7 +641,7 @@ func TestClaudeProxyUsageMakesSetupTokenAccountsSelectableWithoutProbes(t *testi
 	}
 
 	status := collectSetupTokenAccount(t, cfg, account)
-	if !status.Selectable || status.Reason != "ready" {
+	if !status.Selectable || status.Reason != "ready (stale Claude proxy usage; setup-token usage unavailable)" {
 		t.Fatalf("status = %#v", status)
 	}
 	// The five-hour window has reset since the sample; only the weekly counts.
@@ -654,7 +654,7 @@ func TestClaudeProxyUsageMakesSetupTokenAccountsSelectableWithoutProbes(t *testi
 
 	// A second cycle inside the backoff keeps routing on the proxy sample.
 	status = collectSetupTokenAccount(t, cfg, account)
-	if !status.Selectable {
+	if !status.Selectable || status.Reason != "ready (stale Claude proxy usage; setup-token usage unavailable)" {
 		t.Fatalf("backoff status = %#v", status)
 	}
 
@@ -907,7 +907,7 @@ func TestClaudeProxyUsageWithoutFiveHourWindowIsSelectable(t *testing.T) {
 	}
 
 	status := collectSetupTokenAccount(t, cfg, account)
-	if !status.Selectable || status.Reason != "ready" || status.Score != 0.35 {
+	if !status.Selectable || status.Reason != "ready (stale Claude proxy usage; setup-token usage unavailable)" || status.Score != 0.35 {
 		t.Fatalf("status = %#v", status)
 	}
 }

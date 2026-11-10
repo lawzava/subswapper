@@ -322,10 +322,15 @@ Codex can store logins in an OS keyring; subswapper manages file logins only.
 
 ## Usage probes
 
-**Claude** setup-token accounts get their usage from the proxy's rate-limit
-headers. Without the proxy, subswapper probes the OAuth usage endpoint and
-falls back to Claude's status-line data captured at launch; neither refreshes
-or exchanges a setup token.
+**Claude** setup-token accounts get usage from the proxy's rate-limit headers
+and GET requests to the OAuth usage endpoint. An unselected account's proxy
+sample skips the request only while it is less than five minutes old. After
+that, the monitor attempts a refresh at each normal interval, subject to
+failure backoff. Setup tokens without `user:profile` scope can return 403, so
+these attempts cannot guarantee fresh metadata. If the endpoint is unavailable,
+subswapper can keep routing on the last proxy sample, with its original update
+time and a stale-usage warning, or use fresh status-line data captured at launch.
+Usage probes never refresh or exchange a setup token and never make model calls.
 
 **Codex** usage is read through `codex app-server` in the account's own home,
 so the official credential refresh stays in that home. Plans that expose only

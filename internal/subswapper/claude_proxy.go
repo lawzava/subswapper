@@ -682,9 +682,11 @@ func claudeProxyKnownUsage(account AccountState, revision string) (UsageSnapshot
 	return UsageSnapshot{}, false
 }
 
-// trustedClaudeProxyUsage has no age limit: an unused account's windows can
-// only fall, LimitWindow.Ratio zeroes a window once its reset passes, and the
-// proxy re-verifies on the first real response.
+// trustedClaudeProxyUsage has no routing age limit: LimitWindow.Ratio zeroes
+// a window once its reset passes, and the proxy re-verifies on the first real
+// response. This fallback does not imply freshness: the monitor separately
+// bounds how long an observation may suppress a metadata probe, because other
+// clients can consume the same account's quota.
 func trustedClaudeProxyUsage(usage UsageSnapshot, revision string) bool {
 	return usage.Source == claudeUsageSourceProxy &&
 		usage.TokenRevision != "" && usage.TokenRevision == revision &&
