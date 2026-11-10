@@ -30,22 +30,20 @@ func collectClaudeSetupTokenAccount(ctx context.Context, cfg Config, serviceStat
 		status.Reason = "setup token changed during usage probe"
 		return
 	}
-	if !status.Active && trustedClaudeSetupTokenUsage(status.Account.Usage, now, tokenStatus.Revision) &&
+	// Cached usage must not revive a rejected token, even if its observation
+	// is fresh. Once the rejection backoff expires, authenticate again.
+	if status.Account.CredentialsError != "" && now.Before(status.Account.FetchBackoffUntil) {
+		status.Reason = status.Account.CredentialsError
+		return
+	}
+	if status.Account.CredentialsError == "" && !status.Active && trustedClaudeSetupTokenUsage(status.Account.Usage, now, tokenStatus.Revision) &&
 		(status.Account.Usage.Source == claudeUsageSourceSetupTokenDirect ||
 			status.Account.Usage.Source == claudeUsageSourceCommand || status.Account.LastProbeError != "") {
 		markClaudeSetupTokenSelectable(status)
 		return
 	}
-	if !status.Active && adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision) {
-		return
-	}
-
 	if now.Before(status.Account.FetchBackoffUntil) {
-		if status.Account.CredentialsError != "" {
-			status.Reason = status.Account.CredentialsError
-			return
-		}
-		if adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision) {
+		if adoptClaudeProxyUsage(serviceState, status, now, tokenStatus.Revision) {
 			return
 		}
 		if trustedClaudeStatusLineUsage(status.Account.Usage, now, tokenStatus.Revision) {
@@ -55,6 +53,13 @@ func collectClaudeSetupTokenAccount(ctx context.Context, cfg Config, serviceStat
 		status.Account.Usage = UsageSnapshot{}
 		serviceState.Accounts[status.Account.Name] = status.Account
 		status.Reason = "usage unavailable"
+		return
+	}
+	// Routing can keep an old proxy sample, but only a recent observation
+	// may suppress the metadata probe for an inactive account.
+	if status.Account.CredentialsError == "" && !status.Active &&
+		freshClaudeProxyUsage(status.Account.ProxyUsage, now, tokenStatus.Revision) {
+		adoptClaudeProxyUsage(serviceState, status, now, tokenStatus.Revision)
 		return
 	}
 
@@ -110,7 +115,7 @@ func collectClaudeSetupTokenAccount(ctx context.Context, cfg Config, serviceStat
 		status.Account.FetchBackoffUntil = now.Add(transientProbeBackoff(cfg.Monitor.Interval.Duration))
 		status.Account.CredentialsError = ""
 		status.Account.LastProbeError = "setup-token usage unavailable; using Claude proxy data"
-		adoptClaudeProxyUsage(serviceState, status, tokenStatus.Revision)
+		adoptClaudeProxyUsage(serviceState, status, now, tokenStatus.Revision)
 		return
 	}
 	// A status-line sample is trusted only while it is fresh and bound to the
@@ -145,15 +150,23 @@ func trustedClaudeStatusLineUsage(usage UsageSnapshot, now time.Time, tokenRevis
 	return usage.Source == claudeUsageSourceStatusLine && trustedClaudeSetupTokenUsage(usage, now, tokenRevision)
 }
 
+func freshClaudeProxyUsage(usage UsageSnapshot, now time.Time, tokenRevision string) bool {
+	return trustedClaudeProxyUsage(usage, tokenRevision) &&
+		!usage.ObservedAt.After(now) && now.Sub(usage.ObservedAt) < inactiveUsageTTL
+}
+
 // adoptClaudeProxyUsage routes on the proxy's last observed sample. The copy
 // into Usage is only for display and scoring; ProxyUsage stays authoritative.
-func adoptClaudeProxyUsage(serviceState *ServiceState, status *AccountStatus, tokenRevision string) bool {
+func adoptClaudeProxyUsage(serviceState *ServiceState, status *AccountStatus, now time.Time, tokenRevision string) bool {
 	if !trustedClaudeProxyUsage(status.Account.ProxyUsage, tokenRevision) {
 		return false
 	}
 	status.Account.Usage = status.Account.ProxyUsage
 	serviceState.Accounts[status.Account.Name] = status.Account
 	markClaudeSetupTokenSelectable(status)
+	if !freshClaudeProxyUsage(status.Account.ProxyUsage, now, tokenRevision) {
+		status.Reason += " (stale Claude proxy usage; setup-token usage unavailable)"
+	}
 	return true
 }
 

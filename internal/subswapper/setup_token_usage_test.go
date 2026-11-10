@@ -29,6 +29,287 @@ func TestClaudeSetupTokenDirectUsageIsSelectable(t *testing.T) {
 	}
 }
 
+func TestClaudeSetupTokenInactiveProxyUsageRefresh(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		age      time.Duration
+		invalid  bool
+		wantGETs int
+	}{
+		{name: "fresh", age: time.Minute},
+		{name: "TTL reached", age: inactiveUsageTTL, wantGETs: 1},
+		{name: "seven days old", age: 7 * 24 * time.Hour, wantGETs: 1},
+		{name: "future", age: -time.Hour, wantGETs: 1},
+		{name: "wrong revision", age: time.Minute, invalid: true, wantGETs: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, name := setupTokenUsageAccount(t)
+			upstream := newProxyUpstream(t)
+			upstream.respond("setup-token-work", setupTokenMetadataResponse(t, http.StatusOK))
+			useClaudeUsageServer(t, upstream.server.URL+"/api/oauth/usage")
+			state, err := LoadState(cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account := state.Service("claude").Accounts[name]
+			account.ProxyUsage = setupTokenProxySample(account.SetupTokenRevision, time.Now().UTC().Add(-test.age))
+			if test.invalid {
+				account.ProxyUsage.TokenRevision = "previous-token"
+			}
+			state.Service("claude").Accounts[name] = account
+			if err := SaveState(cfg.StatePath, state); err != nil {
+				t.Fatal(err)
+			}
+
+			status := collectSetupTokenAccount(t, cfg, name)
+			if calls := upstream.recorded(); len(calls) != test.wantGETs {
+				t.Fatalf("metadata GETs = %d, want %d", len(calls), test.wantGETs)
+			}
+			if !status.Selectable || status.Reason != "ready" {
+				t.Fatalf("selectable = %v, reason = %q", status.Selectable, status.Reason)
+			}
+			if test.wantGETs == 1 {
+				if status.Account.Usage.Source != claudeUsageSourceSetupTokenDirect ||
+					*status.Account.Usage.Weekly.Pct != 34 ||
+					(test.age >= 0 && !status.Account.Usage.ObservedAt.After(account.ProxyUsage.ObservedAt)) {
+					t.Fatalf("usage was not refreshed: %#v", status.Account.Usage)
+				}
+			} else if !status.Account.Usage.ObservedAt.Equal(account.ProxyUsage.ObservedAt) {
+				t.Fatal("cached observation timestamp changed")
+			}
+		})
+	}
+}
+
+func TestClaudeSetupTokenInactiveDirectAndCommandCacheStillSkipsProbe(t *testing.T) {
+	for _, source := range []string{claudeUsageSourceSetupTokenDirect, claudeUsageSourceCommand} {
+		t.Run(source, func(t *testing.T) {
+			cfg, name := setupTokenUsageAccount(t)
+			upstream := newProxyUpstream(t)
+			upstream.respond("setup-token-work", setupTokenMetadataResponse(t, http.StatusUnauthorized))
+			useClaudeUsageServer(t, upstream.server.URL+"/api/oauth/usage")
+			state, err := LoadState(cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account := state.Service("claude").Accounts[name]
+			account.Usage = setupTokenProxySample(account.SetupTokenRevision, time.Now().UTC().Add(-time.Minute))
+			account.Usage.Source = source
+			account.ProxyUsage = setupTokenProxySample(account.SetupTokenRevision, time.Now().UTC().Add(-time.Hour))
+			state.Service("claude").Accounts[name] = account
+			if err := SaveState(cfg.StatePath, state); err != nil {
+				t.Fatal(err)
+			}
+			status := collectSetupTokenAccount(t, cfg, name)
+			if !status.Selectable || status.Reason != "ready" || status.Account.Usage.Source != source ||
+				!status.Account.Usage.ObservedAt.Equal(account.Usage.ObservedAt) {
+				t.Fatalf("cached %s usage was not retained", source)
+			}
+			if calls := upstream.recorded(); len(calls) != 0 {
+				t.Fatalf("fresh %s cache made %d metadata GETs", source, len(calls))
+			}
+		})
+	}
+}
+
+func TestClaudeSetupTokenStaleProxyFallbackRetriesAfterBackoff(t *testing.T) {
+	cfg, name := setupTokenUsageAccount(t)
+	upstream := newProxyUpstream(t)
+	upstream.respond("setup-token-work", setupTokenMetadataResponse(t, http.StatusForbidden))
+	useClaudeUsageServer(t, upstream.server.URL+"/api/oauth/usage")
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := state.Service("claude").Accounts[name]
+	observed := time.Now().UTC().Add(-7 * 24 * time.Hour)
+	account.ProxyUsage = setupTokenProxySample(account.SetupTokenRevision, observed)
+	state.Service("claude").Accounts[name] = account
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	for cycleNumber := 0; cycleNumber < 3; cycleNumber++ {
+		if cycleNumber == 2 {
+			state, err = LoadState(cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account = state.Service("claude").Accounts[name]
+			account.FetchBackoffUntil = time.Now().UTC().Add(-time.Second)
+			state.Service("claude").Accounts[name] = account
+			if err := SaveState(cfg.StatePath, state); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cycle := MonitorOnce(context.Background(), cfg, false)
+		if len(cycle.Errors) != 0 || len(cycle.Results) != 1 || len(cycle.Results[0].Accounts) != 1 {
+			t.Fatalf("cycle = %#v", cycle)
+		}
+		status := cycle.Results[0].Accounts[0]
+		if !status.Selectable || status.Reason != "ready (stale Claude proxy usage; setup-token usage unavailable)" ||
+			!status.Account.Usage.ObservedAt.Equal(observed) || !status.Account.ProxyUsage.ObservedAt.Equal(observed) {
+			t.Fatalf("cycle %d: selectable=%v reason=%q observed=%v", cycleNumber, status.Selectable, status.Reason, status.Account.Usage.ObservedAt)
+		}
+		if remaining := time.Until(status.Account.FetchBackoffUntil); remaining <= 0 || remaining > cfg.Monitor.Interval.Duration {
+			t.Fatalf("backoff = %v", remaining)
+		}
+		wantGETs := 1
+		if cycleNumber == 2 {
+			wantGETs = 2
+		}
+		if calls := upstream.recorded(); len(calls) != wantGETs {
+			t.Fatalf("cycle %d: metadata GETs = %d, want %d", cycleNumber, len(calls), wantGETs)
+		}
+	}
+}
+
+func TestClaudeSetupTokenProxyCacheCannotHideAuthenticationRejection(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		source   string
+		age      time.Duration
+		rejected bool
+		backoff  time.Duration
+		wantGETs int
+	}{
+		{name: "stale proxy GET rejects", source: claudeUsageSourceProxy, age: time.Hour, wantGETs: 1},
+		{name: "stale proxy rejection backoff", source: claudeUsageSourceProxy, age: time.Hour, rejected: true, backoff: time.Hour},
+		{name: "fresh proxy rejection backoff", source: claudeUsageSourceProxy, age: time.Minute, rejected: true, backoff: time.Hour},
+		{name: "fresh direct rejection backoff", source: claudeUsageSourceSetupTokenDirect, age: time.Minute, rejected: true, backoff: time.Hour},
+		{name: "fresh command rejection backoff", source: claudeUsageSourceCommand, age: time.Minute, rejected: true, backoff: time.Hour},
+		{name: "fresh proxy rejection retry", source: claudeUsageSourceProxy, age: time.Minute, rejected: true, backoff: -time.Second, wantGETs: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, name := setupTokenUsageAccount(t)
+			upstream := newProxyUpstream(t)
+			upstream.respond("setup-token-work", setupTokenMetadataResponse(t, http.StatusUnauthorized))
+			useClaudeUsageServer(t, upstream.server.URL+"/api/oauth/usage")
+			state, err := LoadState(cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account := state.Service("claude").Accounts[name]
+			account.ProxyUsage = setupTokenProxySample(account.SetupTokenRevision, time.Now().UTC().Add(-test.age))
+			account.Usage = account.ProxyUsage
+			account.Usage.Source = test.source
+			if test.rejected {
+				account.CredentialsError = "setup token authentication rejected"
+				account.FetchBackoffUntil = time.Now().UTC().Add(test.backoff)
+			}
+			state.Service("claude").Accounts[name] = account
+			if err := SaveState(cfg.StatePath, state); err != nil {
+				t.Fatal(err)
+			}
+			status := collectSetupTokenAccount(t, cfg, name)
+			if status.Selectable || status.Reason != "setup token authentication rejected" {
+				t.Fatalf("selectable=%v reason=%q", status.Selectable, status.Reason)
+			}
+			if calls := upstream.recorded(); len(calls) != test.wantGETs {
+				t.Fatalf("metadata GETs = %d, want %d", len(calls), test.wantGETs)
+			}
+			if test.wantGETs != 0 && status.Account.Usage.HasAnyLimit() {
+				t.Fatal("401 retained selectable usage")
+			}
+		})
+	}
+}
+
+func TestClaudeSetupTokenMonitorRefreshesAllAccountsWithoutSwitchOrRotation(t *testing.T) {
+	upstream := newProxyUpstream(t)
+	cfg, _ := setupProxyAccounts(t, upstream.server.URL)
+	registerSetupTokenTestAccount(t, cfg, "c")
+	if _, err := ReplaceClaudeSetupToken(context.Background(), cfg, "claude", "c", "setup-token-c", nil); err != nil {
+		t.Fatal(err)
+	}
+	useClaudeUsageServer(t, upstream.server.URL+"/api/oauth/usage")
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions := make(map[string]string)
+	for _, name := range []string{"a", "b", "c"} {
+		upstream.respond("setup-token-"+name, setupTokenMetadataResponse(t, http.StatusOK))
+		account := state.Service("claude").Accounts[name]
+		revisions[name] = account.SetupTokenRevision
+		account.ProxyUsage = setupTokenProxySample(account.SetupTokenRevision, time.Now().UTC().Add(-7*24*time.Hour))
+		state.Service("claude").Accounts[name] = account
+	}
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	// Keep a selected account exhausted while alternatives have headroom, so
+	// an accidental automatic switch would be observable.
+	upstream.respond("setup-token-a", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.RequestURI() != "/api/oauth/usage" {
+			t.Errorf("unexpected metadata request: %s %s", r.Method, r.URL.RequestURI())
+		}
+		_, _ = w.Write([]byte(`{"seven_day":{"utilization":100,"resets_at":"2030-01-02T00:00:00Z"}}`))
+	})
+	cycle := MonitorOnce(context.Background(), cfg, false)
+	if len(cycle.Errors) != 0 || len(cycle.Switches) != 0 {
+		t.Fatalf("errors=%v switches=%v", cycle.Errors, cycle.Switches)
+	}
+	calls := upstream.recorded()
+	if len(calls) != 3 {
+		t.Fatalf("metadata GETs = %d, want 3", len(calls))
+	}
+	for i, name := range []string{"a", "b", "c"} {
+		if calls[i].Authorization != "Bearer setup-token-"+name || calls[i].Path != "/api/oauth/usage" || calls[i].Body != "" {
+			t.Fatalf("account %s did not make its metadata-only GET", name)
+		}
+	}
+	after, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Service("claude").ActiveAccount != "a" || !after.Service("claude").LastSwitchedAt.Equal(state.Service("claude").LastSwitchedAt) {
+		t.Fatal("monitor with auto-switch disabled changed selection")
+	}
+	for name, revision := range revisions {
+		account := after.Service("claude").Accounts[name]
+		token, tokenStatus, err := LoadClaudeSetupTokenWithStatus(cfg, "claude", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if account.SetupTokenRevision != revision || tokenStatus.Revision != revision || token != "setup-token-"+name {
+			t.Fatalf("account %s token or revision changed", name)
+		}
+		wantPct := 34.0
+		if name == "a" {
+			wantPct = 100
+		}
+		if account.Usage.Source != claudeUsageSourceSetupTokenDirect || *account.Usage.Weekly.Pct != wantPct {
+			t.Fatalf("account %s was not refreshed", name)
+		}
+	}
+}
+
+func setupTokenProxySample(revision string, observed time.Time) UsageSnapshot {
+	return UsageSnapshot{
+		Weekly:        LimitWindow{Pct: PtrFloat64(35), ResetsAt: time.Now().UTC().Add(24 * time.Hour)},
+		ObservedAt:    observed,
+		Source:        claudeUsageSourceProxy,
+		TokenRevision: revision,
+	}
+}
+
+func setupTokenMetadataResponse(t *testing.T, status int) func(http.ResponseWriter, *http.Request) {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.RequestURI() != "/api/oauth/usage" || r.ContentLength > 0 {
+			t.Errorf("unexpected metadata request: %s %s length=%d", r.Method, r.URL.RequestURI(), r.ContentLength)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			_, _ = w.Write([]byte(`{"seven_day":{"utilization":34,"resets_at":"2030-01-02T00:00:00Z"}}`))
+		} else {
+			_, _ = w.Write([]byte(`{"error":"private provider detail must not appear in status"}`))
+		}
+	}
+}
+
 func TestClaudeSetupTokenUsageFallsBackOnlyToFreshStatusLineData(t *testing.T) {
 	for _, test := range []struct {
 		name       string
