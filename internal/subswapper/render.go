@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt time.Time) string {
+// RenderStatus prints the status table. staleAfter marks selectable accounts
+// whose usage sample automatic selection ranks after fresh ones.
+func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt time.Time, staleAfter time.Duration) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "subswapper status %s\n\n", observedAt.Format(time.RFC3339))
 	fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n", "SERVICE", "ACCOUNT", "SELECTED", "5H", "WEEKLY", "FABLE5", "SCORE", "UPDATED", "STATE")
@@ -29,6 +31,10 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 			if account.Selectable {
 				score = fmt.Sprintf("%.0f%%", account.Score*100)
 			}
+			state := account.Reason
+			if account.Selectable && StaleUsage(account.Account.Usage, staleAfter, observedAt) {
+				state += " (stale usage; ranked after fresh accounts on the same side of the switch threshold)"
+			}
 			fmt.Fprintf(&b, "%-10s %-24s %-8s %-28s %-28s %-28s %-8s %-8s %s\n",
 				account.Service,
 				account.Account.Name,
@@ -38,7 +44,7 @@ func RenderStatus(results []ServiceStatus, switches []SwitchEvent, observedAt ti
 				formatWindow(account.Account.Usage.FableWeekly),
 				score,
 				formatAge(account.Account.Usage.ObservedAt, observedAt),
-				account.Reason,
+				state,
 			)
 		}
 	}

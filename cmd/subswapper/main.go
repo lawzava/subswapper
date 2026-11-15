@@ -708,7 +708,7 @@ func runStatus(args []string, stdout io.Writer) error {
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(subswapper.BuildStatusReport(cycle.Results, time.Now().UTC()))
 	}
-	if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now())); err != nil {
+	if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, nil, time.Now(), cfg.Monitor.StaleUsageAfterDuration())); err != nil {
 		return err
 	}
 	for _, note := range notes {
@@ -1043,7 +1043,7 @@ func runMonitorLoop(
 		cycle := runCycle(cycleCtx, cfg, autoSwitch)
 		cancelCycle()
 		if once || verbose {
-			if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, cycle.Switches, time.Now())); err != nil {
+			if _, err := io.WriteString(stdout, subswapper.RenderStatus(cycle.Results, cycle.Switches, time.Now(), cfg.Monitor.StaleUsageAfterDuration())); err != nil {
 				return err
 			}
 		} else {

@@ -339,7 +339,7 @@ func TestLoadStateSanitizesLegacyProbeErrors(t *testing.T) {
 			Account: account,
 			Reason:  account.LastProbeError,
 		}},
-	}}, nil, time.Now())
+	}}, nil, time.Now(), defaultStaleUsageAfter)
 	if strings.Contains(rendered, "opaque-") || strings.Contains(rendered, "\x1b") {
 		t.Fatalf("legacy provider detail reached status output: %q", rendered)
 	}

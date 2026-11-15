@@ -32,6 +32,10 @@ type MonitorConfig struct {
 	// It does not delay escaping an exhausted or broken active account.
 	// Default 30m.
 	Cooldown *Duration `json:"cooldown,omitempty"`
+	// StaleUsageAfter is the usage-sample age at which automatic selection
+	// ranks an account after every account with a fresher sample. A stale
+	// account stays eligible. Default 3h.
+	StaleUsageAfter *Duration `json:"stale_usage_after,omitempty"`
 	// Warmup is ignored. The warm-up feature was removed; the key is still
 	// accepted so configs written by older versions keep loading.
 	Warmup *bool `json:"warmup,omitempty"`
@@ -153,6 +157,9 @@ func (c Config) Validate() error {
 	}
 	if d := c.Monitor.Cooldown; d != nil && d.Duration < 0 {
 		return errors.New("monitor.cooldown must be non-negative")
+	}
+	if d := c.Monitor.StaleUsageAfter; d != nil && d.Duration <= 0 {
+		return errors.New("monitor.stale_usage_after must be a positive duration, e.g. \"3h\"")
 	}
 	seen := map[string]struct{}{}
 	for _, service := range c.Services {
@@ -325,6 +332,13 @@ func (m MonitorConfig) CooldownDuration() time.Duration {
 		return defaultAutoSwitchCooldown
 	}
 	return m.Cooldown.Duration
+}
+
+func (m MonitorConfig) StaleUsageAfterDuration() time.Duration {
+	if m.StaleUsageAfter == nil {
+		return defaultStaleUsageAfter
+	}
+	return m.StaleUsageAfter.Duration
 }
 
 func (d *Duration) UnmarshalJSON(data []byte) error {

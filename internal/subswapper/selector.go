@@ -7,8 +7,13 @@ import (
 )
 
 // BestAccount picks the selectable account that should serve next under
-// compareDrainOrder.
-func BestAccount(accounts []AccountStatus, threshold float64) (AccountStatus, bool) {
+// compareDrainOrder, with one extra rule: within the below-threshold group,
+// and within the at-or-above group, an account whose usage sample is at
+// least staleAfter old ranks after every fresh one. An idle account's old
+// reading can hide use by other clients. Staleness never moves an account
+// across the threshold split, so a fresh hot account still yields to a stale
+// cool one, and a stale account stays eligible.
+func BestAccount(accounts []AccountStatus, threshold float64, staleAfter time.Duration, now time.Time) (AccountStatus, bool) {
 	candidates := make([]AccountStatus, 0, len(accounts))
 	for _, account := range accounts {
 		if account.Selectable {
@@ -18,9 +23,9 @@ func BestAccount(accounts []AccountStatus, threshold float64) (AccountStatus, bo
 	if len(candidates) == 0 {
 		return AccountStatus{}, false
 	}
-	now := time.Now()
+	stale := func(usage UsageSnapshot) bool { return StaleUsage(usage, staleAfter, now) }
 	slices.SortStableFunc(candidates, func(left, right AccountStatus) int {
-		if order := compareDrainOrder(left.Account.Usage, right.Account.Usage, threshold, now); order != 0 {
+		if order := drainOrder(left.Account.Usage, right.Account.Usage, threshold, now, stale); order != 0 {
 			return order
 		}
 		return cmp.Compare(left.Account.Name, right.Account.Name)
@@ -28,13 +33,28 @@ func BestAccount(accounts []AccountStatus, threshold float64) (AccountStatus, bo
 	return candidates[0], true
 }
 
+// StaleUsage reports whether a usage sample is too old to rank with fresh
+// ones. A sample without an observation time, or dated after now (a clock
+// correction leaves its age unknown), counts as stale.
+func StaleUsage(usage UsageSnapshot, staleAfter time.Duration, now time.Time) bool {
+	return usage.ObservedAt.IsZero() || usage.ObservedAt.After(now) || now.Sub(usage.ObservedAt) >= staleAfter
+}
+
 // compareDrainOrder orders accounts by which should serve next. Weekly quota
 // left unused at a reset is lost, so among accounts below the switch
 // threshold the one whose weekly window resets first goes first, and an
 // account with no running weekly window goes last because waiting costs it
 // nothing. Accounts at or above the threshold follow, least used first.
-// Accounts without usage data come last.
+// Accounts without usage data come last. The proxies route on this order
+// without a staleness split.
 func compareDrainOrder(left, right UsageSnapshot, threshold float64, now time.Time) int {
+	return drainOrder(left, right, threshold, now, nil)
+}
+
+// drainOrder is compareDrainOrder with an optional staleness split. When
+// stale is not nil, a fresh sample ranks before a stale one after the
+// known-limits and threshold splits and before every finer ordering.
+func drainOrder(left, right UsageSnapshot, threshold float64, now time.Time, stale func(UsageSnapshot) bool) int {
 	if leftKnown, rightKnown := left.HasAnyLimit(), right.HasAnyLimit(); leftKnown != rightKnown {
 		if leftKnown {
 			return -1
@@ -47,6 +67,14 @@ func compareDrainOrder(left, right UsageSnapshot, threshold float64, now time.Ti
 			return 1
 		}
 		return -1
+	}
+	if stale != nil {
+		if leftStale, rightStale := stale(left), stale(right); leftStale != rightStale {
+			if leftStale {
+				return 1
+			}
+			return -1
+		}
 	}
 	if !leftHot {
 		if order := compareWeeklyExpiry(left, right, now); order != 0 {
