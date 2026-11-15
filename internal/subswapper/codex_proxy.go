@@ -527,7 +527,7 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if resp.StatusCode == http.StatusSwitchingProtocols {
-			p.relayWebSocket(w, r, resp)
+			p.relayWebSocket(w, r, resp, route)
 			return
 		}
 		relayClaudeProxyResponse(w, resp)
@@ -565,6 +565,10 @@ func (p *CodexProxy) forward(r *http.Request, route codexProxyRoute, body []byte
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		req.Header.Set("Connection", "Upgrade")
 		req.Header.Set("Upgrade", "websocket")
+		// Codex offers permessage-deflate. Without an offer upstream sends
+		// plain frames, which relayWebSocket can read for in-socket quota
+		// and auth errors. The client accepts an answer without extensions.
+		req.Header.Del("Sec-WebSocket-Extensions")
 	}
 	if route.AccountID != "" {
 		req.Header.Set(codexProxyAccountHeader, route.AccountID)
@@ -578,8 +582,10 @@ func (p *CodexProxy) forward(r *http.Request, route codexProxyRoute, body []byte
 }
 
 // A successful upgrade pins this socket to the account selected at handshake.
-// Never replay frames or switch accounts after the upstream accepted it.
-func (p *CodexProxy) relayWebSocket(w http.ResponseWriter, r *http.Request, resp *http.Response) {
+// Never replay frames or switch accounts after the upstream accepted it. A
+// quota or auth error frame from upstream is relayed, recorded against route
+// and then closes the socket, so the client's reconnect routes elsewhere.
+func (p *CodexProxy) relayWebSocket(w http.ResponseWriter, r *http.Request, resp *http.Response, route codexProxyRoute) {
 	defer func() { _ = resp.Body.Close() }()
 	backend, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
@@ -617,7 +623,32 @@ func (p *CodexProxy) relayWebSocket(w http.ResponseWriter, r *http.Request, resp
 	var copies sync.WaitGroup
 	copies.Add(2)
 	go func() { defer copies.Done(); _, _ = io.Copy(backend, buffered); done <- struct{}{} }()
-	go func() { defer copies.Done(); _, _ = io.Copy(client, backend); done <- struct{}{} }()
+	// forward() withdrew the compression offer; if upstream still answers
+	// with an extension, frames may be compressed and are not inspected.
+	inspect := resp.Header.Get("Sec-WebSocket-Extensions") == ""
+	go func() {
+		defer copies.Done()
+		if !inspect {
+			_, _ = io.Copy(client, backend)
+			done <- struct{}{}
+			return
+		}
+		verdict, _ := relayCodexServerFrames(client, backend)
+		if verdict.kind == codexSocketAccepted {
+			done <- struct{}{}
+			return
+		}
+		// The error frame is already with the client. Record before closing
+		// so the reconnect that the close triggers ranks this account last.
+		p.recordCodexSocketRejection(route, verdict)
+		_, _ = client.Write(codexSocketCloseFrame(codexSocketCloseTryAgainLater, "subswapper: account unavailable, reconnect"))
+		done <- struct{}{}
+		if verdict.kind == codexSocketQuota {
+			// The handler waits for this goroutine; shutdown must not cancel
+			// the bounded usage fetch that replaces the provisional marker.
+			p.refineCodexSocketQuota(context.WithoutCancel(r.Context()), route, verdict)
+		}
+	}()
 	select {
 	case <-done:
 	case <-r.Context().Done():
@@ -918,6 +949,13 @@ func (p *CodexProxy) refreshUsageIfStale(route codexProxyRoute) {
 // recordCodexProxyObservation stores what one real response revealed about an
 // account. switchTo makes the account the selected route after a rejected token.
 func recordCodexProxyObservation(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo bool) error {
+	return recordCodexProxyState(cfg, service, route, usage, unauthorized, switchTo, false)
+}
+
+// recordCodexProxyState is recordCodexProxyObservation with fenceProbe, which
+// stamps the probe clock with a stored usage sample so a monitor probe that
+// started before it cannot override it on merge.
+func recordCodexProxyState(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo, fenceProbe bool) error {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return err
@@ -936,6 +974,9 @@ func recordCodexProxyObservation(cfg Config, service ServiceConfig, route codexP
 	changed := false
 	if usage != nil {
 		account.ProxyUsage = *usage
+		if fenceProbe {
+			account.LastProbeStartedAt = now
+		}
 		changed = true
 	}
 	if unauthorized {
