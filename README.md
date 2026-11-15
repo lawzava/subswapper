@@ -268,7 +268,9 @@ The proxies use the same order for fallback routes.
 
 The monitor and `switch <service> auto` also check the age of each usage
 reading. A reading older than `monitor.stale_usage_after` (default
-**3 hours**), or one with no update time or a future one, is stale: an idle account's old
+**3 hours**), or one with no update time or one dated more than 5 minutes in
+the future (more than normal clock skew between a hub and its clients), is
+stale: an idle account's old
 reading can miss use by other clients. Among accounts below the switch
 threshold, every account with a fresh reading ranks before every account with
 a stale one, and the order above applies within each part. Accounts at or

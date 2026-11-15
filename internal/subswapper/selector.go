@@ -33,11 +33,17 @@ func BestAccount(accounts []AccountStatus, threshold float64, staleAfter time.Du
 	return candidates[0], true
 }
 
+// staleUsageClockSkew is how far in the future a usage sample may be dated
+// and still count as fresh. Hub clients render status with their own clock
+// while the hub stamped the sample, so a few seconds of skew is normal.
+const staleUsageClockSkew = 5 * time.Minute
+
 // StaleUsage reports whether a usage sample is too old to rank with fresh
-// ones. A sample without an observation time, or dated after now (a clock
-// correction leaves its age unknown), counts as stale.
+// ones. A sample without an observation time, or dated more than
+// staleUsageClockSkew after now (a clock correction leaves its age unknown),
+// counts as stale.
 func StaleUsage(usage UsageSnapshot, staleAfter time.Duration, now time.Time) bool {
-	return usage.ObservedAt.IsZero() || usage.ObservedAt.After(now) || now.Sub(usage.ObservedAt) >= staleAfter
+	return usage.ObservedAt.IsZero() || usage.ObservedAt.After(now.Add(staleUsageClockSkew)) || now.Sub(usage.ObservedAt) >= staleAfter
 }
 
 // compareDrainOrder orders accounts by which should serve next. Weekly quota

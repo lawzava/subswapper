@@ -233,12 +233,24 @@ func TestStaleUsageTreatsMissingObservationAsStale(t *testing.T) {
 	}
 }
 
+func TestStaleUsageToleratesSmallClockSkew(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	// A hub client renders status with its own clock while the hub stamped
+	// the sample; a client running a few seconds behind sees it slightly in
+	// the future. That sample is fresh.
+	for _, ahead := range []time.Duration{time.Second, 11 * time.Second, staleUsageClockSkew} {
+		if StaleUsage(UsageSnapshot{ObservedAt: now.Add(ahead)}, defaultStaleUsageAfter, now) {
+			t.Fatalf("a sample %s ahead of now must count as fresh", ahead)
+		}
+	}
+}
+
 func TestStaleUsageTreatsFutureObservationAsStale(t *testing.T) {
 	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 	// A clock correction can leave a sample dated after now; its age is
 	// unknown, so it must not outrank a genuinely fresh reading.
-	if !StaleUsage(UsageSnapshot{ObservedAt: now.Add(time.Minute)}, defaultStaleUsageAfter, now) {
-		t.Fatal("a sample observed in the future must count as stale")
+	if !StaleUsage(UsageSnapshot{ObservedAt: now.Add(staleUsageClockSkew + time.Second)}, defaultStaleUsageAfter, now) {
+		t.Fatal("a sample observed beyond the clock-skew allowance in the future must count as stale")
 	}
 	future := observedStatusForTest("future", 20, now.Add(24*time.Hour), now.Add(time.Hour))
 	fresh := observedStatusForTest("fresh", 20, now.Add(72*time.Hour), now.Add(-time.Minute))
