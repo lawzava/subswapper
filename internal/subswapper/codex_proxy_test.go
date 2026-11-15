@@ -2,7 +2,9 @@ package subswapper
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -804,4 +806,631 @@ func TestCodexProxyKeepsMonitorSwitchMadeDuringRequest(t *testing.T) {
 	if service := state.Service("codex"); service.ActiveAccount != "b" {
 		t.Fatalf("a finished request reverted the monitor's switch: active = %q", service.ActiveAccount)
 	}
+}
+
+// codexSocketFrame encodes one WebSocket frame. A non-nil mask masks the
+// payload, which servers must not do but the relay tolerates.
+func codexSocketFrame(fin bool, opcode byte, payload []byte, mask []byte) []byte {
+	first := opcode
+	if fin {
+		first |= 0x80
+	}
+	frame := []byte{first}
+	maskBit := byte(0)
+	if mask != nil {
+		maskBit = 0x80
+	}
+	switch {
+	case len(payload) < 126:
+		frame = append(frame, maskBit|byte(len(payload)))
+	case len(payload) <= 0xffff:
+		frame = append(frame, maskBit|126)
+		frame = binary.BigEndian.AppendUint16(frame, uint16(len(payload)))
+	default:
+		frame = append(frame, maskBit|127)
+		frame = binary.BigEndian.AppendUint64(frame, uint64(len(payload)))
+	}
+	if mask == nil {
+		return append(frame, payload...)
+	}
+	frame = append(frame, mask...)
+	for index, value := range payload {
+		frame = append(frame, value^mask[index%4])
+	}
+	return frame
+}
+
+func codexSocketText(payload string) []byte {
+	return codexSocketFrame(true, 0x1, []byte(payload), nil)
+}
+
+type codexSocketHandshake struct {
+	Token      string
+	Extensions string
+}
+
+// codexSocketUpstream is a synthetic ChatGPT backend. Each handshake gets
+// frames[token]; afterwards every 4 bytes from the client are answered with
+// a "pong" text frame, which proves the socket is still open.
+type codexSocketUpstream struct {
+	frames     map[string][][]byte
+	usage      func(token string) (int, string)
+	extensions string
+	// beforeFrames runs after the 101 and before frames[token] are sent.
+	beforeFrames func(token string)
+
+	mu         sync.Mutex
+	handshakes []codexSocketHandshake
+}
+
+func (u *codexSocketUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if r.URL.Path == codexProxyUsagePath {
+		status, body := http.StatusInternalServerError, `{"error":"synthetic"}`
+		if u.usage != nil {
+			status, body = u.usage(token)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+		return
+	}
+	u.mu.Lock()
+	u.handshakes = append(u.handshakes, codexSocketHandshake{token, r.Header.Get("Sec-WebSocket-Extensions")})
+	u.mu.Unlock()
+	conn, rw, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n")
+	if u.extensions != "" {
+		_, _ = rw.WriteString("Sec-WebSocket-Extensions: " + u.extensions + "\r\n")
+	}
+	_, _ = rw.WriteString("\r\n")
+	_ = rw.Flush()
+	if u.beforeFrames != nil {
+		u.beforeFrames(token)
+	}
+	for _, frame := range u.frames[token] {
+		// Separate flushes exercise frames that arrive in pieces.
+		_, _ = rw.Write(frame)
+		_ = rw.Flush()
+	}
+	probe := make([]byte, 4)
+	for {
+		if _, err := io.ReadFull(rw, probe); err != nil {
+			return
+		}
+		_, _ = rw.Write(codexSocketText("pong"))
+		_ = rw.Flush()
+	}
+}
+
+func (u *codexSocketUpstream) seen() []codexSocketHandshake {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]codexSocketHandshake(nil), u.handshakes...)
+}
+
+// startCodexSocketProxy serves proxy over HTTP. wait blocks until every
+// proxy handler, including its post-close usage refresh, has returned.
+func startCodexSocketProxy(t *testing.T, upstream *codexSocketUpstream) (cfg Config, addr string, wait func()) {
+	t.Helper()
+	harness := startCodexSocketHarness(t, upstream, nil)
+	return harness.cfg, harness.addr, func() {
+		if !harness.handlersDone(10 * time.Second) {
+			t.Error("proxy WebSocket handler did not return")
+		}
+	}
+}
+
+type codexSocketHarness struct {
+	cfg          Config
+	addr         string
+	proxy        *CodexProxy
+	handlersDone func(timeout time.Duration) bool
+}
+
+// startCodexSocketHarness seeds fresh usage for a and b, lets adjust change
+// that seed, and serves the proxy. handlersDone reports whether every proxy
+// handler returned within timeout.
+func startCodexSocketHarness(t *testing.T, upstream *codexSocketUpstream, adjust func(*ServiceState)) codexSocketHarness {
+	t.Helper()
+	backend := httptest.NewServer(upstream)
+	t.Cleanup(backend.Close)
+	cfg, proxy := setupCodexProxyAccounts(t, backend.URL)
+	// Fresh usage for both accounts keeps the background refresh quiet, so
+	// only the in-socket handling can write usage.
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, name := range []string{"a", "b"} {
+		account := state.Service("codex").Accounts[name]
+		account.ProxyUsage = UsageSnapshot{
+			ObservedAt: now,
+			Source:     claudeUsageSourceProxy,
+			Weekly:     LimitWindow{Pct: PtrFloat64(10), ResetsAt: now.Add(72 * time.Hour)},
+		}
+		state.Service("codex").Accounts[name] = account
+	}
+	if adjust != nil {
+		adjust(state.Service("codex"))
+	}
+	if err := SaveState(cfg.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	var handlers sync.WaitGroup
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.Add(1)
+		defer handlers.Done()
+		proxy.ServeHTTP(w, r)
+	}))
+	handlersDone := func(timeout time.Duration) bool {
+		finished := make(chan struct{})
+		go func() { handlers.Wait(); close(finished) }()
+		select {
+		case <-finished:
+			return true
+		case <-time.After(timeout):
+			return false
+		}
+	}
+	t.Cleanup(func() {
+		server.Close()
+		if !handlersDone(10 * time.Second) {
+			t.Error("proxy WebSocket handler did not return")
+		}
+	})
+	return codexSocketHarness{cfg, strings.TrimPrefix(server.URL, "http://"), proxy, handlersDone}
+}
+
+func dialCodexSocket(t *testing.T, addr, token string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_, _ = fmt.Fprintf(conn, "GET /backend-api/codex/responses HTTP/1.1\r\nHost: synthetic\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: c3Vic3dhcHBlci10ZXN0IQ==\r\n"+
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nAuthorization: Bearer %s\r\n\r\n", token)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d", resp.StatusCode)
+	}
+	return conn, reader
+}
+
+func expectCodexSocketBytes(t *testing.T, reader *bufio.Reader, want []byte) {
+	t.Helper()
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatalf("read relayed frames: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("relayed frames differ from upstream bytes:\n got %q\nwant %q", truncateForTest(got), truncateForTest(want))
+	}
+}
+
+func truncateForTest(data []byte) []byte {
+	if len(data) > 200 {
+		return data[:200]
+	}
+	return data
+}
+
+// expectCodexSocketOpen proves the relay still forwards in both directions.
+func expectCodexSocketOpen(t *testing.T, conn net.Conn, reader *bufio.Reader) {
+	t.Helper()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("socket closed: %v", err)
+	}
+	expectCodexSocketBytes(t, reader, codexSocketText("pong"))
+}
+
+// expectCodexSocketClosed requires a server close frame, then EOF.
+func expectCodexSocketClosed(t *testing.T, conn net.Conn, reader *bufio.Reader) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		t.Fatalf("no close frame: %v", err)
+	}
+	if header[0] != 0x88 || header[1]&0x80 != 0 || header[1] < 2 || header[1] > 125 {
+		t.Fatalf("close frame header = %#x %#x", header[0], header[1])
+	}
+	payload := make([]byte, header[1])
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		t.Fatalf("close payload: %v", err)
+	}
+	if code := binary.BigEndian.Uint16(payload); code != 1013 {
+		t.Fatalf("close code = %d, want 1013", code)
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Fatalf("after close frame: %v, want EOF", err)
+	}
+}
+
+func loadCodexTestAccount(t *testing.T, cfg Config, name string) AccountState {
+	t.Helper()
+	state, err := LoadState(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state.Service("codex").Accounts[name]
+}
+
+// expectCodexSocketFailover opens a second socket and requires it on b.
+func expectCodexSocketFailover(t *testing.T, cfg Config, upstream *codexSocketUpstream, addr, token string) {
+	t.Helper()
+	conn, reader := dialCodexSocket(t, addr, token)
+	expectCodexSocketBytes(t, reader, codexSocketText(`{"type":"response.created"}`))
+	expectCodexSocketOpen(t, conn, reader)
+	handshakes := upstream.seen()
+	if len(handshakes) != 2 || handshakes[0].Token != "chatgpt-token-a" || handshakes[1].Token != "chatgpt-token-b" {
+		t.Fatalf("handshakes = %#v, want a then b", handshakes)
+	}
+	routes, err := codexProxyRoutes(cfg, cfg.Services[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) == 0 || routes[0].Account != "b" {
+		t.Fatalf("route order after rejection = %#v", routes)
+	}
+}
+
+func TestCodexProxyWebSocketQuotaFrameClosesAndFailsOver(t *testing.T) {
+	resetAt := time.Now().Add(36 * time.Hour).Unix()
+	quota := fmt.Sprintf(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","plan_type":"pro","resets_at":%d},"headers":{"x-codex-primary-used-percent":"100.0","x-codex-primary-window-minutes":15}}`, resetAt)
+	aliased := strings.Replace(quota, `"status":429`, `"status_code":429`, 1)
+	split := len(quota) / 2
+	tests := []struct {
+		name   string
+		frames [][]byte
+	}{
+		{"unfragmented", [][]byte{codexSocketText(`{"type":"response.created"}`), codexSocketText(quota)}},
+		{"status_code alias", [][]byte{codexSocketText(aliased)}},
+		{"fragmented with ping", [][]byte{
+			codexSocketFrame(false, 0x1, []byte(quota[:split]), nil),
+			codexSocketFrame(true, 0x9, []byte("keepalive"), nil),
+			codexSocketFrame(true, 0x0, []byte(quota[split:]), nil),
+		}},
+		{"masked", [][]byte{codexSocketFrame(true, 0x1, []byte(quota), []byte{1, 2, 3, 4})}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := &codexSocketUpstream{
+				frames: map[string][][]byte{
+					"chatgpt-token-a": test.frames,
+					"chatgpt-token-b": {codexSocketText(`{"type":"response.created"}`)},
+				},
+				usage: func(token string) (int, string) {
+					if token != "chatgpt-token-a" {
+						return http.StatusInternalServerError, `{}`
+					}
+					return http.StatusOK, fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":%d}}}`, resetAt)
+				},
+			}
+			cfg, addr, wait := startCodexSocketProxy(t, upstream)
+			conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+			expectCodexSocketBytes(t, reader, bytes.Join(test.frames, nil))
+			expectCodexSocketClosed(t, conn, reader)
+			wait()
+			account := loadCodexTestAccount(t, cfg, "a")
+			if usage := account.ProxyUsage; !usage.Exhausted() || usage.Weekly.ResetsAt.Unix() != resetAt || account.LastProbeStartedAt.IsZero() {
+				t.Fatalf("account a after in-socket quota = %#v", account)
+			}
+			expectCodexSocketFailover(t, cfg, upstream, addr, codexProxyTestPlaceholder(t, cfg))
+		})
+	}
+}
+
+func codexProxyTestPlaceholder(t *testing.T, cfg Config) string {
+	t.Helper()
+	placeholder, err := LoadOrCreateCodexProxyPlaceholder(cfg, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return placeholder.Token
+}
+
+func TestCodexProxyWebSocketQuotaWithoutUsageMarksUntilReset(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name     string
+		resetsAt string
+		check    func(UsageSnapshot) bool
+	}{
+		{"short reset", fmt.Sprintf(`,"resets_at":%d`, now.Add(2*time.Hour).Unix()), func(usage UsageSnapshot) bool {
+			return usage.FiveHour.ResetsAt.Unix() == now.Add(2*time.Hour).Unix()
+		}},
+		{"weekly reset", fmt.Sprintf(`,"resets_at":%d`, now.Add(80*time.Hour).Unix()), func(usage UsageSnapshot) bool {
+			return usage.Weekly.ResetsAt.Unix() == now.Add(80*time.Hour).Unix() && usage.FiveHour.Pct == nil
+		}},
+		{"no reset", "", func(usage UsageSnapshot) bool {
+			reset := usage.FiveHour.ResetsAt
+			return reset.After(now) && !reset.After(time.Now().Add(5*time.Minute))
+		}},
+		{"past reset", fmt.Sprintf(`,"resets_at":%d`, now.Add(-time.Hour).Unix()), func(usage UsageSnapshot) bool {
+			reset := usage.FiveHour.ResetsAt
+			return reset.After(now) && !reset.After(time.Now().Add(5*time.Minute))
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := codexSocketText(`{"type":"error","status":429,"error":{"type":"usage_not_included","message":"no"` + test.resetsAt + `}}`)
+			upstream := &codexSocketUpstream{frames: map[string][][]byte{
+				"chatgpt-token-a": {frame},
+				"chatgpt-token-b": {codexSocketText(`{"type":"response.created"}`)},
+			}}
+			cfg, addr, wait := startCodexSocketProxy(t, upstream)
+			conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+			expectCodexSocketBytes(t, reader, frame)
+			expectCodexSocketClosed(t, conn, reader)
+			wait()
+			usage := loadCodexTestAccount(t, cfg, "a").ProxyUsage
+			if !usage.Exhausted() || usage.Source != claudeUsageSourceProxy || !test.check(usage) {
+				t.Fatalf("account a usage after failed fetch = %#v", usage)
+			}
+			expectCodexSocketFailover(t, cfg, upstream, addr, codexProxyTestPlaceholder(t, cfg))
+		})
+	}
+}
+
+func TestCodexProxyWebSocketUnauthorizedFrameClosesAndFailsOver(t *testing.T) {
+	frame := codexSocketText(`{"type":"error","status":401,"error":{"code":"token_revoked","message":"expired"}}`)
+	upstream := &codexSocketUpstream{frames: map[string][][]byte{
+		"chatgpt-token-a": {frame},
+		"chatgpt-token-b": {codexSocketText(`{"type":"response.created"}`)},
+	}}
+	cfg, addr, wait := startCodexSocketProxy(t, upstream)
+	conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+	expectCodexSocketBytes(t, reader, frame)
+	expectCodexSocketClosed(t, conn, reader)
+	wait()
+	if account := loadCodexTestAccount(t, cfg, "a"); account.CredentialsError == "" || !account.FetchBackoffUntil.After(time.Now()) {
+		t.Fatalf("account a after in-socket 401 = %#v", account)
+	}
+	expectCodexSocketFailover(t, cfg, upstream, addr, codexProxyTestPlaceholder(t, cfg))
+}
+
+// expectCodexSocketUnrecorded requires account a to keep its seeded state.
+func expectCodexSocketUnrecorded(t *testing.T, cfg Config) {
+	t.Helper()
+	account := loadCodexTestAccount(t, cfg, "a")
+	if usage := account.ProxyUsage; usage.Weekly.Pct == nil || *usage.Weekly.Pct != 10 || usage.FiveHour.Pct != nil ||
+		account.CredentialsError != "" || !account.LastProbeStartedAt.IsZero() {
+		t.Fatalf("account a changed without a rejection: %#v", account)
+	}
+}
+
+func TestCodexProxyWebSocketRelaysNormalFramesUnchanged(t *testing.T) {
+	large := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", 100<<10) + `"}`
+	// A quota-shaped message over the inspection limit is not classified.
+	largeQuota := `{"type":"error","status":429,"error":{"type":"usage_limit_reached","pad":"` + strings.Repeat("y", 70<<10) + `"}}`
+	binaryPayload := make([]byte, 300)
+	for index := range binaryPayload {
+		binaryPayload[index] = byte(index)
+	}
+	frames := [][]byte{
+		codexSocketText(`{"type":"response.created"}`),
+		codexSocketFrame(true, 0x2, binaryPayload, nil),
+		codexSocketText(large),
+		codexSocketFrame(false, 0x1, []byte(largeQuota[:40<<10]), nil),
+		codexSocketFrame(true, 0xA, nil, nil),
+		codexSocketFrame(true, 0x0, []byte(largeQuota[40<<10:]), nil),
+		codexSocketText(`{"type":"response.completed"}`),
+	}
+	upstream := &codexSocketUpstream{frames: map[string][][]byte{"chatgpt-token-a": frames}}
+	cfg, addr, _ := startCodexSocketProxy(t, upstream)
+	conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+	expectCodexSocketBytes(t, reader, bytes.Join(frames, nil))
+	expectCodexSocketOpen(t, conn, reader)
+	expectCodexSocketUnrecorded(t, cfg)
+}
+
+func TestCodexProxyWebSocketKeepsNonQuotaErrorsOpen(t *testing.T) {
+	frames := [][]byte{
+		codexSocketText(`{"type":"error","status":429,"error":{"type":"rate_limit_exceeded","message":"slow down"}}`),
+		codexSocketText(`{"type":"error","status_code":429,"error":{"code":"websocket_connection_limit_reached","message":"too many sockets"}}`),
+		codexSocketText(`{"type":"error","status":400,"error":{"code":"previous_response_not_found","message":"usage_limit_reached is not the code"}}`),
+		// Codex maps an error frame only when it carries a status.
+		codexSocketText(`{"type":"error","error":{"type":"usage_limit_reached"}}`),
+		// response.failed stays unclassified, as inside an HTTP 200 stream.
+		codexSocketText(`{"type":"response.failed","response":{"error":{"code":"usage_limit_reached"}}}`),
+		codexSocketText(`{"type":"error","status":"429","error":{"type":"usage_limit_reached"}}`),
+		codexSocketText(`not json "error"`),
+	}
+	upstream := &codexSocketUpstream{frames: map[string][][]byte{"chatgpt-token-a": frames}}
+	cfg, addr, _ := startCodexSocketProxy(t, upstream)
+	conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+	expectCodexSocketBytes(t, reader, bytes.Join(frames, nil))
+	expectCodexSocketOpen(t, conn, reader)
+	expectCodexSocketUnrecorded(t, cfg)
+}
+
+func TestCodexProxyWebSocketSkipsInspectionForExtensions(t *testing.T) {
+	quota := codexSocketText(`{"type":"error","status":429,"error":{"type":"usage_limit_reached"}}`)
+	compressed := codexSocketText(`compressed bytes`)
+	compressed[0] |= 0x40
+	tests := []struct {
+		name       string
+		extensions string
+		frames     [][]byte
+	}{
+		{"negotiated extension", "permessage-deflate", [][]byte{quota}},
+		{"rsv1 frame", "", [][]byte{compressed, quota}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := &codexSocketUpstream{extensions: test.extensions, frames: map[string][][]byte{"chatgpt-token-a": test.frames}}
+			cfg, addr, _ := startCodexSocketProxy(t, upstream)
+			conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+			expectCodexSocketBytes(t, reader, bytes.Join(test.frames, nil))
+			expectCodexSocketOpen(t, conn, reader)
+			expectCodexSocketUnrecorded(t, cfg)
+		})
+	}
+}
+
+func TestCodexProxyWebSocketWithdrawsCompressionOffer(t *testing.T) {
+	upstream := &codexSocketUpstream{}
+	cfg, addr, _ := startCodexSocketProxy(t, upstream)
+	conn, reader := dialCodexSocket(t, addr, codexProxyTestPlaceholder(t, cfg))
+	expectCodexSocketOpen(t, conn, reader)
+	if handshakes := upstream.seen(); len(handshakes) != 1 || handshakes[0].Token != "chatgpt-token-a" || handshakes[0].Extensions != "" {
+		t.Fatalf("upstream handshakes = %#v, want no Sec-WebSocket-Extensions", handshakes)
+	}
+}
+
+func TestCodexProxyWebSocketQuotaMarkerSurvivesSlowRefresh(t *testing.T) {
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	frame := codexSocketText(fmt.Sprintf(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_at":%d}}`, resetAt))
+	refreshStarted, releaseRefresh := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	var usageCalls atomic.Int32
+	upstream := &codexSocketUpstream{
+		frames: map[string][][]byte{
+			"chatgpt-token-a": {frame},
+			"chatgpt-token-b": {codexSocketText(`{"type":"response.created"}`)},
+		},
+		usage: func(token string) (int, string) {
+			if token != "chatgpt-token-a" {
+				return http.StatusInternalServerError, `{}`
+			}
+			if usageCalls.Add(1) > 1 {
+				// The refinement after the rejection fails.
+				return http.StatusInternalServerError, `{}`
+			}
+			// The handshake's background refresh reads healthy usage, but
+			// only after the in-socket rejection has been recorded.
+			close(refreshStarted)
+			<-releaseRefresh
+			return http.StatusOK, `{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1788780407}}}`
+		},
+		beforeFrames: func(token string) {
+			if token != "chatgpt-token-a" {
+				return
+			}
+			select {
+			case <-refreshStarted:
+			case <-time.After(5 * time.Second):
+			}
+		},
+	}
+	harness := startCodexSocketHarness(t, upstream, func(service *ServiceState) {
+		// Stale usage makes the handshake start a background refresh.
+		account := service.Accounts["a"]
+		account.ProxyUsage.ObservedAt = time.Now().UTC().Add(-2 * codexProxyUsageTTL)
+		service.Accounts["a"] = account
+	})
+	// Runs before the backend closes, which waits for the held request.
+	t.Cleanup(release)
+	token := codexProxyTestPlaceholder(t, harness.cfg)
+	conn, reader := dialCodexSocket(t, harness.addr, token)
+	expectCodexSocketBytes(t, reader, frame)
+	expectCodexSocketClosed(t, conn, reader)
+	if !harness.handlersDone(10 * time.Second) {
+		t.Fatal("proxy WebSocket handler did not return")
+	}
+	if calls := usageCalls.Load(); calls != 2 {
+		t.Fatalf("usage calls = %d, want the held refresh and the failed refinement", calls)
+	}
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		harness.proxy.usageMu.Lock()
+		pending := len(harness.proxy.usageInFlight)
+		harness.proxy.usageMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if usage := loadCodexTestAccount(t, harness.cfg, "a").ProxyUsage; !usage.Exhausted() || usage.FiveHour.ResetsAt.Unix() != resetAt {
+		t.Fatalf("a refresh that started before the rejection replaced its marker: %#v", usage)
+	}
+	expectCodexSocketFailover(t, harness.cfg, upstream, harness.addr, token)
+}
+
+func TestCodexProxyOlderUsageKeepsNewerTokenRejection(t *testing.T) {
+	cfg, _ := setupCodexProxyAccounts(t, "http://127.0.0.1:1")
+	route := codexProxyRoute{Account: "a"}
+	started := time.Now().UTC().Add(-time.Second)
+	// An in-socket 401 is recorded while a usage fetch that started earlier
+	// is still in flight.
+	if err := recordCodexProxyState(context.Background(), cfg, ServiceConfig{Name: "codex"}, route, nil, true, false, false); err != nil {
+		t.Fatal(err)
+	}
+	healthy := UsageSnapshot{
+		ObservedAt: started,
+		Source:     claudeUsageSourceProxy,
+		Weekly:     LimitWindow{Pct: PtrFloat64(10), ResetsAt: started.Add(72 * time.Hour)},
+	}
+	if err := recordCodexProxyObservation(cfg, ServiceConfig{Name: "codex"}, route, &healthy, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if account := loadCodexTestAccount(t, cfg, "a"); account.CredentialsError == "" || account.FetchBackoffUntil.IsZero() {
+		t.Fatalf("a fetch that started before the token rejection cleared it: %#v", account)
+	}
+	// A fetch that starts after the rejection proves the token works again.
+	healthy.ObservedAt = time.Now().UTC().Add(time.Second)
+	if err := recordCodexProxyObservation(cfg, ServiceConfig{Name: "codex"}, route, &healthy, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if account := loadCodexTestAccount(t, cfg, "a"); account.CredentialsError != "" || !account.FetchBackoffUntil.IsZero() {
+		t.Fatalf("a newer healthy fetch did not clear the token rejection: %#v", account)
+	}
+}
+
+func TestCodexProxyWebSocketRejectionBoundsStateLockWait(t *testing.T) {
+	previous := codexSocketRejectionWindow
+	codexSocketRejectionWindow = 300 * time.Millisecond
+	// Registered first, so it runs after the harness waited for handlers.
+	t.Cleanup(func() { codexSocketRejectionWindow = previous })
+	frame := codexSocketText(`{"type":"error","status":429,"error":{"type":"usage_limit_reached"}}`)
+	send := make(chan struct{})
+	var sendOnce sync.Once
+	upstream := &codexSocketUpstream{
+		frames: map[string][][]byte{"chatgpt-token-a": {frame}},
+		beforeFrames: func(string) {
+			select {
+			case <-send:
+			case <-time.After(10 * time.Second):
+			}
+		},
+	}
+	harness := startCodexSocketHarness(t, upstream, nil)
+	t.Cleanup(func() { sendOnce.Do(func() { close(send) }) })
+	// The placeholder load takes the state lock, so dial before holding it.
+	conn, reader := dialCodexSocket(t, harness.addr, codexProxyTestPlaceholder(t, harness.cfg))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	lock, err := AcquireStateLock(ctx, harness.cfg)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(lock.Release) }
+	// Runs before the harness cleanup waits for the handler.
+	t.Cleanup(unlock)
+	sendOnce.Do(func() { close(send) })
+	expectCodexSocketBytes(t, reader, frame)
+	_ = conn.Close()
+	started := time.Now()
+	if !harness.handlersDone(3 * time.Second) {
+		t.Fatalf("handler still waits for the state lock %s after the client left", time.Since(started).Round(time.Millisecond))
+	}
+	unlock()
 }
