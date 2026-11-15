@@ -91,7 +91,7 @@ func TestBuildStatusReport(t *testing.T) {
 
 func TestRenderStatusShowsUsageAge(t *testing.T) {
 	now := time.Now()
-	out := RenderStatus(statusReportFixture(now), nil, now)
+	out := RenderStatus(statusReportFixture(now), nil, now, defaultStaleUsageAfter)
 	if !strings.Contains(out, "UPDATED") {
 		t.Fatalf("no UPDATED column:\n%s", out)
 	}
@@ -127,7 +127,7 @@ func TestRenderStatusShowsNoFiveHourLimitForClaudeWeeklyOnlyAccount(t *testing.T
 			Service: "claude", Account: AccountState{Name: "broken"}, Reason: "usage unavailable",
 		}},
 	}}
-	for _, line := range strings.Split(RenderStatus(results, nil, now), "\n") {
+	for _, line := range strings.Split(RenderStatus(results, nil, now, defaultStaleUsageAfter), "\n") {
 		switch {
 		case strings.Contains(line, "ultra") && !strings.Contains(line, "no limit"):
 			t.Fatalf("weekly-only row does not read as having no 5-hour limit: %q", line)
@@ -138,5 +138,31 @@ func TestRenderStatusShowsNoFiveHourLimitForClaudeWeeklyOnlyAccount(t *testing.T
 	report := BuildStatusReport(results, now)
 	if account := report.Services[0].Accounts[0]; account.FiveHour != nil || account.Weekly == nil {
 		t.Fatalf("report account = %#v", account)
+	}
+}
+
+func TestRenderStatusMarksStaleSelectableUsage(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	account := func(name string, age time.Duration, selectable bool) AccountStatus {
+		usage := usageForTest(10, 20)
+		usage.ObservedAt = now.Add(-age)
+		return AccountStatus{Service: "claude", Account: AccountState{Name: name, Usage: usage}, Selectable: selectable, Reason: "ready"}
+	}
+	results := []ServiceStatus{{
+		Service: ServiceConfig{Name: "claude", Kind: "claude"},
+		Accounts: []AccountStatus{
+			account("fresh-acct", time.Hour, true),
+			account("stale-acct", 72*time.Hour, true),
+			account("blocked-acct", 72*time.Hour, false),
+		},
+	}}
+	for _, line := range strings.Split(RenderStatus(results, nil, now, defaultStaleUsageAfter), "\n") {
+		marked := strings.Contains(line, "stale usage")
+		switch {
+		case strings.Contains(line, "stale-acct") && !marked:
+			t.Fatalf("stale selectable account is not marked: %q", line)
+		case (strings.Contains(line, "fresh-acct") || strings.Contains(line, "blocked-acct")) && marked:
+			t.Fatalf("account wrongly marked stale: %q", line)
+		}
 	}
 }

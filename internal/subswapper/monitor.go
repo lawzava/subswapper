@@ -22,6 +22,7 @@ const (
 	defaultAutoSwitchThreshold      = 0.90
 	defaultAutoSwitchMinImprovement = 0.10
 	defaultAutoSwitchCooldown       = 30 * time.Minute
+	defaultStaleUsageAfter          = 3 * time.Hour
 )
 
 func StatusOnce(ctx context.Context, cfg Config) (CycleResult, error) {
@@ -74,7 +75,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 			if result.Service.Disabled || len(serviceState.Accounts) == 0 {
 				continue
 			}
-			best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio())
+			best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio(), cfg.Monitor.StaleUsageAfterDuration(), now)
 			if !ok {
 				cycle.Errors = append(cycle.Errors, fmt.Errorf("service %q has no selectable accounts", result.Service.Name))
 				continue
@@ -149,7 +150,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 			continue
 		}
 		result := results[index]
-		best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio())
+		best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio(), cfg.Monitor.StaleUsageAfterDuration(), time.Now().UTC())
 		if !ok {
 			err := fmt.Errorf("service %q has no selectable accounts", service.Name)
 			if !all {

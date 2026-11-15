@@ -566,7 +566,7 @@ func TestFetchHubStatus(t *testing.T) {
 }
 
 func TestRenderStatusShowsServiceNote(t *testing.T) {
-	out := RenderStatus([]ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Note: "hub at hub-host unreachable"}}, nil, time.Now())
+	out := RenderStatus([]ServiceStatus{{Service: ServiceConfig{Name: "claude"}, Note: "hub at hub-host unreachable"}}, nil, time.Now(), defaultStaleUsageAfter)
 	if !strings.Contains(out, "hub at hub-host unreachable") || strings.Contains(out, "no registered accounts") {
 		t.Fatalf("render = %s", out)
 	}

@@ -19,7 +19,9 @@ Tailscale.
 - **Switching without a restart**: running sessions pick up a switch on their
   next request. Real tokens never enter the provider process.
 - **Automatic selection**: a monitor drains the account whose weekly quota
-  resets first and moves away from an account near its limit.
+  resets first and moves away from an account near its limit. Among accounts
+  below the switch threshold, those with old usage readings rank after those
+  with fresh ones.
 - **Hub across machines**: accounts live on one machine, only that machine
   refreshes tokens, and every client's API traffic leaves from its network.
 - **Paseo plugin**: usage in every workspace header and one-click switching.
@@ -264,6 +266,19 @@ whose weekly window resets first. It ranks healthy accounts in this order:
 Ties go to the lower worst-window score, then the lower average, then the name.
 The proxies use the same order for fallback routes.
 
+The monitor and `switch <service> auto` also check the age of each usage
+reading. A reading older than `monitor.stale_usage_after` (default
+**3 hours**), or one with no update time or a future one, is stale: an idle account's old
+reading can miss use by other clients. Among accounts below the switch
+threshold, every account with a fresh reading ranks before every account with
+a stale one, and the order above applies within each part. Accounts at or
+above the threshold are split the same way among themselves. Staleness never
+moves an account across the threshold: a stale account below it still ranks
+before a fresh account at or above it. A stale account stays eligible.
+`status` marks such accounts with `stale usage; ranked after fresh accounts
+on the same side of the switch threshold`. Proxy fallback routes do not apply
+this split.
+
 With automatic switching on, `monitor` moves a service to the best-ranked
 account when the cooldown since its last switch has passed (default
 **30 minutes**) and one of these holds:
@@ -304,7 +319,8 @@ Monitor settings and their defaults:
   "auto_switch": true,
   "switch_threshold": 0.90,
   "min_improvement": 0.10,
-  "cooldown": "30m"
+  "cooldown": "30m",
+  "stale_usage_after": "3h"
 }
 ```
 
@@ -330,6 +346,9 @@ failure backoff. Setup tokens without `user:profile` scope can return 403, so
 these attempts cannot guarantee fresh metadata. If the endpoint is unavailable,
 subswapper can keep routing on the last proxy sample, with its original update
 time and a stale-usage warning, or use fresh status-line data captured at launch.
+Among accounts below the switch threshold, a reading older than
+`monitor.stale_usage_after` (default 3 hours) ranks after fresh accounts.
+See [How auto-switching works](#how-auto-switching-works).
 Usage probes never refresh or exchange a setup token and never make model calls.
 
 **Codex** usage is read through `codex app-server` in the account's own home,

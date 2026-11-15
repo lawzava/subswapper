@@ -206,3 +206,31 @@ func TestConfigNativeRuntimeHomeRequiresProxy(t *testing.T) {
 		t.Fatalf("runtime home = %q", got)
 	}
 }
+
+func TestConfigStaleUsageAfter(t *testing.T) {
+	if got := (MonitorConfig{}).StaleUsageAfterDuration(); got != 3*time.Hour {
+		t.Fatalf("default stale_usage_after = %s, want 3h", got)
+	}
+	load := func(t *testing.T, monitor string) (*Config, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		data := `{"monitor": ` + monitor + `, "services": [{"name": "codex", "kind": "codex"}]}`
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(path)
+	}
+	cfg, err := load(t, `{"interval": "5m", "stale_usage_after": "90m"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Monitor.StaleUsageAfterDuration(); got != 90*time.Minute {
+		t.Fatalf("configured stale_usage_after = %s, want 90m", got)
+	}
+	for _, value := range []string{`"0s"`, `"-1h"`, `0`} {
+		_, err := load(t, `{"interval": "5m", "stale_usage_after": `+value+`}`)
+		if err == nil || !strings.Contains(err.Error(), "monitor.stale_usage_after") {
+			t.Fatalf("stale_usage_after %s: err = %v, want a validation error", value, err)
+		}
+	}
+}
