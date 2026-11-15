@@ -5,7 +5,7 @@ improvements are all welcome.
 
 ## Getting started
 
-You need Go 1.26.10 or newer. Then:
+You need Go 1.26.11 or newer. Then:
 
 ```sh
 git clone https://github.com/lawzava/subswapper.git
