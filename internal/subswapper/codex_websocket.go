@@ -30,6 +30,15 @@ const (
 	codexSocketCloseTryAgainLater = 1013
 )
 
+// codexSocketRejectionWindow bounds everything an in-socket rejection does
+// after the error frame: the marker write, the usage fetch and the refined
+// write. The fetch alone may take codexProxyUsageFetchWindow (10s); 5s more
+// covers two state-lock waits, which normally last milliseconds because
+// every holder only loads and saves the state file. If another process holds
+// the lock longer, the handler gives up instead of waiting without bound.
+// A variable so tests can shorten it.
+var codexSocketRejectionWindow = codexProxyUsageFetchWindow + 5*time.Second
+
 type codexSocketRejection int
 
 const (
@@ -128,6 +137,9 @@ func relayCodexServerFrames(dst io.Writer, src io.Reader) (codexSocketVerdict, e
 					return codexSocketVerdict{}, werr
 				}
 				if keep && !overflow {
+					// Messages over the limit are deliberately not
+					// classified: Codex error frames are a few hundred
+					// bytes, and bounding the copy bounds memory per socket.
 					if len(message)+n > codexSocketInspectLimit {
 						overflow, message = true, message[:0]
 					} else {
@@ -217,11 +229,12 @@ func codexSocketQuotaUsage(fetched *UsageSnapshot, resetsAt, now time.Time) Usag
 	if !resetsAt.After(now) || resetsAt.After(now.Add(codexSocketQuotaMaxReset)) {
 		resetsAt = now.Add(codexSocketQuotaFallback)
 	}
-	usage := UsageSnapshot{Source: claudeUsageSourceProxy}
+	// A merged sample keeps the fetch's start time as its ordering stamp;
+	// the provisional marker is observed now.
+	usage := UsageSnapshot{Source: claudeUsageSourceProxy, ObservedAt: now}
 	if fetched != nil {
 		usage = *fetched
 	}
-	usage.ObservedAt = now
 	window := LimitWindow{ResetsAt: resetsAt}
 	forceLimitReached(&window)
 	// Same slotting as parseCodexWhamUsage: windows up to six hours are the
@@ -236,17 +249,17 @@ func codexSocketQuotaUsage(fetched *UsageSnapshot, resetsAt, now time.Time) Usag
 
 // recordCodexSocketRejection stores what an in-socket rejection revealed
 // before the socket closes, so the reconnect the close triggers already
-// routes elsewhere. It runs no network call.
-func (p *CodexProxy) recordCodexSocketRejection(route codexProxyRoute, verdict codexSocketVerdict) {
+// routes elsewhere. It runs no network call; ctx bounds the state-lock wait.
+func (p *CodexProxy) recordCodexSocketRejection(ctx context.Context, route codexProxyRoute, verdict codexSocketVerdict) {
 	var err error
 	switch verdict.kind {
 	case codexSocketUnauthorized:
 		p.logf("codex proxy: WebSocket token rejected for %s; closing the socket", route.Account)
-		err = recordCodexProxyObservation(p.cfg, p.service, route, nil, true, false)
+		err = recordCodexProxyState(ctx, p.cfg, p.service, route, nil, true, false, false)
 	case codexSocketQuota:
 		p.logf("codex proxy: WebSocket quota reached for %s; closing the socket", route.Account)
 		usage := codexSocketQuotaUsage(nil, verdict.resetsAt, codexProxyNow().UTC())
-		err = recordCodexProxyState(p.cfg, p.service, route, &usage, false, false, true)
+		err = recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true)
 	default:
 		return
 	}
@@ -256,7 +269,8 @@ func (p *CodexProxy) recordCodexSocketRejection(route codexProxyRoute, verdict c
 }
 
 // refineCodexSocketQuota replaces the provisional quota marker with real
-// numbers when the usage endpoint answers. ctx must outlive the socket.
+// numbers when the usage endpoint answers. ctx must outlive the socket and
+// bounds both the fetch and the state-lock wait.
 func (p *CodexProxy) refineCodexSocketQuota(ctx context.Context, route codexProxyRoute, verdict codexSocketVerdict) {
 	fetched, err := p.fetchUsage(ctx, route)
 	if err != nil {
@@ -264,7 +278,7 @@ func (p *CodexProxy) refineCodexSocketQuota(ctx context.Context, route codexProx
 		return
 	}
 	usage := codexSocketQuotaUsage(&fetched, verdict.resetsAt, codexProxyNow().UTC())
-	if err := recordCodexProxyState(p.cfg, p.service, route, &usage, false, false, true); err != nil {
+	if err := recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true); err != nil {
 		p.logf("codex proxy: record state for %s: %v", route.Account, err)
 	}
 }

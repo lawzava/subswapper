@@ -638,15 +638,18 @@ func (p *CodexProxy) relayWebSocket(w http.ResponseWriter, r *http.Request, resp
 			done <- struct{}{}
 			return
 		}
+		// The handler waits for this goroutine, so all rejection handling
+		// shares one bound. Shutdown does not cancel it, so the marker and
+		// its refinement still land; a held state lock cannot stall it.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), codexSocketRejectionWindow)
+		defer cancel()
 		// The error frame is already with the client. Record before closing
 		// so the reconnect that the close triggers ranks this account last.
-		p.recordCodexSocketRejection(route, verdict)
+		p.recordCodexSocketRejection(ctx, route, verdict)
 		_, _ = client.Write(codexSocketCloseFrame(codexSocketCloseTryAgainLater, "subswapper: account unavailable, reconnect"))
 		done <- struct{}{}
 		if verdict.kind == codexSocketQuota {
-			// The handler waits for this goroutine; shutdown must not cancel
-			// the bounded usage fetch that replaces the provisional marker.
-			p.refineCodexSocketQuota(context.WithoutCancel(r.Context()), route, verdict)
+			p.refineCodexSocketQuota(ctx, route, verdict)
 		}
 	}()
 	select {
@@ -843,7 +846,11 @@ func codexProxyKnownUsage(account AccountState) (UsageSnapshot, bool) {
 	return UsageSnapshot{}, false
 }
 
+// fetchUsage stamps the sample with the time the request started, not when it
+// was parsed. recordCodexProxyState orders proxy usage writes by that stamp,
+// so a slow fetch cannot overwrite anything recorded after it began.
 func (p *CodexProxy) fetchUsage(ctx context.Context, route codexProxyRoute) (UsageSnapshot, error) {
+	startedAt := codexProxyNow().UTC()
 	ctx, cancel := context.WithTimeout(ctx, codexProxyUsageFetchWindow)
 	defer cancel()
 	target := *p.upstream
@@ -870,7 +877,7 @@ func (p *CodexProxy) fetchUsage(ctx context.Context, route codexProxyRoute) (Usa
 	if resp.StatusCode != http.StatusOK {
 		return UsageSnapshot{}, fmt.Errorf("codex usage endpoint returned %d", resp.StatusCode)
 	}
-	return parseCodexWhamUsage(data, codexProxyNow().UTC())
+	return parseCodexWhamUsage(data, startedAt)
 }
 
 // parseCodexWhamUsage maps the ChatGPT usage windows onto the five-hour and
@@ -949,14 +956,20 @@ func (p *CodexProxy) refreshUsageIfStale(route codexProxyRoute) {
 // recordCodexProxyObservation stores what one real response revealed about an
 // account. switchTo makes the account the selected route after a rejected token.
 func recordCodexProxyObservation(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo bool) error {
-	return recordCodexProxyState(cfg, service, route, usage, unauthorized, switchTo, false)
+	return recordCodexProxyState(context.Background(), cfg, service, route, usage, unauthorized, switchTo, false)
 }
 
-// recordCodexProxyState is recordCodexProxyObservation with fenceProbe, which
-// stamps the probe clock with a stored usage sample so a monitor probe that
-// started before it cannot override it on merge.
-func recordCodexProxyState(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo, fenceProbe bool) error {
-	lock, err := AcquireStateLock(context.Background(), cfg)
+// recordCodexProxyState is recordCodexProxyObservation with a context that
+// bounds the state-lock wait, and fenceProbe, which stamps the probe clock
+// with a stored usage sample so a monitor probe that started before it cannot
+// override it on merge.
+//
+// usage.ObservedAt is when the observation began (fetch start, or the moment
+// of an in-socket rejection). A stored ProxyUsage observed after that is
+// newer and is kept: a slow background fetch must not erase a quota marker
+// recorded while it was in flight.
+func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo, fenceProbe bool) error {
+	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -972,7 +985,11 @@ func recordCodexProxyState(cfg Config, service ServiceConfig, route codexProxyRo
 	}
 	now := codexProxyNow().UTC()
 	changed := false
-	if usage != nil {
+	accepted := usage != nil && !account.ProxyUsage.ObservedAt.After(usage.ObservedAt)
+	// Only a sample fetched after the last rejection or probe start proves the
+	// token works now; an older fetch must not clear a newer rejection.
+	recovered := accepted && !usage.ObservedAt.Before(account.LastProbeStartedAt)
+	if accepted {
 		account.ProxyUsage = *usage
 		if fenceProbe {
 			account.LastProbeStartedAt = now
@@ -987,7 +1004,7 @@ func recordCodexProxyState(cfg Config, service ServiceConfig, route codexProxyRo
 		// clearing the rejection with its older result.
 		account.LastProbeStartedAt = now
 		changed = true
-	} else if account.CredentialsError != "" && usage != nil {
+	} else if account.CredentialsError != "" && recovered {
 		account.CredentialsError = ""
 		account.FetchBackoffUntil = time.Time{}
 		changed = true

@@ -856,6 +856,8 @@ type codexSocketUpstream struct {
 	frames     map[string][][]byte
 	usage      func(token string) (int, string)
 	extensions string
+	// beforeFrames runs after the 101 and before frames[token] are sent.
+	beforeFrames func(token string)
 
 	mu         sync.Mutex
 	handshakes []codexSocketHandshake
@@ -886,6 +888,9 @@ func (u *codexSocketUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	_, _ = rw.WriteString("\r\n")
 	_ = rw.Flush()
+	if u.beforeFrames != nil {
+		u.beforeFrames(token)
+	}
 	for _, frame := range u.frames[token] {
 		// Separate flushes exercise frames that arrive in pieces.
 		_, _ = rw.Write(frame)
@@ -911,6 +916,26 @@ func (u *codexSocketUpstream) seen() []codexSocketHandshake {
 // proxy handler, including its post-close usage refresh, has returned.
 func startCodexSocketProxy(t *testing.T, upstream *codexSocketUpstream) (cfg Config, addr string, wait func()) {
 	t.Helper()
+	harness := startCodexSocketHarness(t, upstream, nil)
+	return harness.cfg, harness.addr, func() {
+		if !harness.handlersDone(10 * time.Second) {
+			t.Error("proxy WebSocket handler did not return")
+		}
+	}
+}
+
+type codexSocketHarness struct {
+	cfg          Config
+	addr         string
+	proxy        *CodexProxy
+	handlersDone func(timeout time.Duration) bool
+}
+
+// startCodexSocketHarness seeds fresh usage for a and b, lets adjust change
+// that seed, and serves the proxy. handlersDone reports whether every proxy
+// handler returned within timeout.
+func startCodexSocketHarness(t *testing.T, upstream *codexSocketUpstream, adjust func(*ServiceState)) codexSocketHarness {
+	t.Helper()
 	backend := httptest.NewServer(upstream)
 	t.Cleanup(backend.Close)
 	cfg, proxy := setupCodexProxyAccounts(t, backend.URL)
@@ -930,6 +955,9 @@ func startCodexSocketProxy(t *testing.T, upstream *codexSocketUpstream) (cfg Con
 		}
 		state.Service("codex").Accounts[name] = account
 	}
+	if adjust != nil {
+		adjust(state.Service("codex"))
+	}
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		t.Fatal(err)
 	}
@@ -939,17 +967,23 @@ func startCodexSocketProxy(t *testing.T, upstream *codexSocketUpstream) (cfg Con
 		defer handlers.Done()
 		proxy.ServeHTTP(w, r)
 	}))
-	wait = func() {
+	handlersDone := func(timeout time.Duration) bool {
 		finished := make(chan struct{})
 		go func() { handlers.Wait(); close(finished) }()
 		select {
 		case <-finished:
-		case <-time.After(10 * time.Second):
-			t.Error("proxy WebSocket handler did not return")
+			return true
+		case <-time.After(timeout):
+			return false
 		}
 	}
-	t.Cleanup(func() { server.Close(); wait() })
-	return cfg, strings.TrimPrefix(server.URL, "http://"), wait
+	t.Cleanup(func() {
+		server.Close()
+		if !handlersDone(10 * time.Second) {
+			t.Error("proxy WebSocket handler did not return")
+		}
+	})
+	return codexSocketHarness{cfg, strings.TrimPrefix(server.URL, "http://"), proxy, handlersDone}
 }
 
 func dialCodexSocket(t *testing.T, addr, token string) (net.Conn, *bufio.Reader) {
@@ -1254,4 +1288,149 @@ func TestCodexProxyWebSocketWithdrawsCompressionOffer(t *testing.T) {
 	if handshakes := upstream.seen(); len(handshakes) != 1 || handshakes[0].Token != "chatgpt-token-a" || handshakes[0].Extensions != "" {
 		t.Fatalf("upstream handshakes = %#v, want no Sec-WebSocket-Extensions", handshakes)
 	}
+}
+
+func TestCodexProxyWebSocketQuotaMarkerSurvivesSlowRefresh(t *testing.T) {
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	frame := codexSocketText(fmt.Sprintf(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_at":%d}}`, resetAt))
+	refreshStarted, releaseRefresh := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	var usageCalls atomic.Int32
+	upstream := &codexSocketUpstream{
+		frames: map[string][][]byte{
+			"chatgpt-token-a": {frame},
+			"chatgpt-token-b": {codexSocketText(`{"type":"response.created"}`)},
+		},
+		usage: func(token string) (int, string) {
+			if token != "chatgpt-token-a" {
+				return http.StatusInternalServerError, `{}`
+			}
+			if usageCalls.Add(1) > 1 {
+				// The refinement after the rejection fails.
+				return http.StatusInternalServerError, `{}`
+			}
+			// The handshake's background refresh reads healthy usage, but
+			// only after the in-socket rejection has been recorded.
+			close(refreshStarted)
+			<-releaseRefresh
+			return http.StatusOK, `{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1788780407}}}`
+		},
+		beforeFrames: func(token string) {
+			if token != "chatgpt-token-a" {
+				return
+			}
+			select {
+			case <-refreshStarted:
+			case <-time.After(5 * time.Second):
+			}
+		},
+	}
+	harness := startCodexSocketHarness(t, upstream, func(service *ServiceState) {
+		// Stale usage makes the handshake start a background refresh.
+		account := service.Accounts["a"]
+		account.ProxyUsage.ObservedAt = time.Now().UTC().Add(-2 * codexProxyUsageTTL)
+		service.Accounts["a"] = account
+	})
+	// Runs before the backend closes, which waits for the held request.
+	t.Cleanup(release)
+	token := codexProxyTestPlaceholder(t, harness.cfg)
+	conn, reader := dialCodexSocket(t, harness.addr, token)
+	expectCodexSocketBytes(t, reader, frame)
+	expectCodexSocketClosed(t, conn, reader)
+	if !harness.handlersDone(10 * time.Second) {
+		t.Fatal("proxy WebSocket handler did not return")
+	}
+	if calls := usageCalls.Load(); calls != 2 {
+		t.Fatalf("usage calls = %d, want the held refresh and the failed refinement", calls)
+	}
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		harness.proxy.usageMu.Lock()
+		pending := len(harness.proxy.usageInFlight)
+		harness.proxy.usageMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if usage := loadCodexTestAccount(t, harness.cfg, "a").ProxyUsage; !usage.Exhausted() || usage.FiveHour.ResetsAt.Unix() != resetAt {
+		t.Fatalf("a refresh that started before the rejection replaced its marker: %#v", usage)
+	}
+	expectCodexSocketFailover(t, harness.cfg, upstream, harness.addr, token)
+}
+
+func TestCodexProxyOlderUsageKeepsNewerTokenRejection(t *testing.T) {
+	cfg, _ := setupCodexProxyAccounts(t, "http://127.0.0.1:1")
+	route := codexProxyRoute{Account: "a"}
+	started := time.Now().UTC().Add(-time.Second)
+	// An in-socket 401 is recorded while a usage fetch that started earlier
+	// is still in flight.
+	if err := recordCodexProxyState(context.Background(), cfg, ServiceConfig{Name: "codex"}, route, nil, true, false, false); err != nil {
+		t.Fatal(err)
+	}
+	healthy := UsageSnapshot{
+		ObservedAt: started,
+		Source:     claudeUsageSourceProxy,
+		Weekly:     LimitWindow{Pct: PtrFloat64(10), ResetsAt: started.Add(72 * time.Hour)},
+	}
+	if err := recordCodexProxyObservation(cfg, ServiceConfig{Name: "codex"}, route, &healthy, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if account := loadCodexTestAccount(t, cfg, "a"); account.CredentialsError == "" || account.FetchBackoffUntil.IsZero() {
+		t.Fatalf("a fetch that started before the token rejection cleared it: %#v", account)
+	}
+	// A fetch that starts after the rejection proves the token works again.
+	healthy.ObservedAt = time.Now().UTC().Add(time.Second)
+	if err := recordCodexProxyObservation(cfg, ServiceConfig{Name: "codex"}, route, &healthy, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if account := loadCodexTestAccount(t, cfg, "a"); account.CredentialsError != "" || !account.FetchBackoffUntil.IsZero() {
+		t.Fatalf("a newer healthy fetch did not clear the token rejection: %#v", account)
+	}
+}
+
+func TestCodexProxyWebSocketRejectionBoundsStateLockWait(t *testing.T) {
+	previous := codexSocketRejectionWindow
+	codexSocketRejectionWindow = 300 * time.Millisecond
+	// Registered first, so it runs after the harness waited for handlers.
+	t.Cleanup(func() { codexSocketRejectionWindow = previous })
+	frame := codexSocketText(`{"type":"error","status":429,"error":{"type":"usage_limit_reached"}}`)
+	send := make(chan struct{})
+	var sendOnce sync.Once
+	upstream := &codexSocketUpstream{
+		frames: map[string][][]byte{"chatgpt-token-a": {frame}},
+		beforeFrames: func(string) {
+			select {
+			case <-send:
+			case <-time.After(10 * time.Second):
+			}
+		},
+	}
+	harness := startCodexSocketHarness(t, upstream, nil)
+	t.Cleanup(func() { sendOnce.Do(func() { close(send) }) })
+	// The placeholder load takes the state lock, so dial before holding it.
+	conn, reader := dialCodexSocket(t, harness.addr, codexProxyTestPlaceholder(t, harness.cfg))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	lock, err := AcquireStateLock(ctx, harness.cfg)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(lock.Release) }
+	// Runs before the harness cleanup waits for the handler.
+	t.Cleanup(unlock)
+	sendOnce.Do(func() { close(send) })
+	expectCodexSocketBytes(t, reader, frame)
+	_ = conn.Close()
+	started := time.Now()
+	if !harness.handlersDone(3 * time.Second) {
+		t.Fatalf("handler still waits for the state lock %s after the client left", time.Since(started).Round(time.Millisecond))
+	}
+	unlock()
 }
