@@ -1366,7 +1366,11 @@ func TestCodexProxyWebSocketQuotaMarkerSurvivesSlowRefresh(t *testing.T) {
 
 func TestCodexProxyOlderUsageKeepsNewerTokenRejection(t *testing.T) {
 	cfg, _ := setupCodexProxyAccounts(t, "http://127.0.0.1:1")
-	route := codexProxyRoute{Account: "a"}
+	routes, err := codexProxyRoutes(cfg, cfg.Services[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := routes[0]
 	started := time.Now().UTC().Add(-time.Second)
 	// An in-socket 401 is recorded while a usage fetch that started earlier
 	// is still in flight.

@@ -15,6 +15,8 @@ import (
 	"unicode"
 )
 
+var routeStateNow = time.Now
+
 func SwitchAccount(cfg Config, serviceName, accountName string) error {
 	service, ok := cfg.Service(serviceName)
 	if !ok {
@@ -40,7 +42,7 @@ func SwitchAccount(cfg Config, serviceName, accountName string) error {
 	if previous == accountName {
 		return nil
 	}
-	selectAccount(state, service, accountName, time.Now().UTC())
+	selectAccount(state, service, accountName, routeStateNow().UTC())
 	if err := SaveState(cfg.StatePath, state); err != nil {
 		return err
 	}
