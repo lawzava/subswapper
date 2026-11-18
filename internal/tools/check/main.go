@@ -30,6 +30,8 @@ type step struct {
 	notRun      string
 	optional    bool
 	cleanOutput bool
+	// modToolchain runs the step under go.mod's Go version (see toolchainPin).
+	modToolchain bool
 }
 
 func main() {
@@ -110,8 +112,8 @@ func selectSteps(o options, goos, coverage string) []step {
 				step{name: "race", command: []string{"go", "test", "-race", "-count=1", "./..."}},
 			)
 			steps = append(steps,
-				step{name: "lint", command: []string{"golangci-lint", "run"}, versionArgs: []string{"version"}, optional: true, onlyOS: "linux"},
-				step{name: "vuln", command: []string{"govulncheck", "./..."}, versionArgs: []string{"-version"}, optional: true, onlyOS: "linux"},
+				step{name: "lint", command: []string{"golangci-lint", "run"}, versionArgs: []string{"version"}, optional: true, onlyOS: "linux", modToolchain: true},
+				step{name: "vuln", command: []string{"govulncheck", "./..."}, versionArgs: []string{"-version"}, optional: true, onlyOS: "linux", modToolchain: true},
 				step{name: "windows", command: []string{"go", "build", "./..."}, env: []string{"GOOS=windows", "GOARCH=amd64"}, onlyOS: "linux"},
 			)
 		}
@@ -144,7 +146,8 @@ func run(args []string, out io.Writer) (err error) {
 		printMenu(out)
 		return nil
 	}
-	if _, err := os.Stat("go.mod"); err != nil {
+	gomod, err := os.ReadFile("go.mod")
+	if err != nil {
 		return errors.New("run the gate from the repository root (go.mod not found)")
 	}
 	dir, err := os.MkdirTemp("", "subswapper-check-")
@@ -152,7 +155,37 @@ func run(args []string, out io.Writer) (err error) {
 		return err
 	}
 	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
-	return runSteps(selectSteps(o, runtime.GOOS, filepath.Join(dir, "coverage.out")), o.ci, out)
+	steps := selectSteps(o, runtime.GOOS, filepath.Join(dir, "coverage.out"))
+	if pin := toolchainPin(gomod, runtime.Version()); pin != "" {
+		_, _ = fmt.Fprintf(out, "TOOLCHAIN lint and vuln run with %s (go.mod); the gate runs on %s\n", pin, runtime.Version())
+		for i := range steps {
+			if steps[i].modToolchain {
+				steps[i].env = append(steps[i].env, pin)
+			}
+		}
+	}
+	return runSteps(steps, o.ci, out)
+}
+
+// toolchainPin returns the GOTOOLCHAIN entry that selects go.mod's Go version
+// when the running Go is another minor release, else "". The pinned lint and
+// vulnerability tools cannot read package export data from a newer release.
+// CI installs go.mod's version, so nothing is pinned there.
+func toolchainPin(gomod []byte, running string) string {
+	minor := func(v string) string {
+		parts := strings.SplitN(v, ".", 3)
+		return strings.Join(parts[:min(len(parts), 2)], ".")
+	}
+	for line := range strings.SplitSeq(string(gomod), "\n") {
+		line, _, _ = strings.Cut(line, "//")
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "go" {
+			if want := "go" + f[1]; minor(want) != minor(running) {
+				return "GOTOOLCHAIN=" + want
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func runSteps(steps []step, strict bool, out io.Writer) error {

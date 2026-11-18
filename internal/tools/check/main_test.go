@@ -38,6 +38,34 @@ func TestParseOptions(t *testing.T) {
 	}
 }
 
+func TestToolchainPin(t *testing.T) {
+	const gomod = "module example.com/m\n\ngo 1.26.11\n\nrequire (\n\tgo 1.2.3\n)\n"
+	for _, tt := range []struct{ name, gomod, running, want string }{
+		{"same release as CI", gomod, "go1.26.11", ""},
+		{"same minor, other patch", gomod, "go1.26.14", ""},
+		{"newer minor", gomod, "go1.27.4", "GOTOOLCHAIN=go1.26.11"},
+		{"development build", gomod, "devel go1.28-abc", "GOTOOLCHAIN=go1.26.11"},
+		{"CRLF", "module m\r\ngo 1.26.11\r\n", "go1.27.4", "GOTOOLCHAIN=go1.26.11"},
+		{"commented directive", "module m\ngo 1.26.11 // pinned for GO-2026-6859\n", "go1.27.4", "GOTOOLCHAIN=go1.26.11"},
+		{"no go directive", "module m\n", "go1.27.4", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := toolchainPin([]byte(tt.gomod), tt.running); got != tt.want {
+				t.Errorf("toolchainPin = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	var pinned []string
+	for _, s := range selectSteps(options{tier: "full", scope: "all"}, "linux", "coverage.out") {
+		if s.modToolchain {
+			pinned = append(pinned, s.name)
+		}
+	}
+	if want := []string{"lint", "vuln"}; !reflect.DeepEqual(pinned, want) {
+		t.Errorf("steps under go.mod's toolchain = %v, want %v", pinned, want)
+	}
+}
+
 func TestStepSelection(t *testing.T) {
 	for _, tt := range []struct {
 		name, tier, scope, goos string
