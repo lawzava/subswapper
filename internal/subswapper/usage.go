@@ -294,7 +294,7 @@ func markAccountSelectable(status *AccountStatus) {
 	default:
 		status.Selectable = true
 		status.Score = status.Account.Usage.Score()
-		status.Reason = "ready"
+		status.Reason = readyReason(status.Account.Usage)
 	}
 }
 
@@ -345,8 +345,76 @@ func (u UsageSnapshot) HasCoreLimits() bool {
 	return hasWeekly
 }
 
+// Exhausted reports a full core window (5-hour or weekly), which blocks every
+// request. A full model window blocks only that model; see ModelExhausted.
 func (u UsageSnapshot) Exhausted() bool {
-	return u.AtOrAbove(1)
+	for _, window := range []LimitWindow{u.FiveHour, u.Weekly} {
+		if ratio, ok := window.Ratio(); ok && ratio >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// modelWindow is a limit that applies only to models whose name contains
+// label. New per-model windows are added in modelWindows alone.
+type modelWindow struct {
+	label  string
+	window LimitWindow
+}
+
+func (u UsageSnapshot) modelWindows() []modelWindow {
+	return []modelWindow{{label: "fable", window: u.FableWeekly}}
+}
+
+// ModelExhausted reports whether the window scoped to model is full. An
+// empty or unscoped model never matches.
+func (u UsageSnapshot) ModelExhausted(model string) bool {
+	model = strings.ToLower(model)
+	for _, scoped := range u.modelWindows() {
+		if !strings.Contains(model, scoped.label) {
+			continue
+		}
+		if ratio, ok := scoped.window.Ratio(); ok && ratio >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// ExhaustedModels lists the labels of the full model windows.
+func (u UsageSnapshot) ExhaustedModels() []string {
+	var labels []string
+	for _, scoped := range u.modelWindows() {
+		if ratio, ok := scoped.window.Ratio(); ok && ratio >= 1 {
+			labels = append(labels, scoped.label)
+		}
+	}
+	return labels
+}
+
+// readyReason is the reason of a selectable account. It names full model
+// windows, because the account still serves every other model.
+func readyReason(usage UsageSnapshot) string {
+	models := usage.ExhaustedModels()
+	if len(models) == 0 {
+		return "ready"
+	}
+	return "ready (" + strings.Join(models, ", ") + " limit reached)"
+}
+
+// isReadyReason reports a plain ready reason, with or without a model-limit
+// note. Any other suffix, such as a stale-usage note, does not match.
+func isReadyReason(reason string) bool {
+	if reason == "ready" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(reason, "ready (")
+	if !ok {
+		return false
+	}
+	models, ok := strings.CutSuffix(rest, " limit reached)")
+	return ok && !strings.ContainsAny(models, "()")
 }
 
 func (u UsageSnapshot) AtOrAbove(threshold float64) bool {

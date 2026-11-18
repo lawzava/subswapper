@@ -89,7 +89,7 @@ func accountEventKey(account AccountStatus) string {
 }
 
 func monitorIssueReason(account AccountStatus) string {
-	if account.Reason == "ready" || account.Reason == "service disabled" || account.Reason == "no registered accounts" {
+	if isReadyReason(account.Reason) || account.Reason == "service disabled" || account.Reason == "no registered accounts" {
 		return ""
 	}
 	return account.Reason
@@ -116,7 +116,8 @@ func formatWindow(window LimitWindow) string {
 }
 
 func withReset(window LimitWindow, value string) string {
-	if window.ResetsAt.IsZero() {
+	// A passed reset describes the previous window, which already reads 0%.
+	if window.ResetsAt.IsZero() || !time.Now().Before(window.ResetsAt) {
 		return value
 	}
 	return value + " reset " + window.ResetsAt.Local().Format("Jan02 15:04")
