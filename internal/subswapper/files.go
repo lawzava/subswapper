@@ -58,6 +58,30 @@ func selectAccount(state *State, service ServiceConfig, accountName string, swit
 	serviceState.LastSwitchedAt = switchedAt
 }
 
+// selectionUnchanged reports whether the stored selection is still the one a
+// request saw at dispatch. The switch time fences A -> C -> A. AddedAt fences
+// a force-remove and re-add of A, which selects A again without a switch.
+func selectionUnchanged(serviceState *ServiceState, account string, switchedAt, addedAt time.Time) bool {
+	return serviceState.ActiveAccount == account && serviceState.LastSwitchedAt.Equal(switchedAt) &&
+		serviceState.Accounts[account].AddedAt.Equal(addedAt)
+}
+
+// rejectedAfter reports a credentials or quota rejection recorded for account
+// after dispatchedAt. A request dispatched earlier cannot prove it selectable.
+// model scopes the quota check as in quotaRejectedAfter.
+func rejectedAfter(account AccountState, dispatchedAt time.Time, model string) bool {
+	return account.CredentialsError != "" && dispatchedAt.Before(account.LastProbeStartedAt) ||
+		quotaRejectedAfter(account.ProxyUsage, dispatchedAt, model)
+}
+
+// quotaRejectedAfter reports a proxy sample observed after dispatchedAt with
+// a full core window, or a full window scoped to model that was itself
+// reported after dispatchedAt. A full model window does not reject requests
+// for other models.
+func quotaRejectedAfter(usage UsageSnapshot, dispatchedAt time.Time, model string) bool {
+	return usage.Exhausted() && dispatchedAt.Before(usage.ObservedAt) || usage.modelRejectedAfter(model, dispatchedAt)
+}
+
 func RemoveAccountWithOptions(cfg Config, serviceName, accountName string, force, deleteHome bool) error {
 	if strings.TrimSpace(accountName) == "" {
 		return errors.New("account name is required")

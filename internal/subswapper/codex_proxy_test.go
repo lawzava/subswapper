@@ -1374,7 +1374,7 @@ func TestCodexProxyOlderUsageKeepsNewerTokenRejection(t *testing.T) {
 	started := time.Now().UTC().Add(-time.Second)
 	// An in-socket 401 is recorded while a usage fetch that started earlier
 	// is still in flight.
-	if err := recordCodexProxyState(context.Background(), cfg, ServiceConfig{Name: "codex"}, route, nil, true, false, false); err != nil {
+	if err := recordCodexProxyState(context.Background(), cfg, ServiceConfig{Name: "codex"}, route, nil, true, false, false, false); err != nil {
 		t.Fatal(err)
 	}
 	healthy := UsageSnapshot{
