@@ -83,7 +83,12 @@ func statusWindow(window LimitWindow) *StatusWindow {
 	if !ok {
 		return nil
 	}
-	return &StatusWindow{UsedPercent: math.Round(ratio*10000) / 100, ResetsAt: window.ResetsAt}
+	report := &StatusWindow{UsedPercent: math.Round(ratio*10000) / 100}
+	// A passed reset describes the previous window, which already reads 0%.
+	if time.Now().Before(window.ResetsAt) {
+		report.ResetsAt = window.ResetsAt
+	}
+	return report
 }
 
 // formatAge renders how long ago a usage sample was taken.

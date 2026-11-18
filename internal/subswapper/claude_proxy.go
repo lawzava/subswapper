@@ -342,7 +342,7 @@ func (p *ClaudeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeClaudeProxyError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds the proxy replay limit")
 		return
 	}
-	routes, err := claudeProxyRoutes(p.cfg, p.service)
+	routes, err := claudeProxyRoutes(p.cfg, p.service, claudeRequestModel(body))
 	if err != nil {
 		p.logf("claude proxy: route lookup failed: %v", err)
 		writeClaudeProxyError(w, http.StatusServiceUnavailable, "api_error", "subswapper route lookup failed")
@@ -557,7 +557,7 @@ func markClaudeRejectedWindow(usage *UsageSnapshot, header http.Header, observed
 	case "five_hour":
 		markClaudeFiveHourRejected(usage, header, observedAt, claim)
 	default:
-		if usage.Exhausted() {
+		if usage.Exhausted() || len(usage.ExhaustedModels()) > 0 {
 			return
 		}
 		// Unknown claim: the five-hour window resets soonest, so a wrong
@@ -616,9 +616,22 @@ func parseClaudeRateLimitWindow(header http.Header, name string) (LimitWindow, b
 	return LimitWindow{Pct: &percent, ResetsAt: time.Unix(resetSeconds, 0).UTC()}, true
 }
 
+// claudeRequestModel reads the top-level model of a request body. A body
+// that is not a JSON object, or names no model, has none.
+func claudeRequestModel(body []byte) string {
+	var request struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		return ""
+	}
+	return request.Model
+}
+
 // claudeProxyRoutes lists accounts with usable setup tokens: the selected
-// account first, then the alternatives in drain order, exhausted accounts last.
-func claudeProxyRoutes(cfg Config, service ServiceConfig) ([]claudeProxyRoute, error) {
+// account first, then the alternatives in drain order, exhausted accounts
+// last. A full model window exhausts a route only for requests to that model.
+func claudeProxyRoutes(cfg Config, service ServiceConfig, model string) ([]claudeProxyRoute, error) {
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -650,7 +663,7 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig) ([]claudeProxyRoute, e
 		}
 		if usage, ok := claudeProxyKnownUsage(account, status.Revision); ok {
 			route.Usage = usage
-			route.Exhausted = usage.Exhausted()
+			route.Exhausted = usage.Exhausted() || usage.ModelExhausted(model)
 		}
 		routes = append(routes, route)
 	}
@@ -716,12 +729,18 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 	if observation.HasUsage {
 		usage := observation.Usage
 		usage.TokenRevision = route.Revision
-		if usage.FableWeekly.Pct == nil && account.ProxyUsage.TokenRevision == route.Revision &&
-			account.ProxyUsage.FableWeekly.Pct != nil {
+		if usage.FableWeekly.Pct == nil {
 			// Responses from other models omit the Fable window and do not
 			// consume it; keep the last sample. LimitWindow.Ratio zeroes it
 			// once its reset passes and the next Fable response replaces it.
-			usage.FableWeekly = account.ProxyUsage.FableWeekly
+			// A sample known only from a metadata probe counts too, or the
+			// first proxied response would hide a full Fable window.
+			for _, known := range []UsageSnapshot{account.ProxyUsage, account.Usage} {
+				if _, ok := known.FableWeekly.Ratio(); ok && known.TokenRevision == route.Revision {
+					usage.FableWeekly = known.FableWeekly
+					break
+				}
+			}
 		}
 		account.ProxyUsage = usage
 		changed = true

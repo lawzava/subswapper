@@ -91,7 +91,11 @@ codex: accounts on the hub at <hub>
 ```
 
 `FABLE5` is the weekly window for Claude's Fable models. `SCORE` is an
-account's worst window. `UPDATED` is the age of the usage sample.
+account's worst window. `UPDATED` is the age of the usage sample. A full
+5-hour or weekly window shows as `limit reached` and the account is not
+selected. A full Fable window blocks only Fable requests: the account stays
+selectable and shows as `ready (fable limit reached)`. A window whose reset
+time has passed shows 0% without a reset time.
 
 ## Commands
 
@@ -189,6 +193,10 @@ every response. The `7d_oi` window, which Claude Code shows as the Fable
 limit, arrives only on responses served by a Fable model and is kept across
 other responses because they do not consume it. A window counts as 0% once
 its reset time passes.
+
+A request for a Fable model goes to an account whose Fable window is not
+full, when one exists, and that account becomes the selected one. Requests
+for other models ignore the Fable window.
 
 A rate-limit response reaches the client unchanged; the proxy never resends a
 request with another account to get past a limit. The rejected window is
@@ -291,8 +299,9 @@ account when the cooldown since its last switch has passed (default
   account improves the worst-window score by at least the minimum improvement
   (default **10 percentage points**).
 
-An exhausted active account, or one whose credentials stop working, is left on
-the next cycle regardless of cooldown. Accounts with missing, expired, or
+An active account with a full 5-hour or weekly window, or one whose
+credentials stop working, is left on the next cycle regardless of cooldown. A
+full Fable window counts as a window at the threshold, not as exhaustion. Accounts with missing, expired, or
 rejected credentials, or without trusted usage, are never selected.
 `switch <service> auto` picks the best account immediately.
 

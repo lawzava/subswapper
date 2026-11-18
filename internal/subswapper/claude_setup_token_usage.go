@@ -181,7 +181,7 @@ func markClaudeSetupTokenSelectable(status *AccountStatus) {
 	}
 	status.Selectable = true
 	status.Score = status.Account.Usage.Score()
-	status.Reason = "ready"
+	status.Reason = readyReason(status.Account.Usage)
 }
 
 // RecordClaudeStatusLineUsage stores only fresh, complete rate limits. The
