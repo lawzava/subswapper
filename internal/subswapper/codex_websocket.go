@@ -255,11 +255,11 @@ func (p *CodexProxy) recordCodexSocketRejection(ctx context.Context, route codex
 	switch verdict.kind {
 	case codexSocketUnauthorized:
 		p.logf("codex proxy: WebSocket token rejected for %s; closing the socket", route.Account)
-		err = recordCodexProxyState(ctx, p.cfg, p.service, route, nil, true, false, false)
+		err = recordCodexProxyState(ctx, p.cfg, p.service, route, nil, true, false, false, false)
 	case codexSocketQuota:
 		p.logf("codex proxy: WebSocket quota reached for %s; closing the socket", route.Account)
 		usage := codexSocketQuotaUsage(nil, verdict.resetsAt, codexProxyNow().UTC())
-		err = recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true)
+		err = recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true, true)
 	default:
 		return
 	}
@@ -278,7 +278,7 @@ func (p *CodexProxy) refineCodexSocketQuota(ctx context.Context, route codexProx
 		return
 	}
 	usage := codexSocketQuotaUsage(&fetched, verdict.resetsAt, codexProxyNow().UTC())
-	if err := recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true); err != nil {
+	if err := recordCodexProxyState(ctx, p.cfg, p.service, route, &usage, false, false, true, false); err != nil {
 		p.logf("codex proxy: record state for %s: %v", route.Account, err)
 	}
 }

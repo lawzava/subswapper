@@ -89,6 +89,8 @@ type codexProxyRoute struct {
 	AddedAt         time.Time
 	SelectedAccount string
 	SelectedAt      time.Time
+	SelectedAddedAt time.Time
+	DispatchedAt    time.Time
 }
 
 type codexProxyAuthFile struct {
@@ -500,14 +502,20 @@ func (p *CodexProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// response would undo a switch made while it streamed.
 		switchTo := !unauthorized && !rejected && !route.Active
 		var usage *UsageSnapshot
+		provisional := false
 		if quotaRejected {
 			// The rejection carries no numbers; ask the usage endpoint so the
 			// account ranks last with a real reset time.
 			if fetched, err := p.fetchUsage(r.Context(), route); err == nil {
 				usage = &fetched
+			} else {
+				// Without numbers, hold the account last for a short while,
+				// as after an in-socket rejection; a later sample replaces it.
+				marker := codexSocketQuotaUsage(nil, time.Time{}, codexProxyNow().UTC())
+				usage, provisional = &marker, true
 			}
 		}
-		if err := recordCodexProxyObservation(p.cfg, p.service, route, usage, unauthorized, switchTo); err != nil {
+		if err := recordCodexProxyState(context.Background(), p.cfg, p.service, route, usage, unauthorized, switchTo, false, provisional); err != nil {
 			p.logf("codex proxy: record state for %s: %v", route.Account, err)
 		}
 		if r.Context().Err() != nil {
@@ -775,6 +783,8 @@ func codexQuotaRejected(body []byte) bool {
 // codexProxyRoutes lists accounts whose home holds a ChatGPT login: the
 // selected account first, then the alternatives in drain order, exhausted last.
 func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, error) {
+	// Stamp before the snapshot so an unseen concurrent rejection cannot look older.
+	now := codexProxyNow().UTC()
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -784,7 +794,6 @@ func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, err
 	if err != nil {
 		return nil, err
 	}
-	now := codexProxyNow().UTC()
 	serviceState := state.Service(service.Name)
 	routes := make([]codexProxyRoute, 0, len(serviceState.Accounts))
 	for name, account := range serviceState.Accounts {
@@ -803,6 +812,8 @@ func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, err
 			AddedAt:         account.AddedAt,
 			SelectedAccount: serviceState.ActiveAccount,
 			SelectedAt:      serviceState.LastSwitchedAt,
+			SelectedAddedAt: serviceState.Accounts[serviceState.ActiveAccount].AddedAt,
+			DispatchedAt:    now,
 		}
 		if usage, ok := codexProxyKnownUsage(account); ok {
 			route.Usage = usage
@@ -962,19 +973,34 @@ func (p *CodexProxy) refreshUsageIfStale(route codexProxyRoute) {
 // recordCodexProxyObservation stores what one real response revealed about an
 // account. switchTo makes the account the selected route after a rejected token.
 func recordCodexProxyObservation(cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo bool) error {
-	return recordCodexProxyState(context.Background(), cfg, service, route, usage, unauthorized, switchTo, false)
+	return recordCodexProxyState(context.Background(), cfg, service, route, usage, unauthorized, switchTo, false, false)
+}
+
+// keepOutlastingFullWindows copies into marker each stored full window that
+// marker leaves empty or that resets later than marker's, with its reset.
+// The marker's ObservedAt still dates the new rejection.
+func keepOutlastingFullWindows(marker *UsageSnapshot, stored UsageSnapshot) {
+	for _, slot := range []struct {
+		to   *LimitWindow
+		from LimitWindow
+	}{{&marker.FiveHour, stored.FiveHour}, {&marker.Weekly, stored.Weekly}} {
+		if ratio, ok := slot.from.Ratio(); ok && ratio >= 1 && (slot.to.Pct == nil || slot.from.ResetsAt.After(slot.to.ResetsAt)) {
+			*slot.to = slot.from
+		}
+	}
 }
 
 // recordCodexProxyState is recordCodexProxyObservation with a context that
 // bounds the state-lock wait, and fenceProbe, which stamps the probe clock
 // with a stored usage sample so a monitor probe that started before it cannot
-// override it on merge.
+// override it on merge. provisional marks usage as a quota marker without
+// numbers, which keeps the stored exhausted windows that outlast it.
 //
 // usage.ObservedAt is when the observation began (fetch start, or the moment
 // of an in-socket rejection). A stored ProxyUsage observed after that is
 // newer and is kept: a slow background fetch must not erase a quota marker
 // recorded while it was in flight.
-func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo, fenceProbe bool) error {
+func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfig, route codexProxyRoute, usage *UsageSnapshot, unauthorized, switchTo, fenceProbe, provisional bool) error {
 	lock, err := AcquireStateLock(ctx, cfg)
 	if err != nil {
 		return err
@@ -989,6 +1015,9 @@ func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfi
 	if !ok || !account.AddedAt.Equal(route.AddedAt) {
 		return errors.New("codex account changed during the proxied request")
 	}
+	// Judge before this observation overwrites the stored state.
+	// Codex usage has no model-scoped windows.
+	rejected := rejectedAfter(account, route.DispatchedAt, "")
 	now := codexProxyNow().UTC()
 	changed := false
 	accepted := usage != nil && !account.ProxyUsage.ObservedAt.After(usage.ObservedAt)
@@ -996,7 +1025,11 @@ func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfi
 	// token works now; an older fetch must not clear a newer rejection.
 	recovered := accepted && !usage.ObservedAt.Before(account.LastProbeStartedAt)
 	if accepted {
-		account.ProxyUsage = *usage
+		sample := *usage
+		if provisional {
+			keepOutlastingFullWindows(&sample, account.ProxyUsage)
+		}
+		account.ProxyUsage = sample
 		if fenceProbe {
 			account.LastProbeStartedAt = now
 		}
@@ -1018,10 +1051,10 @@ func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfi
 	if changed {
 		serviceState.Accounts[route.Account] = account
 	}
-	// A fallback may take over only the selection it saw at dispatch.
-	// Compare the timestamp too, so an intervening A -> C -> A is fenced.
-	if switchTo && serviceState.ActiveAccount != route.Account &&
-		serviceState.ActiveAccount == route.SelectedAccount && serviceState.LastSwitchedAt.Equal(route.SelectedAt) {
+	// A fallback may take over only the selection it saw at dispatch, and
+	// only if no rejection of its own account was recorded since.
+	if switchTo && serviceState.ActiveAccount != route.Account && !rejected &&
+		selectionUnchanged(serviceState, route.SelectedAccount, route.SelectedAt, route.SelectedAddedAt) {
 		selectAccount(state, service, route.Account, now)
 		changed = true
 	}

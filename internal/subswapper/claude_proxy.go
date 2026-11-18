@@ -79,7 +79,10 @@ type claudeProxyRoute struct {
 	Exhausted       bool
 	SelectedAccount string
 	SelectedAt      time.Time
+	SelectedAddedAt time.Time
 	DispatchedAt    time.Time
+	// Model is the request's model; a full window scoped to it rejects the request.
+	Model string
 }
 
 type claudeRateLimitObservation struct {
@@ -569,6 +572,40 @@ func markClaudeRejectedWindow(usage *UsageSnapshot, header http.Header, observed
 	}
 }
 
+// addFullWindows copies into stored each window that incoming shows full and
+// stored does not; a full stored window is never lowered. Every window that
+// incoming shows full dates the newest rejection, even one already full: a
+// core window advances stored.ObservedAt, a model window its own ObservedAt.
+// No time moves backwards. It reports whether stored changed.
+func addFullWindows(stored *UsageSnapshot, incoming UsageSnapshot) bool {
+	full := func(window LimitWindow) bool {
+		ratio, ok := window.Ratio()
+		return ok && ratio >= 1
+	}
+	added := false
+	for _, slot := range []struct {
+		to   *LimitWindow
+		from LimitWindow
+		core bool
+	}{{&stored.FiveHour, incoming.FiveHour, true}, {&stored.Weekly, incoming.Weekly, true}, {&stored.FableWeekly, incoming.FableWeekly, false}} {
+		if !full(slot.from) {
+			continue
+		}
+		if !full(*slot.to) {
+			*slot.to = slot.from
+			added = true
+		} else if !slot.core && slot.from.ObservedAt.After(slot.to.ObservedAt) {
+			slot.to.ObservedAt = slot.from.ObservedAt
+			added = true
+		}
+		if slot.core && incoming.ObservedAt.After(stored.ObservedAt) {
+			stored.ObservedAt = incoming.ObservedAt
+			added = true
+		}
+	}
+	return added
+}
+
 // markClaudeFiveHourRejected fills the five-hour window. An account without
 // one (verified Ultra) is held through a synthesized window instead: a full
 // window with no reset time would never clear, because LimitWindow.Ratio
@@ -666,7 +703,9 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig, model string) ([]claud
 			Active:          serviceState.ActiveAccount == name,
 			SelectedAccount: serviceState.ActiveAccount,
 			SelectedAt:      serviceState.LastSwitchedAt,
+			SelectedAddedAt: serviceState.Accounts[serviceState.ActiveAccount].AddedAt,
 			DispatchedAt:    now,
+			Model:           model,
 		}
 		if usage, ok := claudeProxyKnownUsage(account, status.Revision); ok {
 			route.Usage = usage
@@ -731,6 +770,8 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 	if !ok || account.SetupTokenRevision != route.Revision {
 		return errors.New("claude account changed during the proxied request")
 	}
+	// Judge before this observation overwrites the stored state.
+	rejected := rejectedAfter(account, route.DispatchedAt, route.Model)
 	now := claudeProxyNow().UTC()
 	changed := false
 	if observation.HasUsage {
@@ -748,9 +789,18 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 					break
 				}
 			}
+		} else {
+			usage.FableWeekly.ObservedAt = usage.ObservedAt
 		}
-		account.ProxyUsage = usage
-		changed = true
+		// Headers from a request dispatched before a stored quota rejection that
+		// applies to it must not erase that rejection, as with a token rejection.
+		// The windows its own rejection found full still bind, so they are added.
+		if !quotaRejectedAfter(account.ProxyUsage, route.DispatchedAt, route.Model) {
+			account.ProxyUsage = usage
+			changed = true
+		} else if observation.Rejected && addFullWindows(&account.ProxyUsage, usage) {
+			changed = true
+		}
 	}
 	if unauthorized {
 		account.CredentialsError = "setup token authentication rejected"
@@ -770,10 +820,10 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 	if changed {
 		serviceState.Accounts[route.Account] = account
 	}
-	// A fallback may take over only the selection it saw at dispatch.
-	// Compare the timestamp too, so an intervening A -> C -> A is fenced.
-	if switchTo && serviceState.ActiveAccount != route.Account &&
-		serviceState.ActiveAccount == route.SelectedAccount && serviceState.LastSwitchedAt.Equal(route.SelectedAt) {
+	// A fallback may take over only the selection it saw at dispatch, and
+	// only if no rejection of its own account was recorded since.
+	if switchTo && serviceState.ActiveAccount != route.Account && !rejected &&
+		selectionUnchanged(serviceState, route.SelectedAccount, route.SelectedAt, route.SelectedAddedAt) {
 		selectAccount(state, service, route.Account, now)
 		changed = true
 	}

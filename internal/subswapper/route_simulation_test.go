@@ -16,7 +16,8 @@ import (
 // code, so neither goroutine timing nor map iteration determines event order.
 // The collector is synthetic; MonitorOnce's locked merge and decision are real.
 func TestRouteInterleavingSimulation(t *testing.T) {
-	seeds := []uint64{1, 2, 7, 42}
+	// 1022 is the only default seed that reaches ReaddFences.
+	seeds := []uint64{1, 2, 7, 42, 1022}
 	defaultSeedCount := len(seeds)
 	defaultSeeds := os.Getenv("SUBSWAPPER_SIM_SEED") == ""
 	if value := os.Getenv("SUBSWAPPER_SIM_SEED"); value != "" {
@@ -54,6 +55,11 @@ func TestRouteInterleavingSimulation(t *testing.T) {
 				coverage[service].StaleSuccesses += counts[service].StaleSuccesses
 				coverage[service].StaleIdentities += counts[service].StaleIdentities
 				coverage[service].Recoveries += counts[service].Recoveries
+				coverage[service].RejectionFences += counts[service].RejectionFences
+				coverage[service].ReaddFences += counts[service].ReaddFences
+				coverage[service].KeptQuotaRejections += counts[service].KeptQuotaRejections
+				coverage[service].AddedRejectedWindows += counts[service].AddedRejectedWindows
+				coverage[service].RepeatedRejections += counts[service].RepeatedRejections
 			}
 		}
 	}
@@ -63,7 +69,8 @@ func TestRouteInterleavingSimulation(t *testing.T) {
 	if defaultSeeds && defaultSeedsRun == defaultSeedCount && !t.Failed() {
 		for service, counts := range coverage {
 			if counts.FencedFallbacks == 0 || counts.FallbackTakeovers == 0 || counts.StaleSuccesses == 0 ||
-				counts.Recoveries == 0 || counts.StaleIdentities == 0 {
+				counts.Recoveries == 0 || counts.StaleIdentities == 0 || counts.RejectionFences == 0 || counts.ReaddFences == 0 ||
+				counts.KeptQuotaRejections == 0 || service == 0 && (counts.AddedRejectedWindows == 0 || counts.RepeatedRejections == 0) {
 				t.Errorf("default seeds missed required paths for %s: %+v", []string{"claude", "codex"}[service], counts)
 			}
 		}
@@ -76,18 +83,34 @@ type routeSimCoverage struct {
 	StaleSuccesses    int
 	StaleIdentities   int
 	Recoveries        int
+	// RejectionFences counts fallback successes stopped only by a rejection
+	// of their account recorded after dispatch.
+	RejectionFences int
+	// ReaddFences counts fallback successes stopped only by a force-remove
+	// and re-add of the account selected at dispatch.
+	ReaddFences int
+	// KeptQuotaRejections counts successes dispatched before a live quota
+	// rejection that completed without erasing it.
+	KeptQuotaRejections int
+	// AddedRejectedWindows counts Claude 429s dispatched before a live quota
+	// rejection that named a window not yet full. Codex has no such case.
+	AddedRejectedWindows int
+	// RepeatedRejections counts Claude 429s dispatched before a live quota
+	// rejection that named a window already full. Codex has no such case.
+	RepeatedRejections int
 }
 
 type routeSimRequest struct {
-	service    ServiceConfig
-	claude     claudeProxyRoute
-	codex      codexProxyRoute
-	account    string
-	active     string
-	switchedAt time.Time
-	addedAt    time.Time
-	startedAt  time.Time
-	outcome    int // success, quota, 401
+	service       ServiceConfig
+	claude        claudeProxyRoute
+	codex         codexProxyRoute
+	account       string
+	active        string
+	activeAddedAt time.Time
+	switchedAt    time.Time
+	addedAt       time.Time
+	startedAt     time.Time
+	outcome       int // success, quota, 401
 }
 
 func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage) {
@@ -102,6 +125,8 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 	t.Cleanup(func() {
 		claudeProxyNow, codexProxyNow, routeStateNow, monitorUsageSnapshot = oldClaude, oldCodex, oldRoute, oldCollector
 	})
+	// CreateAccountHome links shared Claude configuration from the native home.
+	t.Setenv("HOME", t.TempDir())
 	cfg := setupTokenTestConfig(t.TempDir())
 	cfg.Services = append(cfg.Services, ServiceConfig{Name: "codex", Kind: "codex", AccountMode: AccountModeHome})
 	cfg.ApplyDefaults()
@@ -143,8 +168,21 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 	var pending [6]*routeSimRequest
 	var probe *State
 	var results []ServiceStatus
+	var probed []string
+	var probeAt time.Time
 	var removed string
 	var removedService ServiceConfig
+	// The model's own history of each account incarnation by service/account.
+	// It changes only on simulated events, never by reading stored state.
+	models := map[string]*routeSimAccountModel{}
+	model := func(key string) *routeSimAccountModel {
+		if models[key] == nil {
+			models[key] = &routeSimAccountModel{}
+		}
+		return models[key]
+	}
+	// Accounts removed while a monitor probe was in flight; its merge must skip them.
+	removedSinceProbe := map[string]bool{}
 	for step := 0; step < 96 || probe != nil || routeSimPending(pending) || removed != ""; step++ {
 		actors := []int{0, 1, 2, 3, 4, 5, 6, 7, 8}
 		if step >= 96 {
@@ -174,7 +212,8 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 			counts := &coverage[actor/3]
 			if pending[actor] == nil {
 				ss := before.Service(service.Name)
-				request := &routeSimRequest{service: service, active: ss.ActiveAccount, switchedAt: ss.LastSwitchedAt, startedAt: now, outcome: rng.IntN(3)}
+				request := &routeSimRequest{service: service, active: ss.ActiveAccount, activeAddedAt: ss.Accounts[ss.ActiveAccount].AddedAt,
+					switchedAt: ss.LastSwitchedAt, startedAt: now, outcome: rng.IntN(3)}
 				if service.Name == "claude" {
 					routes, err := claudeProxyRoutes(cfg, service, "")
 					if err != nil {
@@ -212,16 +251,26 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 				usage := routeSimUsage(request.startedAt, pct, request.claude.Revision)
 				var err error
 				switchTo := request.outcome == 0 && request.account != request.active
+				// A Codex quota sample reads both windows full. A Claude 429 marks
+				// only its binding window, chosen by step parity so the rng
+				// sequence is unchanged; the two windows reset at different times.
+				window := -1
 				if service.Name == "claude" {
 					// Claude headers are stamped when received, unlike a Codex fetch.
 					usage.ObservedAt = now
+					if request.outcome == 1 {
+						window = step % 2
+						usage = routeSimUsage(request.startedAt, 10, request.claude.Revision)
+						usage.ObservedAt = now
+						[]*LimitWindow{&usage.FiveHour, &usage.Weekly}[window].Pct = PtrFloat64(100)
+					}
 					err = recordClaudeProxyObservation(cfg, service, request.claude, claudeRateLimitObservation{HasUsage: request.outcome != 2, Usage: usage, Rejected: request.outcome == 1}, request.outcome == 2, switchTo)
 				} else {
 					var sample *UsageSnapshot
 					if request.outcome != 2 {
 						sample = &usage
 					}
-					err = recordCodexProxyState(context.Background(), cfg, service, request.codex, sample, request.outcome == 2, switchTo, false)
+					err = recordCodexProxyState(context.Background(), cfg, service, request.codex, sample, request.outcome == 2, switchTo, false, false)
 				}
 				after := routeTestState(t, cfg)
 				oldSS, newSS := before.Service(service.Name), after.Service(service.Name)
@@ -235,15 +284,45 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 				} else if err != nil {
 					fail("record: %v", err)
 				}
-				if oldSS.ActiveAccount != request.active || !oldSS.LastSwitchedAt.Equal(request.switchedAt) {
-					if newSS.ActiveAccount != oldSS.ActiveAccount || !newSS.LastSwitchedAt.Equal(oldSS.LastSwitchedAt) {
-						violation("stale completion undid newer switch: %s active=%s -> %s", service.Name, oldSS.ActiveAccount, newSS.ActiveAccount)
-					} else if switchTo && oldSS.ActiveAccount != request.account && oldAccount.AddedAt.Equal(request.addedAt) {
-						counts.FencedFallbacks++
+				key := service.Name + "/" + request.account
+				identity := oldAccount.AddedAt.Equal(request.addedAt)
+				selectionChanged := newSS.ActiveAccount != oldSS.ActiveAccount || !newSS.LastSwitchedAt.Equal(oldSS.LastSwitchedAt)
+				switched := oldSS.ActiveAccount != request.active || !oldSS.LastSwitchedAt.Equal(request.switchedAt)
+				// Force-remove and re-add selects the account again without a switch.
+				readded := !oldSS.Accounts[oldSS.ActiveAccount].AddedAt.Equal(request.activeAddedAt)
+				m := model(key)
+				quotaAt := m.quotaLatest()
+				newerRejection := identity && (request.startedAt.Before(m.credAt) || request.startedAt.Before(quotaAt))
+				if identity && request.outcome != 2 && request.startedAt.Before(quotaAt) {
+					if !newAccount.ProxyUsage.Exhausted() {
+						violation("stale observation erased newer quota rejection: %s/%s", service.Name, request.account)
+					} else if request.outcome == 0 {
+						counts.KeptQuotaRejections++
+					} else if window >= 0 && m.quota[window].IsZero() {
+						counts.AddedRejectedWindows++
+					} else if window >= 0 {
+						counts.RepeatedRejections++
 					}
 				}
-				if oldAccount.AddedAt.Equal(request.addedAt) && switchTo &&
-					oldSS.ActiveAccount == request.active && oldSS.LastSwitchedAt.Equal(request.switchedAt) {
+				if switched || readded {
+					if selectionChanged {
+						violation("stale completion undid newer selection: %s active=%s -> %s (re-added=%v)", service.Name, oldSS.ActiveAccount, newSS.ActiveAccount, readded)
+					} else if switchTo && oldSS.ActiveAccount != request.account && identity {
+						if switched {
+							counts.FencedFallbacks++
+						} else if !newerRejection {
+							counts.ReaddFences++
+						}
+					}
+				}
+				if identity && switchTo && newerRejection {
+					if selectionChanged {
+						violation("stale success selected %s/%s despite a newer rejection", service.Name, request.account)
+					} else if !switched && !readded {
+						counts.RejectionFences++
+					}
+				}
+				if identity && switchTo && !newerRejection && !switched && !readded {
 					if newSS.ActiveAccount != request.account || !newSS.LastSwitchedAt.Equal(now) {
 						violation("unchanged selection did not fail over: %s -> %s", service.Name, request.account)
 					} else {
@@ -268,6 +347,9 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 						counts.Recoveries++
 					}
 				}
+				if identity {
+					m.complete(service.Name == "claude", request.outcome, window, request.startedAt, usage.ObservedAt, now)
+				}
 			}
 		case actor == 6:
 			service := cfg.Services[rng.IntN(2)]
@@ -281,6 +363,8 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 			if probe == nil {
 				probe = before
 				results = nil
+				probed, probeAt = nil, now
+				clear(removedSinceProbe)
 				var samples []string
 				for _, service := range cfg.Services {
 					ss := probe.Service(service.Name)
@@ -290,6 +374,7 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 						if !ok {
 							continue
 						}
+						probed = append(probed, service.Name+"/"+name)
 						account.LastProbeStartedAt = now
 						account.Usage = routeSimUsage(now, float64(rng.IntN(2)*100), account.SetupTokenRevision)
 						account.CredentialsError, account.FetchBackoffUntil = "", time.Time{}
@@ -313,7 +398,8 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 				after := routeTestState(t, cfg)
 				for _, service := range cfg.Services {
 					oldSS, snapshotSS, gotSS := before.Service(service.Name), probe.Service(service.Name), after.Service(service.Name)
-					if (oldSS.ActiveAccount != snapshotSS.ActiveAccount || !oldSS.LastSwitchedAt.Equal(snapshotSS.LastSwitchedAt)) &&
+					if (oldSS.ActiveAccount != snapshotSS.ActiveAccount || !oldSS.LastSwitchedAt.Equal(snapshotSS.LastSwitchedAt) ||
+						!oldSS.Accounts[oldSS.ActiveAccount].AddedAt.Equal(snapshotSS.Accounts[snapshotSS.ActiveAccount].AddedAt)) &&
 						(gotSS.ActiveAccount != oldSS.ActiveAccount || !gotSS.LastSwitchedAt.Equal(oldSS.LastSwitchedAt)) {
 						violation("stale monitor undid newer switch: %s", service.Name)
 					}
@@ -326,6 +412,11 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 						}
 					}
 				}
+				for _, key := range probed {
+					if !removedSinceProbe[key] {
+						model(key).probe(probeAt)
+					}
+				}
 				probe = nil
 			}
 		default:
@@ -333,6 +424,10 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 				removedService = cfg.Services[rng.IntN(2)]
 				names := routeSimAccountNames(before.Service(removedService.Name))
 				removed = names[rng.IntN(len(names))]
+				if active := before.Service(removedService.Name).ActiveAccount; active != "" && rng.IntN(2) == 0 {
+					// Removing the selection is the case that re-selects on re-add.
+					removed = active
+				}
 				log("%s force-remove %s", removedService.Name, removed)
 				if removedService.Name == "claude" {
 					if err := RemoveClaudeSetupToken(context.Background(), cfg, "claude", removed); err != nil {
@@ -342,14 +437,18 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 				if err := RemoveAccountWithOptions(cfg, removedService.Name, removed, true, false); err != nil {
 					fail("remove: %v", err)
 				}
+				// Removal ends the incarnation and its history; a re-add starts fresh.
+				delete(models, removedService.Name+"/"+removed)
+				removedSinceProbe[removedService.Name+"/"+removed] = true
 				if before.Service(removedService.Name).ActiveAccount == removed && routeTestState(t, cfg).Service(removedService.Name).ActiveAccount != "" {
 					violation("force-removing the active account did not clear selection")
 				}
 			} else {
 				log("%s re-add %s", removedService.Name, removed)
-				state := routeTestState(t, cfg)
-				state.Service(removedService.Name).Accounts[removed] = AccountState{Name: removed, AddedAt: now}
-				routeTestSave(t, cfg, state)
+				// The production add path selects the account when nothing is selected.
+				if _, _, err := CreateAccountHome(cfg, removedService.Name, removed, ""); err != nil {
+					fail("re-add: %v", err)
+				}
 				if removedService.Name == "claude" {
 					if _, err := ReplaceClaudeSetupToken(context.Background(), cfg, "claude", removed, fmt.Sprintf("synthetic-%s-%d", removed, step), nil); err != nil {
 						fail("re-add setup token: %v", err)
@@ -368,10 +467,99 @@ func runRouteSimulation(t *testing.T, seed uint64, coverage *[2]routeSimCoverage
 			if got.LastSwitchedAt.Before(old.LastSwitchedAt) {
 				violation("LastSwitchedAt went backwards: %s", service.Name)
 			}
+			// Every rejection the model still holds must still be stored.
+			for _, name := range []string{"a", "b", "c"} {
+				m := models[service.Name+"/"+name]
+				if m == nil {
+					continue
+				}
+				account := got.Accounts[name]
+				// Report each lost rejection once, at the event that lost it.
+				if !m.credAt.IsZero() && account.CredentialsError == "" && !m.credAt.Equal(m.lostCred) {
+					m.lostCred = m.credAt
+					violation("token rejection at %s lost: %s/%s", m.credAt.Format(time.RFC3339), service.Name, name)
+				}
+				if latest := m.quotaLatest(); !latest.IsZero() && !latest.Equal(m.lostQuota) {
+					lost := !account.ProxyUsage.ObservedAt.Equal(latest)
+					for window, at := range m.quota {
+						ratio, _ := []LimitWindow{account.ProxyUsage.FiveHour, account.ProxyUsage.Weekly}[window].Ratio()
+						lost = lost || !at.IsZero() && ratio < 1
+					}
+					if lost {
+						m.lostQuota = latest
+						violation("quota rejection at %s lost: %s/%s windows=%v", latest.Format(time.RFC3339), service.Name, name, m.quota)
+					}
+				}
+			}
 		}
 	}
 	if len(violations) != 0 {
 		fail("%s", strings.Join(violations, "\n"))
+	}
+}
+
+// routeSimAccountModel is the simulation's own history of one account
+// incarnation. A rejection retires only on an event that supersedes it, never
+// because stored state stopped showing it.
+type routeSimAccountModel struct {
+	credAt   time.Time    // newest live token rejection
+	quota    [2]time.Time // evidence time of the live five-hour and weekly rejections
+	sampleAt time.Time    // Codex: newest accepted proxy sample
+
+	lostCred, lostQuota time.Time // last rejection reported lost
+}
+
+// quotaLatest is the newest live quota rejection, or zero.
+func (m *routeSimAccountModel) quotaLatest() time.Time {
+	if m.quota[0].After(m.quota[1]) {
+		return m.quota[0]
+	}
+	return m.quota[1]
+}
+
+// complete applies one recorded completion. A request's observation counts
+// only if no live quota rejection is newer than its dispatch (Claude) or its
+// sample is not older than the newest accepted one (Codex, which orders
+// samples by ObservedAt). An accepted sample replaces the quota state; a
+// usage-bearing response from a request dispatched at or after a token
+// rejection proves the token works again. A Claude rejection that does not
+// count still adds the window it names (window; -1 means both windows).
+func (m *routeSimAccountModel) complete(claude bool, outcome, window int, dispatchedAt, observedAt, now time.Time) {
+	if outcome == 2 {
+		m.credAt = now
+		return
+	}
+	accepted := !dispatchedAt.Before(m.quotaLatest())
+	if !claude {
+		accepted = !observedAt.Before(m.sampleAt)
+		if accepted {
+			m.sampleAt = observedAt
+		}
+	}
+	if !dispatchedAt.Before(m.credAt) && (claude || accepted && !observedAt.Before(m.credAt)) {
+		m.credAt = time.Time{}
+	}
+	if accepted {
+		m.quota = [2]time.Time{}
+	} else if !claude || outcome != 1 {
+		return
+	}
+	// Each rejection dates its window, also one already live; never backwards.
+	if outcome == 1 {
+		for slot := range m.quota {
+			if (window < 0 || slot == window) && observedAt.After(m.quota[slot]) {
+				m.quota[slot] = observedAt
+			}
+		}
+	}
+}
+
+// probe applies a merged monitor probe that started at startedAt. It clears
+// a token rejection no newer than its start. Monitor usage is not a proxy
+// sample, so it leaves quota rejections alone.
+func (m *routeSimAccountModel) probe(startedAt time.Time) {
+	if !startedAt.Before(m.credAt) {
+		m.credAt = time.Time{}
 	}
 }
 

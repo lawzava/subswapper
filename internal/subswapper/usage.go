@@ -40,6 +40,11 @@ type LimitWindow struct {
 	Limit    float64   `json:"limit,omitempty"`
 	Pct      *float64  `json:"pct,omitempty"`
 	ResetsAt time.Time `json:"resets_at,omitzero"`
+	// ObservedAt is when a response last reported this window. Only the
+	// proxy sets it, on model-scoped windows, which a response from another
+	// model carries over unreported. Zero (older state, other sources) is
+	// treated as observed long ago.
+	ObservedAt time.Time `json:"observed_at,omitzero"`
 }
 
 type AccountStatus struct {
@@ -376,6 +381,21 @@ func (u UsageSnapshot) ModelExhausted(model string) bool {
 			continue
 		}
 		if ratio, ok := scoped.window.Ratio(); ok && ratio >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// modelRejectedAfter reports a full window scoped to model that a response
+// reported after t. A window with no observation time never matches.
+func (u UsageSnapshot) modelRejectedAfter(model string, t time.Time) bool {
+	model = strings.ToLower(model)
+	for _, scoped := range u.modelWindows() {
+		if !strings.Contains(model, scoped.label) {
+			continue
+		}
+		if ratio, ok := scoped.window.Ratio(); ok && ratio >= 1 && t.Before(scoped.window.ObservedAt) {
 			return true
 		}
 	}
