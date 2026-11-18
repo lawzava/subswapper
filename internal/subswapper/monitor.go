@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+var monitorUsageSnapshot = collectUsageSnapshot
+
 type CycleResult struct {
 	Results  []ServiceStatus
 	Switches []SwitchEvent
@@ -47,7 +49,7 @@ func StatusOnce(ctx context.Context, cfg Config) (CycleResult, error) {
 }
 
 func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
-	probed, results, err := collectUsageSnapshot(ctx, cfg)
+	probed, results, err := monitorUsageSnapshot(ctx, cfg)
 	if err != nil {
 		return CycleResult{Errors: []error{err}}
 	}
@@ -64,7 +66,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 	}
 	mergeProbeState(state, probed)
 	if autoSwitch {
-		now := time.Now().UTC()
+		now := routeStateNow().UTC()
 		for index := range cycle.Results {
 			result := &cycle.Results[index]
 			serviceState := state.Service(result.Service.Name)
@@ -97,7 +99,7 @@ func MonitorOnce(ctx context.Context, cfg Config, autoSwitch bool) CycleResult {
 	} else {
 		recordSwitches(cfg, switched, HistorySwitchAuto)
 	}
-	recordUsageSamples(cfg, time.Now(), cycle.Results)
+	recordUsageSamples(cfg, routeStateNow(), cycle.Results)
 	return cycle
 }
 
@@ -150,7 +152,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 			continue
 		}
 		result := results[index]
-		best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio(), cfg.Monitor.StaleUsageAfterDuration(), time.Now().UTC())
+		best, ok := BestAccount(result.Accounts, cfg.Monitor.SwitchThresholdRatio(), cfg.Monitor.StaleUsageAfterDuration(), routeStateNow().UTC())
 		if !ok {
 			err := fmt.Errorf("service %q has no selectable accounts", service.Name)
 			if !all {
@@ -163,7 +165,7 @@ func SwitchBest(ctx context.Context, cfg Config, serviceName string) ([]SwitchEv
 			continue
 		}
 		switched = append(switched, historySwitch{service, serviceState.ActiveAccount, best.Account.Name})
-		selectAccount(state, service, best.Account.Name, time.Now().UTC())
+		selectAccount(state, service, best.Account.Name, routeStateNow().UTC())
 		switches = append(switches, SwitchEvent{Service: service.Name, Account: best.Account.Name})
 	}
 	if !matched {
@@ -190,7 +192,7 @@ func collectUsageSnapshot(ctx context.Context, cfg Config) (*State, []ServiceSta
 	if err != nil {
 		return nil, nil, err
 	}
-	startedAt := time.Now().UTC()
+	startedAt := routeStateNow().UTC()
 	for _, service := range state.Services {
 		if service == nil {
 			continue

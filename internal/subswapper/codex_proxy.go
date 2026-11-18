@@ -80,12 +80,15 @@ type CodexProxy struct {
 }
 
 type codexProxyRoute struct {
-	Account   string
-	Token     string
-	AccountID string
-	Active    bool
-	Usage     UsageSnapshot
-	Exhausted bool
+	Account         string
+	Token           string
+	AccountID       string
+	Active          bool
+	Usage           UsageSnapshot
+	Exhausted       bool
+	AddedAt         time.Time
+	SelectedAccount string
+	SelectedAt      time.Time
 }
 
 type codexProxyAuthFile struct {
@@ -793,10 +796,13 @@ func codexProxyRoutes(cfg Config, service ServiceConfig) ([]codexProxyRoute, err
 			continue
 		}
 		route := codexProxyRoute{
-			Account:   name,
-			Token:     token,
-			AccountID: accountID,
-			Active:    serviceState.ActiveAccount == name,
+			Account:         name,
+			Token:           token,
+			AccountID:       accountID,
+			Active:          serviceState.ActiveAccount == name,
+			AddedAt:         account.AddedAt,
+			SelectedAccount: serviceState.ActiveAccount,
+			SelectedAt:      serviceState.LastSwitchedAt,
 		}
 		if usage, ok := codexProxyKnownUsage(account); ok {
 			route.Usage = usage
@@ -980,8 +986,8 @@ func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfi
 	}
 	serviceState := state.Service(service.Name)
 	account, ok := serviceState.Accounts[route.Account]
-	if !ok {
-		return errors.New("codex account removed during the proxied request")
+	if !ok || !account.AddedAt.Equal(route.AddedAt) {
+		return errors.New("codex account changed during the proxied request")
 	}
 	now := codexProxyNow().UTC()
 	changed := false
@@ -1012,7 +1018,10 @@ func recordCodexProxyState(ctx context.Context, cfg Config, service ServiceConfi
 	if changed {
 		serviceState.Accounts[route.Account] = account
 	}
-	if switchTo && serviceState.ActiveAccount != route.Account {
+	// A fallback may take over only the selection it saw at dispatch.
+	// Compare the timestamp too, so an intervening A -> C -> A is fenced.
+	if switchTo && serviceState.ActiveAccount != route.Account &&
+		serviceState.ActiveAccount == route.SelectedAccount && serviceState.LastSwitchedAt.Equal(route.SelectedAt) {
 		selectAccount(state, service, route.Account, now)
 		changed = true
 	}

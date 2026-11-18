@@ -71,12 +71,15 @@ type ClaudeProxy struct {
 }
 
 type claudeProxyRoute struct {
-	Account   string
-	Token     string
-	Revision  string
-	Active    bool
-	Usage     UsageSnapshot
-	Exhausted bool
+	Account         string
+	Token           string
+	Revision        string
+	Active          bool
+	Usage           UsageSnapshot
+	Exhausted       bool
+	SelectedAccount string
+	SelectedAt      time.Time
+	DispatchedAt    time.Time
 }
 
 type claudeRateLimitObservation struct {
@@ -632,6 +635,8 @@ func claudeRequestModel(body []byte) string {
 // account first, then the alternatives in drain order, exhausted accounts
 // last. A full model window exhausts a route only for requests to that model.
 func claudeProxyRoutes(cfg Config, service ServiceConfig, model string) ([]claudeProxyRoute, error) {
+	// Stamp before the snapshot so an unseen concurrent rejection cannot look older.
+	now := claudeProxyNow().UTC()
 	lock, err := AcquireStateLock(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -641,7 +646,6 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig, model string) ([]claud
 	if err != nil {
 		return nil, err
 	}
-	now := claudeProxyNow().UTC()
 	serviceState := state.Service(service.Name)
 	routes := make([]claudeProxyRoute, 0, len(serviceState.Accounts))
 	for name, account := range serviceState.Accounts {
@@ -656,10 +660,13 @@ func claudeProxyRoutes(cfg Config, service ServiceConfig, model string) ([]claud
 			continue
 		}
 		route := claudeProxyRoute{
-			Account:  name,
-			Token:    token,
-			Revision: status.Revision,
-			Active:   serviceState.ActiveAccount == name,
+			Account:         name,
+			Token:           token,
+			Revision:        status.Revision,
+			Active:          serviceState.ActiveAccount == name,
+			SelectedAccount: serviceState.ActiveAccount,
+			SelectedAt:      serviceState.LastSwitchedAt,
+			DispatchedAt:    now,
 		}
 		if usage, ok := claudeProxyKnownUsage(account, status.Revision); ok {
 			route.Usage = usage
@@ -753,7 +760,9 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 		// clearing the rejection with its older result.
 		account.LastProbeStartedAt = now
 		changed = true
-	} else if account.CredentialsError != "" && observation.HasUsage {
+	} else if account.CredentialsError != "" && observation.HasUsage && !route.DispatchedAt.Before(account.LastProbeStartedAt) {
+		// Headers from an already in-flight request do not prove recovery
+		// from a token rejection recorded after that request was dispatched.
 		account.CredentialsError = ""
 		account.FetchBackoffUntil = time.Time{}
 		changed = true
@@ -761,7 +770,10 @@ func recordClaudeProxyObservation(cfg Config, service ServiceConfig, route claud
 	if changed {
 		serviceState.Accounts[route.Account] = account
 	}
-	if switchTo && serviceState.ActiveAccount != route.Account {
+	// A fallback may take over only the selection it saw at dispatch.
+	// Compare the timestamp too, so an intervening A -> C -> A is fenced.
+	if switchTo && serviceState.ActiveAccount != route.Account &&
+		serviceState.ActiveAccount == route.SelectedAccount && serviceState.LastSwitchedAt.Equal(route.SelectedAt) {
 		selectAccount(state, service, route.Account, now)
 		changed = true
 	}
