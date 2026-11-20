@@ -1,11 +1,16 @@
 # OpenCode built-in OpenAI through Subswapper
 
-Version **0.2.0**, targeting **OpenCode 2.2.6**, with the real
+Version **0.2.1**, targeting **OpenCode 2.2.6**, with the real
 `@opencode/plugin@2.2.6` SDK pinned in `package-lock.json`. Requires Node 24+
 for development and POSIX credential permissions. This is a local server
 plugin, not a published npm package or a new model provider.
 
 ## Install and configure
+
+Version 0.2.0 exposed the bridge capability through `GET /api/model` and
+`GET /api/provider`. Install 0.2.1, then restart the OpenCode server. The
+capability is per process and rotates on restart; replacing files alone does
+not revoke the exposed capability.
 
 First configure Subswapper's Codex accounts and run its proxy. On a hub client,
 configure a persistent `proxy_listen` relay and run `subswapper proxy`; a
@@ -14,7 +19,7 @@ server. The plugin does not start Subswapper or create credentials.
 
 Copy `index.ts`, `catalog.ts`, `private-group.ts`, `package.json` and `package-lock.json` into a private, immutable
 versioned installation directory, for example
-`~/.local/share/subswapper-opencode/0.2.0/`. Install its runtime dependencies:
+`~/.local/share/subswapper-opencode/0.2.1/`. Install its runtime dependencies:
 
 ```sh
 npm ci --omit=dev --ignore-scripts --no-audit --no-fund
@@ -24,7 +29,7 @@ Run that command in the installed directory. Do not copy credential files.
 From any directory, this **read-only** helper prints a standalone JSON config snippet:
 
 ```sh
-subswapper setup opencode -plugin "$HOME/.local/share/subswapper-opencode/0.2.0" \
+subswapper setup opencode -plugin "$HOME/.local/share/subswapper-opencode/0.2.1" \
   -config "$HOME/.config/subswapper/config.json"
 ```
 
@@ -42,7 +47,7 @@ Do not install it both ways.
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [{
-    "package": "/absolute/path/to/subswapper-opencode/0.2.0",
+    "package": "/absolute/path/to/subswapper-opencode/0.2.1",
     "options": { "config": "/absolute/path/to/subswapper/config.json", "service": "codex" }
   }]
 }
@@ -91,26 +96,48 @@ loading a plugin into a connecting client does not change the server's route.
 
 ## Safety and behavior
 
-- Built-in `openai` uses the private bridge as its provider-level base URL and
-  a private `x-subswapper-bridge` capability header on providers and models.
-  This covers native calls that have no session hooks,
-  including stateless image and decision generation. Session hooks also guard
+- Built-in `openai` uses the private bridge as its provider-level base URL.
+  Provider and model settings use the fixed public activation key
+  `subswapper-bridge`. The random bridge capability exists only in process
+  memory, per-request session-hook headers and the plugin's own in-process
+  `/models` inventory request. It never appears in provider/model settings,
+  static headers or plugin storage. Session hooks guard
   HTTP and WebSocket destinations. Model overrides cannot restore a public API
   URL, unavailable text model, paid cost estimate, or `pro` reasoning variant.
   Compression is disabled. Native compaction stays enabled; the configured
   HTTP/WebSocket transport is retained.
 - OpenCode's native conversion drops Web `Request.redirect`. Therefore a
   private per-plugin loopback bridge, on an ephemeral port, owns credential
-  attachment. Native OpenCode requests carry a random bridge capability, **not
-  the proxy placeholder**. Authentication uses the private header, not
+  attachment. Session-hooked requests carry the random `x-subswapper-bridge`
+  capability, **not the proxy placeholder**. Authentication uses that header, not
   `Authorization`, which native stateless calls can replace with the dummy
   integration key. Neither that key nor a Bearer header alone grants bridge
-  access. The bridge strips its capability header before forwarding and streams
+  access. On Linux, stateless calls without a valid capability can POST only to
+  `/images/generations`, `/images/edits` and `/decisions`. The bridge verifies
+  that the loopback TCP client socket belongs to the OpenCode process through
+  `/proc/self/net/tcp`, `/proc/self/net/tcp6` and `/proc/self/fd`. Missing or
+  ambiguous ownership data fails closed, except an absent `tcp6` table on hosts
+  without IPv6. Positive ownership is cached for that
+  connection, without widening its allowed methods or paths. Stateless image
+  and decision calls are unsupported on other platforms; session-hooked calls
+  still use the capability. Any HTTP client inside the OpenCode process can POST
+  to those three paths. Ownership means the socket descriptor is in OpenCode's
+  descriptor table. This assumes OpenCode does not share its client sockets and
+  both ends use the same network namespace. It does not protect against a
+  same-user process that can ptrace OpenCode or read its memory. Other loaded
+  plugins remain inside this trust boundary.
+  In-flight checks share work per socket. At most four sockets are verified at
+  once; excess requests get 401 without queuing. Checks limit each TCP table to
+  4 MiB and scan at most 65536 descriptors, with one retry for missing
+  ownership. If OpenCode's HTTP client routes `127.0.0.1` through an environment
+  proxy, stateless calls fail with 401. Exempt loopback with `NO_PROXY`.
+  WebSocket upgrades always require the capability.
+  The bridge strips its capability header before forwarding and streams
   only to the configured proxy's `/backend-api/codex` tree using Node HTTP,
   which never follows redirects. It converts
   every 3xx into a secret-free 502 with no `Location` header. This guarantee is
   tested across the SDK's real Effect HTTP conversion and dispatch.
-- The bridge accepts only capability-authenticated canonical ASCII paths,
+- The bridge accepts only authenticated canonical ASCII paths,
   with GET, HEAD, POST, PUT, PATCH, DELETE or OPTIONS. It forwards queries,
   content types, bodies and error/stream bytes, preserves
   cancellation/backpressure, strips hop-by-hop headers, and closes on plugin
@@ -202,14 +229,19 @@ response, not proof a later inference or image generation will succeed.
 
 | Request family | Route and boundary |
 | --- | --- |
-| Chat, tools, continuations, titles | HTTP or WS `/responses`; session guards plus provider bridge |
-| Native compact | HTTP `/responses/compact`; no forced summary substitute |
-| Image generation / editing | `/images/generations`, `/images/edits`; provider bridge even without session hooks |
-| Hosted image tool | `/responses`, same bridge |
-| Native decision / speech / transcription | `/decisions`, `/audio/speech`, `/audio/transcriptions`; provider bridge, backend support not assumed |
-| Discovery / upload / file content | Canonical `/models`, `/files`, `/uploads` paths are bridged; no automatic upload claim |
+| Chat, tools, continuations, titles | HTTP or WS `/responses`; session-hook capability required |
+| Native compact | HTTP `/responses/compact`; session-hook capability required; no forced summary substitute |
+| Image generation / editing | `/images/generations`, `/images/edits`; without session hooks, Linux same-process socket ownership is required |
+| Hosted image tool | `/responses`; session-hook capability required |
+| Native decision | `/decisions`; without session hooks, Linux same-process socket ownership is required; backend support not assumed |
+| Speech / transcription | `/audio/speech`, `/audio/transcriptions`; requires session-hook capability, stateless native calls are unsupported |
+| Discovery / upload / file content | Canonical `/models`, `/files`, `/uploads` paths require the session-hook capability; the plugin supplies it for its own inventory request; no automatic upload claim |
 | Other origins / encoded or malformed paths | Rejected before attaching the placeholder |
 | Experimental Voice / Realtime | **Unsupported and outside the provider bridge.** OpenCode 2.2.6 reads its API-key integration directly and calls public OpenAI Live/Realtime endpoints. ChatGPT sign-in is explicitly unsupported by its source. A dummy API key fails OpenAI authentication. Do not configure a real OpenAI key in this server if direct Voice traffic must be impossible. |
+
+Apart from POSTs to the three stateless paths above, every bridge route needs
+the session-hook capability. Non-hooked calls without it get 401, including
+`/models`, `/files`, `/uploads` and audio routes.
 
 These are routing guarantees, not proof every ChatGPT endpoint accepts every
 model or payload. OpenCode's artifact/media layer can download remote image URLs
@@ -232,8 +264,11 @@ intercepted.
 
 ```sh
 subswapper doctor -config /absolute/path/to/subswapper/config.json \
-  -opencode-plugin /absolute/path/to/subswapper-opencode/0.2.0
+  -opencode-plugin /absolute/path/to/subswapper-opencode/0.2.1
 ```
+
+Doctor accepts plugin versions 0.1.0 and 0.2.1. It rejects 0.2.0 and tells you to
+install 0.2.1 and restart OpenCode.
 
 This opt-in mode runs **only** read-only OpenCode checks: package/version and SDK
 manifest pin, config route, safe existing placeholder, authenticated proxy health,

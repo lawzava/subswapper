@@ -1,10 +1,10 @@
 import { Plugin } from "@opencode/plugin";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, opendir, readlink } from "node:fs/promises";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Agent, createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
-import { homedir, platform } from "node:os";
-import { isIP } from "node:net";
+import { endianness, homedir, platform } from "node:os";
+import { isIP, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -114,6 +114,91 @@ async function discover(options: Readonly<Record<string, unknown>>): Promise<{ b
 }
 
 const bridgeHeader = "x-subswapper-bridge";
+const publicBridgeKey = "subswapper-bridge";
+const statelessPaths = new Set(["/images/generations", "/images/edits", "/decisions"]);
+const peerTableLimit = 4 * 1024 * 1024;
+const peerFDLimit = 65536;
+const peerConcurrencyLimit = 4;
+const peerReads = {
+  async readFile(path: string): Promise<string> {
+    const file = await open(path, "r");
+    try {
+      // procfs reports size zero. Bound the read itself, not just later parsing.
+      const buffer = Buffer.alloc(peerTableLimit + 1);
+      let size = 0;
+      while (size < buffer.length) {
+        const { bytesRead } = await file.read(buffer, size, buffer.length - size, null);
+        if (!bytesRead) break;
+        size += bytesRead;
+      }
+      if (size > peerTableLimit) throw new Error();
+      return buffer.toString("utf8", 0, size);
+    } finally { await file.close(); }
+  },
+  async readdir(path: string): Promise<string[]> {
+    const entries: string[] = [];
+    for await (const entry of await opendir(path)) {
+      if (entries.length >= peerFDLimit) throw new Error();
+      entries.push(entry.name);
+    }
+    return entries;
+  },
+  readlink: (path: string) => readlink(path),
+};
+
+// /proc/self/net lists the network namespace, not just this process. Match the
+// CLIENT side of the connection, then prove its inode is in our own fd table.
+export async function ownSocketPeer(remotePort: number | undefined, localPort: number | undefined, read = peerReads, byteOrder = endianness()): Promise<boolean> {
+  try {
+    if (!["LE", "BE"].includes(byteOrder) || ![remotePort, localPort].every(port => Number.isInteger(port) && port! > 0 && port! <= 65535)) return false;
+    const clientPort = remotePort!.toString(16).toUpperCase().padStart(4, "0");
+    const serverPort = localPort!.toString(16).toUpperCase().padStart(4, "0");
+    const ipv4 = byteOrder === "LE" ? "0100007F" : "7F000001";
+    const mapped = byteOrder === "LE" ? "0000000000000000FFFF00000100007F" : "00000000000000000000FFFF7F000001";
+    // seq_file reads and fd scans can race connection changes. Retry a missing
+    // owner once, but never retry malformed, oversized or ambiguous input.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inodes = new Set<string>();
+      for (const [table, address] of [["tcp", ipv4], ["tcp6", mapped]]) {
+        let text: string;
+        // A host without IPv6 has no tcp6 table; every other read error fails closed.
+        try { text = await read.readFile(`/proc/self/net/${table}`); }
+        catch (error) { if (table === "tcp6" && (error as NodeJS.ErrnoException)?.code === "ENOENT") continue; return false; }
+        if (Buffer.byteLength(text, "utf8") > peerTableLimit) return false;
+        const lines = text.trim().split("\n");
+        if (!/^\s*sl\s+local_address\s+(?:rem|remote)_address\s+st\s/.test(lines.shift() ?? "")) return false;
+        const endpoint = table === "tcp" ? /^[0-9A-F]{8}:[0-9A-F]{4}$/ : /^[0-9A-F]{32}:[0-9A-F]{4}$/;
+        for (const line of lines) {
+          const fields = line.trim().split(/\s+/);
+          // Kernel layout: sl local rem st queues timer retrnsmt uid timeout inode.
+          if (fields.length < 10 || !/^\d+:$/.test(fields[0]) || !endpoint.test(fields[1]) || !endpoint.test(fields[2]) ||
+              !/^[0-9A-F]{2}$/.test(fields[3]) || !/^[0-9A-F]{8}:[0-9A-F]{8}$/.test(fields[4]) ||
+              !/^[0-9A-F]{2}:[0-9A-F]{8}$/.test(fields[5]) || !/^[0-9A-F]{8}$/.test(fields[6]) ||
+              !/^\d+$/.test(fields[7]) || !/^\d+$/.test(fields[8]) || !/^(0|[1-9]\d*)$/.test(fields[9])) return false;
+          if (fields[1] === `${address}:${clientPort}` && fields[2] === `${address}:${serverPort}` && fields[3] === "01") inodes.add(fields[9]);
+        }
+      }
+      if (!inodes.size) continue;
+      if (inodes.size !== 1 || inodes.has("0")) return false;
+      const inode = [...inodes][0];
+      const descriptors = await read.readdir("/proc/self/fd");
+      if (descriptors.length > peerFDLimit) return false;
+      for (const fd of descriptors) {
+        if (!/^\d+$/.test(fd)) return false;
+        // Unrelated descriptors close while we scan; a vanished entry is not ours.
+        let target: string;
+        try { target = await read.readlink(`/proc/self/fd/${fd}`); } catch { continue; }
+        if (target === `socket:[${inode}]`) return true;
+      }
+    }
+    return false;
+  } catch { return false; }
+}
+
+function staticHeaders(headers: Record<string, string> = {}): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).filter(([key]) => !["authorization", "chatgpt-account-id", bridgeHeader].includes(key.toLowerCase())));
+}
+
 const hopHeaders = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", bridgeHeader]);
 function cleanHeaders(headers: IncomingHttpHeaders): IncomingHttpHeaders {
   const blocked = new Set([...hopHeaders, ...(headers.connection?.split(",").map(value => value.trim().toLowerCase()) ?? [])]);
@@ -175,13 +260,37 @@ async function bridge(route: Awaited<ReturnType<typeof discover>>) {
   const agent = new Agent({ keepAlive: true, proxyEnv: {} });
   const controllers = new Set<AbortController>();
   const sockets = new Set<Duplex>();
+  const ownedPeers = new WeakSet<Socket>();
+  const verifyingPeers = new WeakMap<Socket, Promise<boolean>>();
+  let peerVerifications = 0;
   const server = createServer(async (request, response) => {
     const reject = (status: number, message: string) => { if (!response.headersSent) { response.writeHead(status, { "content-type": "text/plain", "x-should-retry": "false" }); response.end(`Subswapper: ${message}`); } else response.destroy(); };
-    // Native stateless calls replace Authorization with their integration key.
-    // Authenticate independently, then strip this private header upstream.
+    // Session hooks supply a private capability. Stateless native calls have no
+    // hooks: on Linux only, admit their three HTTP POST routes from our own PID.
     const auth = Buffer.from(String(request.headers[bridgeHeader] ?? ""));
     const expected = Buffer.from(capability);
-    if (auth.length !== expected.length || !timingSafeEqual(auth, expected)) { reject(401, "bridge authentication failed"); return; }
+    if (auth.length !== expected.length || !timingSafeEqual(auth, expected)) {
+      if (request.method !== "POST" || request.headers.upgrade || !statelessPaths.has((request.url ?? "").split("?", 1)[0]) ||
+          platform() !== "linux" || request.socket.remoteAddress !== "127.0.0.1") {
+        reject(401, "bridge authentication failed"); return;
+      }
+      if (!ownedPeers.has(request.socket)) {
+        let verification = verifyingPeers.get(request.socket);
+        if (!verification) {
+          // Do not queue arbitrary local clients or duplicate pipelined scans.
+          if (peerVerifications >= peerConcurrencyLimit) { reject(401, "bridge authentication failed"); return; }
+          peerVerifications++;
+          verification = ownSocketPeer(request.socket.remotePort, request.socket.localPort).finally(() => {
+            peerVerifications--;
+            verifyingPeers.delete(request.socket);
+          });
+          verifyingPeers.set(request.socket, verification);
+        }
+        if (!await verification) { reject(401, "bridge authentication failed"); return; }
+      }
+      if (request.socket.destroyed) { reject(401, "bridge authentication failed"); return; }
+      ownedPeers.add(request.socket);
+    }
     let path: string;
     try { path = routePath(route.baseURL + request.url, route.baseURL); }
     catch { reject(400, "invalid HTTP route"); return; }
@@ -346,8 +455,8 @@ export default Plugin.define({
         if (!openai) return;
         editor.update("openai", provider => {
           provider.activation = "enabled";
-          provider.settings = { ...provider.settings, baseURL: transport.baseURL, apiKey: transport.capability, compaction: { type: "native" } };
-          provider.headers = { ...Object.fromEntries(Object.entries(provider.headers ?? {}).filter(([key]) => key.toLowerCase() !== bridgeHeader)), authorization: `Bearer ${transport.capability}`, [bridgeHeader]: transport.capability, originator: "opencode", "x-codex-beta-features": "remote_compaction_v2" };
+          provider.settings = { ...provider.settings, baseURL: transport.baseURL, apiKey: publicBridgeKey, compaction: { type: "native" } };
+          provider.headers = { ...staticHeaders(provider.headers), originator: "opencode", "x-codex-beta-features": "remote_compaction_v2" };
           delete provider.settings.encoding;
         });
         const models = subscriptionModels(inventory, [...openai.models.values()]);
@@ -367,11 +476,9 @@ export default Plugin.define({
           editor.update("openai", model.id, value => {
             value.cost = structuredClone(supported.cost) as typeof value.cost;
             value.variants = structuredClone(supported.variants) as typeof value.variants;
-            value.settings = { ...value.settings, baseURL: transport.baseURL, apiKey: transport.capability, compaction: { type: "native" } };
+            value.settings = { ...value.settings, baseURL: transport.baseURL, apiKey: publicBridgeKey, compaction: { type: "native" } };
             delete value.settings.encoding;
-            value.headers = Object.fromEntries(Object.entries(value.headers ?? {}).filter(([key]) => !["authorization", "chatgpt-account-id", bridgeHeader].includes(key.toLowerCase())));
-            value.headers.authorization = `Bearer ${transport.capability}`;
-            value.headers[bridgeHeader] = transport.capability;
+            value.headers = staticHeaders(value.headers);
             if (value.body?.reasoning?.mode === "pro") delete value.body.reasoning.mode;
           });
         }

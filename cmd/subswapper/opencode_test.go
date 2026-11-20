@@ -73,7 +73,9 @@ func TestDoctorOpenCodeIsReadOnlyAndChecksPackagePlaceholderHealthReadiness(t *t
 		}
 	}
 	var healthy, ready atomic.Bool
+	var proxyCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
 		if r.Header.Get("Authorization") != "Bearer synthetic.fixture.signature" {
 			t.Error("missing placeholder")
 			w.WriteHeader(401)
@@ -136,7 +138,18 @@ func TestDoctorOpenCodeIsReadOnlyAndChecksPackagePlaceholderHealthReadiness(t *t
 	if err := os.WriteFile(filepath.Join(plugin, "catalog.ts"), []byte("export {}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	check("plugin version 0.2.0 present", true)
+	beforeRejectedVersion := proxyCalls.Load()
+	check("plugin version 0.2.0 exposes the bridge capability through OpenCode's model catalog; install subswapper-opencode 0.2.1 and restart OpenCode", false)
+	if proxyCalls.Load() != beforeRejectedVersion {
+		t.Fatal("doctor contacted the proxy after rejecting the exposed plugin version")
+	}
+	if err := os.WriteFile(filepath.Join(plugin, "package.json"), []byte(`{"name":"subswapper-opencode","version":"0.2.1","dependencies":{"@opencode/plugin":"2.2.6"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugin, "catalog.ts"), []byte("export {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("plugin version 0.2.1 present", true)
 	check("HTTP/WebSocket bridge, native compaction", true)
 	if err := os.Remove(filepath.Join(plugin, "catalog.ts")); err != nil {
 		t.Fatal(err)
