@@ -52,8 +52,16 @@ func doctorOpenCode(ctx context.Context, d *doctorReport, cfg subswapper.Config,
 	_, entryErr := os.Stat(filepath.Join(plugin, "index.ts"))
 	_, helperErr := os.Stat(filepath.Join(plugin, "private-group.ts"))
 	_, catalogErr := os.Stat(filepath.Join(plugin, "catalog.ts"))
-	if !filepath.IsAbs(plugin) || err != nil || entryErr != nil || helperErr != nil || json.Unmarshal(data, &pkg) != nil || pkg.Name != "subswapper-opencode" || (pkg.Version != "0.1.0" && pkg.Version != "0.2.0") || (pkg.Version == "0.2.0" && catalogErr != nil) || pkg.Dependencies["@opencode/plugin"] != "2.2.6" {
-		d.fail("opencode: plugin version missing or unsupported; install subswapper-opencode 0.2.0 (or 0.1.0) with SDK 2.2.6")
+	if !filepath.IsAbs(plugin) || err != nil || entryErr != nil || helperErr != nil || json.Unmarshal(data, &pkg) != nil || pkg.Name != "subswapper-opencode" {
+		d.fail("opencode: plugin version missing or unsupported; install subswapper-opencode 0.2.1 with SDK 2.2.6")
+		return
+	}
+	if pkg.Version == "0.2.0" {
+		d.fail("opencode: plugin version 0.2.0 exposes the bridge capability through OpenCode's model catalog; install subswapper-opencode 0.2.1 and restart OpenCode")
+		return
+	}
+	if (pkg.Version != "0.1.0" && pkg.Version != "0.2.1") || (pkg.Version == "0.2.1" && catalogErr != nil) || pkg.Dependencies["@opencode/plugin"] != "2.2.6" {
+		d.fail("opencode: plugin version missing or unsupported; install subswapper-opencode 0.2.1 with SDK 2.2.6")
 		return
 	}
 	d.ok("opencode: plugin version %s present (SDK 2.2.6); runtime loading not verified", pkg.Version)

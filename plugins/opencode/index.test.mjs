@@ -3,8 +3,12 @@ import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { createServer, globalAgent, request as httpRequest } from "node:http";
-import { tmpdir } from "node:os";
+import fsPromises from "node:fs/promises";
+import { Agent, createServer, globalAgent, request as httpRequest } from "node:http";
+import { connect, Socket } from "node:net";
+import { syncBuiltinESMExports } from "node:module";
+import { setImmediate as nextTurn } from "node:timers/promises";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
@@ -12,7 +16,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { make as makeAI, Media } from "@opencode/ai";
 import * as OpenAI from "@opencode/ai/providers/openai";
 import { Model } from "@opencode/plugin";
-import plugin from "./index.ts";
+import plugin, * as bridgeModule from "./index.ts";
 import { isPrivateGroup, privateGroupRecords, supportsPrivateGroupNSS } from "./private-group.ts";
 
 const placeholder = { token: "synthetic.fixture.signature", account_id: "subswapper-proxy" };
@@ -54,7 +58,7 @@ async function fixture(t, handler = (_, response) => response.end("synthetic res
   ] }), { mode: 0o600 });
   return { directory, path, config, baseURL: `${proxy}/backend-api/codex`, endpoint: `${proxy}/backend-api/codex/responses` };
 }
-async function harness(t, options, overrides = [], { storageEntries = [], claudeCatalog = [] } = {}) {
+async function harness(t, options, overrides = [], { storageEntries = [], claudeCatalog = [], providerHeaders = {} } = {}) {
   // Do not start a real Claude installation from any synthetic routing test.
   t.mock.method(childProcess, "spawn", () => {
     const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), kill() {} });
@@ -62,7 +66,7 @@ async function harness(t, options, overrides = [], { storageEntries = [], claude
     return child;
   });
   const hooks = new Map();
-  const provider = { settings: { transport: "websocket", encoding: "gzip", retained: true } };
+  const provider = { settings: { transport: "websocket", encoding: "gzip", retained: true }, headers: providerHeaders };
   const claudeProvider = { activation: "disabled" };
   const models = new Map([["claude-agent", claudeCatalog]]);
   const storage = new Map(storageEntries);
@@ -94,9 +98,27 @@ async function nativeDispatch(request) {
   }).pipe(Effect.provide(FetchHttpClient.layer))));
 }
 
+function holdPeerReads(t) {
+  const gate = Promise.withResolvers();
+  const events = new EventEmitter();
+  let scans = 0;
+  const originalOpen = fsPromises.open, originalRead = fsPromises.readFile;
+  const wait = async path => { if (path === "/proc/self/net/tcp") { scans++; events.emit("scan"); await gate.promise; } };
+  const openMock = t.mock.method(fsPromises, "open", async (...args) => { await wait(args[0]); return originalOpen(...args); });
+  const readMock = t.mock.method(fsPromises, "readFile", async (...args) => { await wait(args[0]); return originalRead(...args); });
+  syncBuiltinESMExports();
+  t.after(() => { gate.resolve(); openMock.mock.restore(); readMock.mock.restore(); syncBuiltinESMExports(); });
+  return {
+    get scans() { return scans; },
+    release: gate.resolve,
+    until(count) { return new Promise(resolve => { if (scans >= count) resolve(); else events.on("scan", () => { if (scans >= count) resolve(); }); }); },
+  };
+}
+
 test("inherited Subswapper environment cannot enter synthetic fixtures", () => {
   for (const [file, name] of [
     ["index.test.mjs", "real SDK pin and provider settings; config option alone derives proxy and placeholder"],
+    ...(platform() === "linux" ? [["index.test.mjs", "real native SDK images and decisions route despite integration API-key replacement and without session hooks"]] : []),
     ["catalog.test.mjs", "Claude discovery sends initialize control only, bounds output, and closes without a prompt"],
   ]) {
     const inherited = {
@@ -106,7 +128,7 @@ test("inherited Subswapper environment cannot enter synthetic fixtures", () => {
       SUBSWAPPER_LIVE_TEST: "1",
     };
     const child = childProcess.spawnSync(process.execPath, ["--test", `--test-name-pattern=^${name}$`, file], {
-      cwd: new URL(".", import.meta.url), env: { ...Object.fromEntries(Object.keys(process.env).filter(key => !key.startsWith("SUBSWAPPER_") && key !== "NODE_TEST_CONTEXT").map(key => [key, process.env[key]])), ...inherited }, encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024,
+      cwd: new URL(".", import.meta.url), env: { ...Object.fromEntries(Object.keys(process.env).filter(key => !key.startsWith("SUBSWAPPER_") && key !== "NODE_TEST_CONTEXT" && key !== "OPENAI_API_KEY").map(key => [key, process.env[key]])), ...inherited }, encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024,
     });
     // Keep captured output private, including on failure. Only booleans reach
     // assertion diagnostics, never headers, paths, or inherited values.
@@ -128,9 +150,9 @@ test("real SDK pin and provider settings; config option alone derives proxy and 
   const event = { headers: {}, sessionID: "synthetic-session" };
   await hooks.get("model.request")(event);
   assert.equal(event.baseURL, provider.settings.baseURL);
-  secretEqual(event.headers.authorization, provider.headers.authorization);
-  secretEqual(event.headers["x-subswapper-bridge"], provider.headers["x-subswapper-bridge"]);
-  secretEqual(provider.headers["x-subswapper-bridge"], provider.settings.apiKey);
+  secretEqual(event.headers.authorization, `Bearer ${event.headers["x-subswapper-bridge"]}`);
+  assert.equal(provider.settings.apiKey, "subswapper-bridge");
+  assert.deepEqual(provider.headers, { originator: "opencode", "x-codex-beta-features": "remote_compaction_v2" });
   assert.equal(/^Bearer [0-9a-f]{64}$/.test(event.headers.authorization), true, "request must use a bridge capability");
   const provenance = storage.get("catalog-discovery-v1");
   assert.equal(provenance.openai.source, "backend");
@@ -138,7 +160,7 @@ test("real SDK pin and provider settings; config option alone derives proxy and 
   assert.deepEqual(provenance.openai.wireModelIDs, ["gpt-synthetic"]);
   assert.equal(provenance.claude.source, "unavailable");
   assert.equal(JSON.stringify(provenance).includes(placeholder.token), false);
-  assert.equal(JSON.stringify(provenance).includes(provider.settings.apiKey), false);
+  assert.equal(JSON.stringify(provenance).includes(event.headers["x-subswapper-bridge"]), false);
   assert.equal(hooks.has("title"), false, "production plugin must not replace user titles");
   const retry = { decision: { retry: true, delay: 5 } };
   hooks.get("retry")(retry);
@@ -152,6 +174,103 @@ test("credential assertion failures never include compared values", () => {
   assert.equal(failure instanceof assert.AssertionError, true, "credential mismatch must fail");
   assert.equal(values.some(value => String(failure).includes(value)), false, "credential failure message must not expose compared values");
   assert.equal(typeof failure.actual === "boolean" && typeof failure.expected === "boolean", true, "credential assertion diagnostics must contain only booleans");
+});
+
+test("bridge capability stays out of provider, model and storage JSON", async t => {
+  const f = await fixture(t);
+  const override = { ...Model.Info.default("openai", "gpt-synthetic"), id: "custom",
+    headers: { Authorization: "Bearer synthetic-private-key", "ChatGPT-Account-ID": "not-selected", "X-Subswapper-Bridge": "synthetic-private-key" } };
+  const { hooks, provider, models, storage } = await harness(t, { config: f.config }, [override], {
+    providerHeaders: { AUTHORIZATION: "Bearer synthetic-private-key", "ChatGPT-Account-ID": "not-selected", "X-Subswapper-Bridge": "synthetic-private-key", "x-retained": "yes" },
+  });
+  const event = { headers: {}, sessionID: "synthetic-session" };
+  await hooks.get("model.request")(event);
+  const capability = event.headers["x-subswapper-bridge"];
+  assert.equal(typeof capability === "string" && /^[0-9a-f]{64}$/.test(capability), true, "session hook must inject a capability");
+  secretEqual(event.headers.authorization, `Bearer ${capability}`);
+  const json = JSON.stringify({ provider, models: [...models.values()], storage: [...storage.values()] });
+  assert.equal(json.includes(capability), false, "static JSON must not contain the live capability");
+  assert.equal(/[0-9a-f]{64}/.test(json), false, "static JSON must not contain any capability-shaped value");
+  for (const value of [provider, ...[...models.values()].flat()]) {
+    assert.equal(Object.keys(value.headers ?? {}).some(key => ["authorization", "chatgpt-account-id", "x-subswapper-bridge"].includes(key.toLowerCase())), false, "static headers must not contain authentication keys");
+  }
+  assert.equal(provider.headers["x-retained"], "yes");
+});
+
+test("ownSocketPeer verifies the client-side inode against process descriptors and fails closed", async t => {
+  const header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+  const row = (inode = "12345", port = "C350", address = "0100007F") =>
+    `  0: ${address}:${port} ${address}:A028 01 00000000:00000000 00:00000000 00000000 1000 0 ${inode} 1 0000000000000000\n`;
+  const mapped = "0000000000000000FFFF00000100007F";
+  for (const [name, tcp, tcp6, target, expected, failure] of [
+    ["match", row(), "", "socket:[12345]", true],
+    ["mapped IPv4 match", "", row("12345", "C350", mapped), "socket:[12345]", true],
+    ["inode zero", row("0"), "", "socket:[0]", false],
+    ["no row", "", "", "socket:[12345]", false],
+    ["different client port", row("12345", "C351"), "", "socket:[12345]", false],
+    ["different server port", row().replace(":A028", ":A029"), "", "socket:[12345]", false],
+    ["non-established client", row().replace(" 01 ", " 06 "), "", "socket:[12345]", false],
+    ["no matching fd", row(), "", "socket:[54321]", false],
+    ["non-exact fd target", row(), "", "socket:[12345] extra", false],
+    ["duplicate identical row", row() + row(), "", "socket:[12345]", true],
+    ["two different inodes", row() + row("54321"), "", "socket:[12345]", false],
+    ["ambiguous tables", row(), row("54321", "C350", mapped), "socket:[12345]", false],
+    ["malformed inode", row("not-an-inode"), "", "socket:[12345]", false],
+    ["malformed table", "malformed\n", "", "socket:[12345]", false],
+    ["table read error", row(), "", "socket:[12345]", false, "readFile"],
+    ["fd list error", row(), "", "socket:[12345]", false, "readdir"],
+    ["fd read error", row(), "", "socket:[12345]", false, "readlink"],
+    ["vanished unrelated fd is skipped", row(), "", "socket:[12345]", true, "vanished"],
+    ["missing tcp6 table", row(), "", "socket:[12345]", true, "no-tcp6"],
+    ["unreadable tcp6 table", row(), "", "socket:[12345]", false, "tcp6-denied"],
+  ]) {
+    await t.test(name, async () => {
+      const read = {
+        async readFile(path) { if (failure === "readFile") throw new Error("synthetic read failure");
+          if (path.endsWith("tcp6") && (failure === "no-tcp6" || failure === "tcp6-denied")) throw Object.assign(new Error("synthetic read failure"), { code: failure === "no-tcp6" ? "ENOENT" : "EACCES" }); assert.equal(["/proc/self/net/tcp", "/proc/self/net/tcp6"].includes(path), true); return header + (path.endsWith("tcp6") ? tcp6 : tcp); },
+        async readdir(path) { if (failure === "readdir") throw new Error("synthetic read failure"); assert.equal(path, "/proc/self/fd"); return failure === "vanished" ? ["6", "7"] : ["7"]; },
+        async readlink(path) { if (failure === "readlink" || path === "/proc/self/fd/6") throw new Error("synthetic read failure"); assert.equal(path, "/proc/self/fd/7"); return target; },
+      };
+      assert.equal(await bridgeModule.ownSocketPeer(50000, 41000, read, "LE"), expected);
+    });
+  }
+});
+
+test("ownSocketPeer supports both byte orders, bounds proc input and retries a missing owner once", async t => {
+  const header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+  const row = address => `0: ${address}:C350 ${address}:A028 01 00000000:00000000 00:00000000 00000000 1000 0 12345\n`;
+  for (const [order, ipv4, mapped] of [
+    ["LE", "0100007F", "0000000000000000FFFF00000100007F"],
+    ["BE", "7F000001", "00000000000000000000FFFF7F000001"],
+  ]) {
+    for (const table of ["tcp", "tcp6"]) {
+      await t.test(`${order} ${table}`, async () => {
+        const read = {
+          async readFile(path) { return header + (path.endsWith("/" + table) ? row(table === "tcp" ? ipv4 : mapped) : ""); },
+          async readdir() { return ["7"]; },
+          async readlink() { return "socket:[12345]"; },
+        };
+        assert.equal(await bridgeModule.ownSocketPeer(50000, 41000, read, order), true);
+      });
+    }
+  }
+  for (const scenario of ["table oversize", "fd list oversize", "first table misses", "first fd scan misses", "always missing"]) {
+    await t.test(scenario, async () => {
+      let attempts = 0, fdScans = 0, links = 0;
+      const read = {
+        async readFile(path) {
+          if (path.endsWith("/tcp")) attempts++;
+          if (scenario === "table oversize" && path.endsWith("/tcp")) return header + row("0100007F") + " ".repeat(4 * 1024 * 1024);
+          return header + (path.endsWith("/tcp") && scenario !== "always missing" && !(scenario === "first table misses" && attempts === 1) ? row("0100007F") : "");
+        },
+        async readdir() { fdScans++; return scenario === "fd list oversize" ? Array.from({ length: 65537 }, (_, i) => String(i)) : ["7"]; },
+        async readlink() { links++; return scenario === "first fd scan misses" && fdScans === 1 ? "socket:[54321]" : "socket:[12345]"; },
+      };
+      assert.equal(await bridgeModule.ownSocketPeer(50000, 41000, read, "LE"), ["first table misses", "first fd scan misses"].includes(scenario));
+      assert.equal(attempts, ["first table misses", "first fd scan misses", "always missing"].includes(scenario) ? 2 : 1);
+      if (scenario.endsWith("oversize")) assert.equal(links, 0, "oversized input must fail before scanning descriptors");
+    });
+  }
 });
 
 test("Claude cache fallback accepts the 24-hour boundary but rejects stale and future snapshots", async t => {
@@ -205,9 +324,7 @@ test("final model transform removes unavailable text and overrides public routin
   assert.equal(custom.settings.encoding, undefined);
   assert.deepEqual(custom.variants, [{ id: "high", settings: { reasoningEffort: "high" } }]);
   assert.equal(custom.body.reasoning.mode, undefined);
-  assert.deepEqual(Object.keys(custom.headers), ["authorization", "x-subswapper-bridge"]);
-  secretEqual(custom.headers.authorization, provider.headers.authorization);
-  secretEqual(custom.headers["x-subswapper-bridge"], provider.headers["x-subswapper-bridge"]);
+  assert.deepEqual(custom.headers, {});
   assert.deepEqual(custom.cost, [{ input: 0, output: 0, cache: { read: 0, write: 0 } }]);
 });
 
@@ -329,7 +446,7 @@ test("native compact, discovery, uploads and media HTTP preserve paths, methods 
   }
 });
 
-test("real native SDK images and decisions route despite integration API-key replacement and without session hooks", async t => {
+test("real native SDK images and decisions route despite integration API-key replacement and without session hooks", { skip: platform() !== "linux" }, async t => {
   const calls = [];
   const f = await fixture(t, async (r, w) => {
     let body = ""; for await (const chunk of r) body += chunk;
@@ -343,8 +460,12 @@ test("real native SDK images and decisions route despite integration API-key rep
   // Native ModelResolver replaces settings.apiKey with the integration key.
   // Stateless requests have no session hook to repair Authorization afterward.
   const settings = { ...provider.settings, headers: provider.headers, apiKey: "subswapper-dummy" };
+  assert.equal(Object.keys(settings.headers).some(key => ["authorization", "x-subswapper-bridge"].includes(key.toLowerCase())), false, "stateless SDK settings must not carry bridge authentication");
   const ai = makeAI();
   t.after(() => ai.dispose());
+  // Also exercise the public activation constant without an integration key.
+  await rejectsSafely(ai.image.generate({ model: OpenAI.imageModel("gpt-image-synthetic", { ...provider.settings, headers: provider.headers }), prompt: "synthetic public activation key" }), error => /synthetic backend rejection/.test(error.message));
+  assert.equal(calls.at(-1).path, "/backend-api/codex/images/generations");
   await rejectsSafely(ai.image.generate({ model: OpenAI.imageModel("gpt-image-synthetic", settings), prompt: "synthetic test only" }), error => /synthetic backend rejection/.test(error.message));
   assert.equal(calls.at(-1).path, "/backend-api/codex/images/generations");
   assert.equal(JSON.parse(calls.at(-1).body).model, "gpt-image-synthetic");
@@ -357,13 +478,176 @@ test("real native SDK images and decisions route despite integration API-key rep
   assert.equal(calls.at(-1).path, "/backend-api/codex/decisions");
 });
 
+test("stateless admission rejects other processes, non-allowlisted paths and unauthenticated upgrades", { timeout: 15000 }, async t => {
+  let upstreamCalls = 0;
+  const f = await fixture(t, (_, response) => { upstreamCalls++; response.setHeader("content-type", "application/json"); response.end('{"data":[]}'); });
+  const { provider } = await harness(t, { config: f.config });
+  const baseURL = provider.settings.baseURL;
+  const script = `
+    const statuses = [];
+    for (const path of ["/images/generations", "/images/edits", "/decisions"]) {
+      const response = await fetch(process.argv[1] + path, { method: "POST", body: "{}", headers: { authorization: "Bearer subswapper-bridge" }, signal: AbortSignal.timeout(5000) });
+      statuses.push(response.status);
+      await response.text();
+    }
+    console.log(JSON.stringify(statuses));
+  `;
+  const child = await new Promise(resolve => childProcess.execFile(process.execPath, ["--input-type=module", "-e", script, baseURL], { timeout: 10000, maxBuffer: 1024 }, (error, stdout) => resolve({ error, stdout })));
+  assert.equal(child.error === null, true, "synthetic child HTTP probe must complete");
+  assert.deepEqual(JSON.parse(child.stdout), [401, 401, 401]);
+  for (const [path, method] of [["/responses", "POST"], ["/models", "GET"], ["/files", "POST"], ["/uploads", "POST"], ["/audio/speech", "POST"], ["/audio/transcriptions", "POST"], ["/images/generations/extra", "POST"], ["/images/generations", "GET"]]) {
+    const response = await fetch(baseURL + path, { method, ...(method === "POST" ? { body: "{}" } : {}) });
+    assert.equal(response.status, 401);
+    await response.text();
+  }
+  const destroyed = await new Promise(resolve => {
+    const connection = httpRequest(baseURL + "/images/generations", { headers: { connection: "Upgrade", upgrade: "websocket" }, timeout: 5000 });
+    connection.once("upgrade", (_, socket) => { socket.destroy(); resolve(false); });
+    connection.once("response", response => { response.resume(); resolve(false); });
+    connection.once("error", error => resolve(error.code === "ECONNRESET"));
+    connection.once("timeout", () => { connection.destroy(); resolve(false); });
+    connection.end();
+  });
+  assert.equal(destroyed, true, "upgrade without a capability must be destroyed");
+  assert.equal(upstreamCalls, 0, "unauthorized probes must never reach the upstream");
+  for (const headers of [{}, { "x-subswapper-bridge": "synthetic-wrong-capability" }]) {
+    const response = await fetch(baseURL + "/images/generations?fixture=1", { method: "POST", body: "{}", headers });
+    assert.equal(response.status, platform() === "linux" ? 200 : 401);
+    await response.text();
+  }
+  assert.equal(upstreamCalls, platform() === "linux" ? 2 : 0);
+  if (platform() === "linux") {
+    const nonLoopbackPeer = await new Promise((resolve, reject) => {
+      const connection = httpRequest(baseURL + "/decisions", { method: "POST", localAddress: "127.0.0.2" }, response => { response.resume(); response.once("end", () => resolve(response.statusCode)); });
+      connection.once("error", reject);
+      connection.end("{}");
+    });
+    assert.equal(nonLoopbackPeer, 401, "same-process socket from another loopback address must fail closed");
+  }
+});
+
+test("cached same-process keep-alive admission does not widen paths or allow upgrades", { skip: platform() !== "linux", timeout: 10000 }, async t => {
+  const f = await fixture(t, (_, response) => { response.setHeader("content-type", "application/json"); response.end('{"data":[]}'); });
+  const { provider } = await harness(t, { config: f.config });
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  t.after(() => agent.destroy());
+  const sockets = [];
+  for (const [path, expected] of [["/images/generations", 200], ["/decisions", 200], ["/responses", 401]]) {
+    const status = await new Promise((resolve, reject) => {
+      const connection = httpRequest(provider.settings.baseURL + path, { method: "POST", agent }, response => { response.resume(); response.once("end", () => resolve(response.statusCode)); });
+      connection.once("socket", socket => sockets.push(socket));
+      connection.once("error", reject);
+      connection.end("{}");
+    });
+    assert.equal(status, expected);
+  }
+  assert.equal(sockets.every(socket => socket === sockets[0]), true, "requests must exercise the same cached TCP connection");
+  const rejected = await new Promise(resolve => {
+    const connection = httpRequest(provider.settings.baseURL + "/decisions", { agent, headers: { connection: "Upgrade", upgrade: "websocket" } });
+    connection.once("socket", socket => assert.equal(socket === sockets[0], true, "upgrade must reuse the cached TCP connection"));
+    connection.once("upgrade", (_, socket) => { socket.destroy(); resolve(false); });
+    connection.once("response", response => { response.resume(); resolve(false); });
+    connection.once("error", error => resolve(error.code === "ECONNRESET"));
+    connection.end();
+  });
+  assert.equal(rejected, true, "cached peer ownership must not authorize an upgrade");
+});
+
+test("pipelined stateless requests share one in-flight peer scan", { skip: platform() !== "linux", timeout: 10000 }, async t => {
+  const f = await fixture(t, (_, response) => { response.setHeader("content-type", "application/json"); response.end('{"data":[]}'); });
+  const { provider } = await harness(t, { config: f.config });
+  const hold = holdPeerReads(t);
+  const socket = connect(Number(new URL(provider.settings.baseURL).port), "127.0.0.1");
+  t.after(() => socket.destroy());
+  const received = new Promise((resolve, reject) => {
+    let text = "";
+    socket.on("data", chunk => { text += chunk; });
+    socket.once("end", () => resolve(text));
+    socket.once("error", reject);
+  });
+  socket.write("POST /images/generations HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}POST /decisions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+  await hold.until(1);
+  await nextTurn();
+  try { assert.equal(hold.scans, 1, "pipelined requests must share the same verification"); }
+  finally { hold.release(); await received; }
+  assert.equal(((await received).match(/HTTP\/1\.1 200/g) ?? []).length, 2);
+});
+
+test("stateless peer scans cap concurrency and reject excess sockets without queuing", { skip: platform() !== "linux", timeout: 10000 }, async t => {
+  const f = await fixture(t, (_, response) => { response.setHeader("content-type", "application/json"); response.end('{"data":[]}'); });
+  const { hooks, provider } = await harness(t, { config: f.config });
+  const hold = holdPeerReads(t);
+  const dispatch = async () => {
+    const response = await fetch(provider.settings.baseURL + "/decisions", { method: "POST", body: "{}" });
+    await response.text();
+    return response.status;
+  };
+  const pending = Array.from({ length: 4 }, dispatch);
+  await hold.until(4);
+  const excess = dispatch();
+  try {
+    assert.equal(await Promise.race([excess, hold.until(5).then(() => -1)]), 401, "excess sockets must be rejected before starting another scan");
+    assert.equal(hold.scans, 4);
+    const event = { request: request(provider.settings.baseURL + "/responses") };
+    await hooks.get("http.request")(event);
+    assert.equal((await nativeDispatch(event.request)).status, 200, "capability admission must not wait on saturated peer verification");
+  } finally { hold.release(); await Promise.allSettled([...pending, excess]); }
+  assert.deepEqual(await Promise.all(pending), [200, 200, 200, 200]);
+  assert.equal(await dispatch(), 200, "completed verifications must release their concurrency slots");
+});
+
+test("a socket destroyed during peer verification never reaches the upstream", { skip: platform() !== "linux", timeout: 10000 }, async t => {
+  let upstreamCalls = 0;
+  const f = await fixture(t, (_, response) => { upstreamCalls++; response.setHeader("content-type", "application/json"); response.end('{"data":[]}'); });
+  const { provider } = await harness(t, { config: f.config });
+  const client = connect(Number(new URL(provider.settings.baseURL).port), "127.0.0.1");
+  t.after(() => client.destroy());
+  await new Promise(resolve => client.once("connect", resolve));
+  const clientPort = client.localPort;
+  const inodeTarget = await fsPromises.readlink(`/proc/self/fd/${client._handle.fd}`);
+  const proofRead = Promise.withResolvers(), releaseProof = Promise.withResolvers();
+  const originalReadlink = fsPromises.readlink, originalLstat = fsPromises.lstat;
+  let placeholderReads = 0;
+  const linkMock = t.mock.method(fsPromises, "readlink", async (...args) => {
+    const target = await originalReadlink(...args);
+    if (target === inodeTarget) { proofRead.resolve(); await releaseProof.promise; }
+    return target;
+  });
+  const statMock = t.mock.method(fsPromises, "lstat", (...args) => {
+    if (args[0] === f.path) placeholderReads++;
+    return originalLstat(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { releaseProof.resolve(); linkMock.mock.restore(); statMock.mock.restore(); syncBuiltinESMExports(); });
+  const serverClosed = Promise.withResolvers();
+  const originalDestroy = Socket.prototype.destroy;
+  t.mock.method(Socket.prototype, "destroy", function (...args) {
+    if (this.remotePort === clientPort) this.once("close", serverClosed.resolve);
+    return originalDestroy.apply(this, args);
+  });
+  client.write("POST /decisions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}");
+  await proofRead.promise;
+  client.destroy();
+  await serverClosed.promise;
+  releaseProof.resolve();
+  await nextTurn();
+  // A fresh request also checks that a completed verification releases its slot.
+  const response = await fetch(provider.settings.baseURL + "/decisions", { method: "POST", body: "{}" });
+  await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(upstreamCalls, 1, "only the live request may reach the upstream");
+  assert.equal(placeholderReads, 1, "dead requests must stop before reading the placeholder");
+});
+
 test("native image results reject remote media URLs before artifact download", async t => {
   let downloads = 0;
   const sink = await server(t, (_, response) => { downloads++; response.end("must not download"); });
   const f = await fixture(t, (_, response) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ data: [{ url: sink + "/synthetic-image" }] })); });
-  const { provider } = await harness(t, { config: f.config });
+  const { hooks, provider } = await harness(t, { config: f.config });
+  const modelRequest = { headers: {}, sessionID: "synthetic-image-session" };
+  await hooks.get("model.request")(modelRequest);
   const ai = makeAI(); t.after(() => ai.dispose());
-  await rejectsSafely(ai.image.generate({ model: OpenAI.imageModel("gpt-image-synthetic", { ...provider.settings, headers: provider.headers }), prompt: "synthetic" }), error => /remote image URLs are unsupported/.test(error.message));
+  await rejectsSafely(ai.image.generate({ model: OpenAI.imageModel("gpt-image-synthetic", { ...provider.settings, headers: { ...provider.headers, ...modelRequest.headers } }), prompt: "synthetic" }), error => /remote image URLs are unsupported/.test(error.message));
   assert.equal(downloads, 0);
 });
 
@@ -389,12 +673,14 @@ for (const inline of [false, true]) {
             if (inline && frameType === "partial_image") response.write(`data: ${JSON.stringify(frame("completed"))}\n\n`);
             response.end();
           });
-          const { provider } = await harness(t, { config: f.config });
+          const { hooks, provider } = await harness(t, { config: f.config });
+          const modelRequest = { headers: {}, sessionID: "synthetic-image-session" };
+          await hooks.get("model.request")(modelRequest);
           const ai = makeAI(); t.after(() => ai.dispose());
           let images = 0;
           const types = [];
           const consume = async () => {
-            for await (const event of ai.image.stream({ model: OpenAI.imageModel("gpt-image-synthetic", { ...provider.settings, headers: provider.headers, apiKey: "subswapper-dummy" }), prompt: "synthetic stream only", ...(family === "image_edit" ? { images: [Media.bytes(png, "image/png")] } : {}) }, { signal: AbortSignal.timeout(5000) })) {
+            for await (const event of ai.image.stream({ model: OpenAI.imageModel("gpt-image-synthetic", { ...provider.settings, headers: { ...provider.headers, ...modelRequest.headers }, apiKey: "subswapper-dummy" }), prompt: "synthetic stream only", ...(family === "image_edit" ? { images: [Media.bytes(png, "image/png")] } : {}) }, { signal: AbortSignal.timeout(5000) })) {
               types.push(event.type);
               if (!event.image) continue;
               images++;
@@ -478,11 +764,11 @@ test("bridge rejects unauthenticated callers and preserves upstream errors in fu
   const unauthorized = await fetch(event.request.url, { method: "POST", body: "{}" });
   assert.equal(unauthorized.status, 401);
   assert.equal(unauthorized.headers.get("x-should-retry") === "false", true, "bridge errors must disable native retries");
-  for (const authorization of ["Bearer subswapper-dummy", provider.headers.authorization]) {
+  for (const authorization of ["Bearer subswapper-dummy", event.request.headers.get("authorization")]) {
     const bearerOnly = await fetch(event.request.url, { method: "POST", body: "{}", headers: { authorization } });
     assert.equal(bearerOnly.status, 401, "Bearer authentication alone must never grant bridge access");
   }
-  const wrongCapability = await fetch(event.request.url, { method: "POST", body: "{}", headers: { authorization: provider.headers.authorization, "x-subswapper-bridge": "synthetic-wrong-capability" } });
+  const wrongCapability = await fetch(event.request.url, { method: "POST", body: "{}", headers: { authorization: event.request.headers.get("authorization"), "x-subswapper-bridge": "synthetic-wrong-capability" } });
   assert.equal(wrongCapability.status, 401, "wrong bridge capability must be rejected");
   const response = await nativeDispatch(event.request);
   assert.equal(response.status, 429);
